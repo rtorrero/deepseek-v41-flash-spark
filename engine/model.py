@@ -119,8 +119,54 @@ class Weights:
         self.mtp = []
         for k in range(3 if load_mtp else 0):
             self.mtp.append(MTPWeights(get, k, args, device))
+        # The three blocks are the only consumers of the override, and it is up to 1.3 GB of host
+        # tensors. Holding it past this point would come straight off the arena, which is sized from
+        # what is free after the weights are loaded.
+        _drop_mtp_override()
         self.dspark_experts = None  # filled by the engine (arena of 3 x 128 experts)
         log(f"weights: all non-expert weights on GPU in {time.time() - t0:.0f}s")
+
+
+# A fine-tuned DSpark head instead of the checkpoint's (tools/train_mtp.py, docs/architecture.md
+# "Fine-tuning the drafter"). The file holds bf16 tensors under the checkpoint's own names
+# (`mtp.0.attn.wq_a.weight`, ...); everything it does NOT name comes from the checkpoint, so a file
+# with three tensors in it is a legal three-tensor override. Unset = the shipped head.
+#
+# The tensors are re-quantized on load into the format the shipped path serves in -- fp8 e4m3 with
+# UE8M0 block scales, and then FP4 for whichever groups DSV41_DENSE_FP4 names -- so a fine-tuned
+# head reads exactly as many bytes per draft as the shipped one and the speed of the draft graph
+# does not move. That round trip is lossy, which is why tools/train_mtp.py reports the acceptance
+# proxy after quantizing as well as before.
+MTP_WEIGHTS = os.environ.get("DSV41_MTP_WEIGHTS", "").strip()
+_MTP_OVERRIDE = None
+
+
+def _mtp_override():
+    """{name: tensor} from DSV41_MTP_WEIGHTS, read once. Keys outside `mtp.` are refused rather than
+    ignored: a file whose names are wrong would otherwise load as "the shipped head" and the only
+    evidence would be an acceptance number that did not move."""
+    global _MTP_OVERRIDE
+    if _MTP_OVERRIDE is None:
+        if not MTP_WEIGHTS:
+            _MTP_OVERRIDE = {}
+        else:
+            f = safe_open(MTP_WEIGHTS, "pt", device="cpu")
+            keys = list(f.keys())
+            bad = [k for k in keys if not k.startswith("mtp.")]
+            if bad:
+                raise ValueError(f"DSV41_MTP_WEIGHTS={MTP_WEIGHTS}: {len(bad)} tensor(s) outside the "
+                                 f"DSpark blocks, e.g. {bad[:3]}")
+            _MTP_OVERRIDE = {k: f.get_tensor(k) for k in keys}
+            print(f"DSV41_MTP_WEIGHTS: {len(keys)} tensors from {MTP_WEIGHTS}", flush=True)
+    return _MTP_OVERRIDE
+
+
+def _drop_mtp_override():
+    """Release the host tensors once the DSpark blocks have been built. Anything that built an
+    MTPWeights after this would silently get the shipped head, so nothing does: `Weights.__init__`
+    is the only place they are constructed."""
+    global _MTP_OVERRIDE
+    _MTP_OVERRIDE = {}
 
 
 class MTPWeights:
@@ -140,24 +186,51 @@ class MTPWeights:
         # LayerWeights expects "layers.{L}." prefix; build the same fields by hand
         dev = device
 
+        over = _mtp_override()
+
+        def ov(name):
+            """The fine-tuned tensor for `mtp.k.<name>`, or None."""
+            t = over.get(p + name)
+            return None if t is None else t.to(dev)
+
         def bf(name):
-            return get(p + name).to(dev).to(torch.bfloat16)
+            t = ov(name)
+            return (get(p + name) if t is None else t).to(dev).to(torch.bfloat16)
 
         def f32(name):
-            return get(p + name).to(dev).to(torch.float32)
+            t = ov(name)
+            return (get(p + name) if t is None else t).to(dev).to(torch.float32)
 
         fp4_groups = R.dense_fp4_groups()
 
         def fp8lin(name):
+            t = ov(name + ".weight")
+            if t is not None:
+                # bf16 in, the checkpoint's own stored format out -- same kernels, same bytes/step
+                if R.quantize_to_fp8 is None:
+                    return t.to(torch.bfloat16)
+                return R.maybe_fp4(R.quantize_to_fp8(t.to(torch.bfloat16)), name, fp4_groups)
             w, sc = get(p + name + ".weight").to(dev), get(p + name + ".scale").to(dev)
             if R.FP8Weight is not None and os.environ.get("DSV41_DENSE_FP8", "1") == "1":
                 return R.maybe_fp4(R.FP8Weight(w, sc), name, fp4_groups)
             return R.dequant_fp8_block(w, sc)
 
+        def wo_a():
+            t = ov("attn.wo_a.weight")
+            if t is None:
+                return R.make_wo_a(get(p + "attn.wo_a.weight").to(dev),
+                                   get(p + "attn.wo_a.scale").to(dev), args, fp4_groups)
+            # [G, R, K] bf16 -> the grouped stored format, addressed as [G*R, K]
+            if R.FP8GroupedWeight is None or R.quantize_to_fp8 is None:
+                return t.to(torch.bfloat16).view(args.o_groups, args.o_lora_rank, -1)
+            q = R.quantize_to_fp8(t.to(torch.bfloat16).reshape(-1, t.shape[-1]))
+            g = R.FP8GroupedWeight(q.w, q.s, args.o_groups, args.o_lora_rank)
+            return R.quantize_fp8_grouped_to_fp4(g) if "wo_a" in fp4_groups else g
+
         self.attn_norm = bf("attn_norm.weight"); self.ffn_norm = bf("ffn_norm.weight")
         self.attn_sink = f32("attn.attn_sink"); self.q_norm = bf("attn.q_norm.weight"); self.kv_norm = bf("attn.kv_norm.weight")
         self.wq_a = fp8lin("attn.wq_a"); self.wq_b = fp8lin("attn.wq_b"); self.wkv = fp8lin("attn.wkv")
-        self.wo_a = R.make_wo_a(get(p + "attn.wo_a.weight").to(dev), get(p + "attn.wo_a.scale").to(dev), args, fp4_groups); self.wo_b = fp8lin("attn.wo_b")
+        self.wo_a = wo_a(); self.wo_b = fp8lin("attn.wo_b")
         self.hc_attn_fn = f32("hc_attn_fn"); self.hc_ffn_fn = f32("hc_ffn_fn")
         self.hc_attn_base = f32("hc_attn_base"); self.hc_ffn_base = f32("hc_ffn_base")
         self.hc_attn_scale = f32("hc_attn_scale"); self.hc_ffn_scale = f32("hc_ffn_scale")
@@ -174,8 +247,8 @@ class MTPWeights:
             self.markov_embed = bf("markov_head.embed.weight")
             # fp32 once, for the same reason as the LM head: this one is applied once per drafted
             # token, i.e. five times per DSpark step.
-            self.markov_head = get(p + "markov_head.head.weight").to(dev).to(torch.bfloat16)
-            self.conf_proj = get(p + "confidence_head.proj.weight").to(dev).float()
+            self.markov_head = bf("markov_head.head.weight")
+            self.conf_proj = f32("confidence_head.proj.weight")
 
 
 # ----------------------------------------------------------------------------- caches
