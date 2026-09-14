@@ -40,6 +40,7 @@ import webbrowser
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import atlas_export as AX  # noqa: E402
 import budget as B  # noqa: E402
+import gate_records as GR  # noqa: E402
 import keep_for_context as K  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -362,7 +363,12 @@ def read_gate(path: str) -> list:
                     # A `| only |` row means named prompts were re-run. It says
                     # those pass and nothing about the ones that were not run,
                     # so it is never a profile's record.
-                    "filtered": _card(lines, "only") is not None, **cfg})
+                    "filtered": _card(lines, "only") is not None,
+                    # Neither is a run taken with the reasoning-span controls or
+                    # any other non-default decode control on: it measures a
+                    # decode path the box does not serve with. The rule is
+                    # tools/gate_records.py, shared with tools/tail_metric.py.
+                    "controls": GR.decode_controls(lines), **cfg})
     return out
 
 
@@ -395,19 +401,27 @@ def read_gates_index(root: str = None) -> dict:
 
 def gate_for(record: str | None, topics, index: dict = None, root: str = None) -> dict | None:
     """This profile's gate record: the newest full run in its GATE.md whose
-    topic list is exactly the profile's.
+    topic list is exactly the profile's and which was taken with default decode
+    controls.
 
     Exactly, not loosely, because a run on a different bundle is a different
     measurement -- `reasoning_lang` moved European languages from 6 of 10 to 3
     of 10 and World languages from 3 of 10 to 6 of 10, on the same keep-set and
     the same night (RESULTS.md, 2026-09-14). A profile that ships without a
     topic must not show the number the run WITH it produced.
+
+    Default controls for the same reason one step down: a run with
+    `DSV41_THINK_BUDGET` or `DSV41_THINK_REPEAT_BREAK` set (tools/
+    verify_think_controls.sh appends four of them to frontend/ and backend/)
+    measures a decode path this box does not serve with, so it is an experiment
+    beside the record and never the record itself.
     """
     if not record:
         return None
     path = os.path.join(root or ROOT, "results", "keepsets", record, GATE_BASENAME)
     want = sorted(topics)
-    runs = [g for g in read_gate(path) if not g["filtered"] and sorted(g["topics"]) == want]
+    runs = [g for g in read_gate(path)
+            if not g["filtered"] and not g["controls"] and sorted(g["topics"]) == want]
     if not runs:
         return None
     g = dict(runs[-1])

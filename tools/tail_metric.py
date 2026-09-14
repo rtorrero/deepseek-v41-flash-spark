@@ -41,7 +41,9 @@ The record-selection rule and the gate-card parser below are a deliberate second
 implementation of the ones in `tools/tune.py`, not an import of them: that module
 pulls `curses` at import time, and a metrics CLI has no business needing a terminal.
 `tools/test_tail_metric.py` holds the two to the same record for every shipped
-profile, so they cannot drift apart quietly.
+profile, so they cannot drift apart quietly. The one piece both import rather
+than restate is `tools/gate_records.py`, which decides whether a run was taken
+with default decode controls -- a rule that has to move in both at once.
 """
 
 from __future__ import annotations
@@ -56,6 +58,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import budget as B  # noqa: E402
+import gate_records as GR  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATS_DEFAULT = os.path.join(ROOT, "results", "keepsets", "topics", "coverage.json")
@@ -161,21 +164,29 @@ def read_gate(path: str) -> list:
                     # A `| only |` row means named prompts were re-run: it says
                     # those pass and nothing about the ones that were not run,
                     # so it is never a profile's record.
-                    "filtered": _card(lines, "only") is not None})
+                    "filtered": _card(lines, "only") is not None,
+                    # Nor is a run taken with the reasoning-span controls, or any
+                    # other non-default decode control the card names: it measures
+                    # a decode path the box does not serve with.
+                    "controls": GR.decode_controls(lines)})
     return out
 
 
 def gate_for(record: str | None, topics, root: str = ROOT) -> dict | None:
     """The newest full run in this profile's GATE.md whose topic list is EXACTLY
-    the profile's. Exactly, because a run on a different bundle is a different
-    measurement: `reasoning_lang` moved European languages from 6 of 10 to 3 of
-    10 and World languages from 3 of 10 to 6 of 10 on the same keep-set and the
-    same night."""
+    the profile's and which was taken with default decode controls. Exactly,
+    because a run on a different bundle is a different measurement:
+    `reasoning_lang` moved European languages from 6 of 10 to 3 of 10 and World
+    languages from 3 of 10 to 6 of 10 on the same keep-set and the same night.
+    Default controls, because a run with `DSV41_THINK_BUDGET` or
+    `DSV41_THINK_REPEAT_BREAK` set measures a decode path the box does not serve
+    with -- it belongs beside the record as an A/B, not in place of it."""
     if not record:
         return None
     path = os.path.join(root, "results", "keepsets", record, "GATE.md")
     want = sorted(topics)
-    runs = [g for g in read_gate(path) if not g["filtered"] and sorted(g["topics"]) == want]
+    runs = [g for g in read_gate(path)
+            if not g["filtered"] and not g["controls"] and sorted(g["topics"]) == want]
     if not runs:
         return None
     g = dict(runs[-1])

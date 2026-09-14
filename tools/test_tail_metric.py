@@ -325,6 +325,58 @@ if os.path.exists(STATS) and os.path.exists(GATES):
 else:
     print("skip the shipped-file checks (no results/keepsets/topics/coverage.json)")
 
+
+# =============================================================================
+# 5. the record-selection rule, on a synthetic GATE.md
+# =============================================================================
+# tools/verify_think_controls.sh appends gate runs taken with DSV41_THINK_BUDGET
+# (and DSV41_THINK_REPEAT_BREAK) to results/keepsets/{frontend,backend}/GATE.md.
+# They measure a decode path the box does not serve with, so the newest of them
+# is never the profile's record -- the newest run taken with the controls OFF is.
+# The predicate is tools/gate_records.py, imported by this module and by
+# tools/tune.py alike; the same case is in tools/test_tune_profiles.py.
+def section(when, controls, strict=5, finished=None, runs=10):
+    """One gate card in the shape tools/gate_profile.py writes it."""
+    rows = [f"# Generation gate \u2014 {when}", "", "| | |", "|---|---|",
+            "| profile | Synthetic |", "| topics | html, css |",
+            f"| prompts | {runs} runs over {runs} prompts |", "| thinking | on |",
+            "| keep-set | PRUNE_KEEP=0.36, DSV41_PRUNE_RANK=maxmin, "
+            "DSV41_PRUNE_SOURCE=saliency |"]
+    if controls is not None:
+        rows.append(f"| reasoning-span controls | {controls} |")
+    rows += ["", "| prompt | thinking | finish | why |", "|---|---|---|---|",
+             "| `css-card` | on | stop | ok |", "",
+             f"**Verdict: FAIL** \u2014 {runs - strict} of {runs} runs failed: `css-card` (on) no",
+             "",
+             f"{finished if finished is not None else strict} of {runs} finished a correct "
+             "answer (strict passes plus repeat-only misses); misses by kind: think-exit 0, "
+             f"guard 0, corrupt 0, content {runs - strict}.", ""]
+    return "\n".join(rows)
+
+
+synth = os.path.join(TMP, "results", "keepsets", "synthetic")
+os.makedirs(synth, exist_ok=True)
+open(os.path.join(synth, "GATE.md"), "w").write("\n".join([
+    section("2026-09-14 03:36",
+            "off (neither DSV41_THINK_BUDGET nor DSV41_THINK_REPEAT_BREAK was set)",
+            strict=3, finished=10),
+    section("2026-09-14 20:04", "DSV41_THINK_BUDGET=2000", strict=9),
+    section("2026-09-14 22:41", "DSV41_THINK_BUDGET=2000, DSV41_THINK_REPEAT_BREAK=12", strict=8),
+]))
+seen = TM.read_gate(os.path.join(synth, "GATE.md"))
+check("the control runs are read, and named", [x["controls"] for x in seen],
+      [[], ["DSV41_THINK_BUDGET=2000"],
+       ["DSV41_THINK_BUDGET=2000", "DSV41_THINK_REPEAT_BREAK=12"]])
+g = TM.gate_for("synthetic", ["html", "css"], root=TMP)
+check("the record is the newest DEFAULT run, not the newest run", g["run"], "2026-09-14 03:36")
+check("  with that run's counts", (g["strict"], g["runs"], g["finished"]), (3, 10, 10))
+try:
+    import tune as T2  # noqa: E402
+    check("  and tune.py picks the same one",
+          T2.gate_for("synthetic", ["html", "css"], {}, root=TMP)["run"], g["run"])
+except Exception as e:  # noqa: BLE001
+    print(f"skip the tune.py cross-check on the synthetic file ({type(e).__name__}: {e})")
+
 print()
 if fails:
     print(f"{len(fails)} FAILED: {', '.join(fails[:8])}{' ...' if len(fails) > 8 else ''}")

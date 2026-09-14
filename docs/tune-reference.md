@@ -377,6 +377,12 @@ run in that file whose topic list is exactly the profile's** — a filtered re-r
 card) is never a record, because it says the prompts it ran pass and nothing about the ones it did
 not, and neither is a run on a different bundle.
 
+Nor is a run taken with **non-default decode controls**: a card naming `DSV41_THINK_BUDGET` or
+`DSV41_THINK_REPEAT_BREAK` in its `| reasoning-span controls |` row (the four runs
+`tools/verify_think_controls.sh` appends to `frontend/` and `backend/`), or any later control row
+the card writer grows, measures a decode path this box does not serve with, so it sits beside the
+record as an A/B and never in place of it. The rule is `tools/gate_records.py`.
+
 | what is shown | where it comes from |
 |---|---|
 | `7 of 10 strict` | the runs the gate passed outright, out of `**Verdict:**` in that section |

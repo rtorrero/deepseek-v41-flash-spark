@@ -71,6 +71,15 @@ all 37 by hand and shows what that costs. Those three records are kept as the re
 | `gates.json` | which run is each profile's current record, and the keep fraction and ranking pair it was measured at — the one thing a card written before 2026-09-14 does not carry |
 | `tail_metric.json` | the coverage bar and four tail alternatives to it, scored against those records (`tools/tail_metric.py`) |
 
+Not every run in a `GATE.md` is the profile's **record**. A filtered re-run (`| only |` in its card)
+is not, a run on a different topic bundle is not, and neither is a run taken with non-default decode
+controls — a `| reasoning-span controls |` row naming `DSV41_THINK_BUDGET` or
+`DSV41_THINK_REPEAT_BREAK`, as the four `tools/verify_think_controls.sh` runs appended to
+`frontend/` and `backend/` do: those measure a decode path the box does not serve with and belong
+beside the record as an A/B, not in place of it. The record is the newest run that is none of those,
+which is what `./tune.sh`, `--print`, `gates.json` and `tools/tail_metric.py` all read
+(`tools/gate_records.py`).
+
 `tail_metric.json` exists because the coverage bar stopped resolving anything once the box was
 served on `saliency`: the ten shipped profiles read 0.936 to 0.965 while their gates run from 3 of
 10 to 8 of 11, and a keep-set swap of 513 resident experts moved every bar by 0.005 and flipped a

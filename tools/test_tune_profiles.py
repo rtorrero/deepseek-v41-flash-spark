@@ -299,6 +299,69 @@ check("every index entry names a run that is in its file",
        if k[1] not in {x["run"] for x in
                        T.read_gate(os.path.join(KEEPSETS, k[0], T.GATE_BASENAME))}], [])
 
+# --- a run taken with non-default decode controls is not a record ------------
+# tools/verify_think_controls.sh appends four gate runs to frontend/ and
+# backend/ taken with DSV41_THINK_BUDGET (and on two of them
+# DSV41_THINK_REPEAT_BREAK) set. They are an A/B against the baseline beside
+# them, not the profile's result: the box serves with neither set, so the screen,
+# --print and gates.json must keep reading the newest DEFAULT run. The rule is
+# tools/gate_records.py, shared with tools/tail_metric.py.
+def section(when, controls, strict=5, finished=None, runs=10, extra=()):
+    """One gate card in the shape tools/gate_profile.py writes it."""
+    rows = [f"# Generation gate \u2014 {when}", "", "| | |", "|---|---|",
+            "| profile | Synthetic |", "| topics | html, css |",
+            f"| prompts | {runs} runs over {runs} prompts |", "| thinking | on |",
+            "| reasoning effort | 45 |", "| max tokens | 16,000 |",
+            "| keep-set | PRUNE_KEEP=0.36, DSV41_PRUNE_RANK=maxmin, "
+            "DSV41_PRUNE_SOURCE=saliency |"]
+    rows += list(extra)
+    if controls is not None:
+        rows.append(f"| reasoning-span controls | {controls} |")
+    rows += ["", "| prompt | thinking | finish | why |", "|---|---|---|---|",
+             "| `css-card` | on | stop | ok |", "",
+             f"**Verdict: FAIL** \u2014 {runs - strict} of {runs} runs failed: `css-card` (on) no",
+             "",
+             f"{finished if finished is not None else strict} of {runs} finished a "
+             "correct answer (strict passes plus repeat-only "
+             "misses); misses by kind: think-exit 0, guard 0, corrupt 0, content "
+             f"{runs - strict}.", ""]
+    return "\n".join(rows)
+
+
+CONTROLS_OFF = "off (neither DSV41_THINK_BUDGET nor DSV41_THINK_REPEAT_BREAK was set)"
+synth = os.path.join(TMP, "results", "keepsets", "synthetic")
+os.makedirs(synth, exist_ok=True)
+open(os.path.join(synth, T.GATE_BASENAME), "w").write("\n".join([
+    section("2026-09-13 00:55", None, strict=4),                        # before the row existed
+    section("2026-09-14 03:36", CONTROLS_OFF, strict=3, finished=10),   # the record
+    section("2026-09-14 20:04", "DSV41_THINK_BUDGET=2000", strict=9),
+    section("2026-09-14 22:41", "DSV41_THINK_BUDGET=2000, DSV41_THINK_REPEAT_BREAK=12", strict=8),
+]))
+seen = T.read_gate(os.path.join(synth, T.GATE_BASENAME))
+check("all four synthetic runs parse", [x["run"] for x in seen],
+      ["2026-09-13 00:55", "2026-09-14 03:36", "2026-09-14 20:04", "2026-09-14 22:41"])
+check("  a card written before the row is a default run", seen[0]["controls"], [])
+check("  an explicit off row is a default run", seen[1]["controls"], [])
+check("  a budget run names what it was taken with", seen[2]["controls"],
+      ["DSV41_THINK_BUDGET=2000"])
+check("  and a budget-plus-break run names both", seen[3]["controls"],
+      ["DSV41_THINK_BUDGET=2000", "DSV41_THINK_REPEAT_BREAK=12"])
+g = T.gate_for("synthetic", ["html", "css"], {}, root=TMP)
+check("the record is the newest DEFAULT run, not the newest run", g["run"], "2026-09-14 03:36")
+check("  with that run's counts", (g["strict"], g["runs"], g["finished"]), (3, 10, 10))
+
+# A control set to zero is the control not being on; so is a row the parser has
+# never seen that says it is off.
+open(os.path.join(synth, T.GATE_BASENAME), "a").write(
+    section("2026-09-15 01:10", "DSV41_THINK_BUDGET=0", strict=6) + "\n")
+check("a control at zero is a default run", T.gate_for("synthetic", ["html", "css"], {},
+      root=TMP)["run"], "2026-09-15 01:10")
+open(os.path.join(synth, T.GATE_BASENAME), "a").write(
+    section("2026-09-15 03:20", None, strict=6,
+            extra=["| escape hatch | DSV41_ESCAPE_K=1, DSV41_ESCAPE_MARGIN=0.10 |"]) + "\n")
+check("a control row the card writer gains later disqualifies too",
+      T.gate_for("synthetic", ["html", "css"], {}, root=TMP)["run"], "2026-09-15 01:10")
+
 # --- what the screen does with it -------------------------------------------
 # The keep fraction a shipped profile is budgeted at is the one its gate ran at,
 # not the one the coverage target implies. Under `saliency` those are three
