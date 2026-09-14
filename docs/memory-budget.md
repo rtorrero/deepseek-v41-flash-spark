@@ -271,10 +271,50 @@ Reproduce any row without a terminal:
 ./tune.sh --keep 0.42 --print
 ```
 
+## Asking the ladder instead of reading it
+
+The ceiling above is a function of `MAX_SEQ`, because the KV cache and the prefill term both are.
+`tools/keep_for_context.py` is that question asked directly — the largest **step** of the ladder
+whose plan clears both gates, which is not the continuous `max_keep` above: the engine rounds the
+per-layer count up (`ceil(keep x 384)`), so a plan at the continuous ceiling is already over it.
+
+```bash
+$ python3 tools/keep_for_context.py --max-seq 262144
+PRUNE_KEEP=auto -> 0.36 for MAX_SEQ=262144 (fits with 3.3 GB spare)
+
+$ python3 tools/keep_for_context.py --max-seq 262144 --bare
+0.36
+$ python3 tools/keep_for_context.py --max-seq 262144 --arena
+81
+```
+
+On a 121 GiB box, reading `MemAvailable` as the 117.0 GB stand-in this document uses elsewhere:
+
+| `MAX_SEQ` | KV | prefill reserve | largest step that fits | arena |
+|---|---|---|---|---|
+| 32k | 0.3 GB | 7.7 GB | 38 % | 85 GB |
+| 64k | 0.4 GB | 8.2 GB | 38 % | 85 GB |
+| 128k | 0.6 GB | 9.2 GB | 38 % | 85 GB |
+| 256k | 1.0 GB | 11.3 GB | 36 % | 81 GB |
+
+The 256k row is the one the record measured: 0.36 with an 81 GB arena served a filled 256k
+context, and 0.40 with 89.2 GB served short prompts and was killed 582 s into a 195k-token
+prefill. The spare it reports is the tighter of the two gates, so a row that says `fits with 3.3
+GB spare` has 3.3 GB on the gate that binds and more on the other.
+
+`PRUNE_KEEP=auto` in `.env` is this call, made by `./start.sh` before it launches anything; it
+then sizes `ARENA_GB` from the answer when none is pinned, because the engine's own automatic
+sizing takes 82 % of what is free and that is more arena than a filled context can afford. A
+pinned `ARENA_GB` caps the answer instead — the kept set has to fit inside it, less the transient
+ring — and when the pinned arena is itself too big for the context, the tool says so rather than
+walking the ladder down, since the keep fraction is not what is over budget. Below 36 % it still
+answers and warns: no keep-set that small has ever been through a generation gate here.
+
 ## Where this is checked
 
 ```bash
 python3 tools/test_budget.py
+python3 tools/test_keep_for_context.py
 ```
 
 Cross-checks the slot sizes against the kernel's own constant, the KV formula against two measured
