@@ -108,13 +108,16 @@ one_run() {
     local label="run $id: $profile, budget=$BUDGET, repeat-break=$ngram"
     local out penv rc=0
     out="$(gate_out "$profile")" || err "no profile named '$profile' (tools/tune.py:PROFILES)"
-    penv="$(profile_env "$profile")" \
-        || err "tune.py says $profile at keep $KEEP / max_seq $MAX_SEQ does not fit this box"
+    # The budget model reads live memory, so with an engine still loaded the
+    # profile does not "fit". Derive after the stop; for --list, show what can
+    # be shown now.
+    penv="$(profile_env "$profile")" || penv=""
 
     if $LIST; then
         echo "$label"
         echo "    record  $out"
-        printf '%s\n' "$penv" | sed 's/^/    env     /'
+        if [ -n "$penv" ]; then printf '%s\n' "$penv" | sed 's/^/    env     /'
+        else echo "    env     (an engine is loaded now; derived after ./stop.sh at run time)"; fi
         echo "    env     DSV41_THINK_BUDGET=$BUDGET DSV41_THINK_REPEAT_BREAK=$ngram"
         echo "    gate    $PYTHON tools/gate_profile.py --profile $profile --thinking on --url $URL"
         return 0
@@ -122,6 +125,13 @@ one_run() {
 
     say "$label  ($(date '+%Y-%m-%d %H:%M:%S'))"
     ./stop.sh >>"$LOG" 2>&1 || true
+    # give the arena back before the budget model looks at MemAvailable
+    for _ in $(seq 1 30); do
+        avail=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo 2>/dev/null || echo 999)
+        [ "$avail" -ge 90 ] && break; sleep 2
+    done
+    penv="$(profile_env "$profile")" \
+        || err "tune.py says $profile at keep $KEEP / max_seq $MAX_SEQ does not fit this box (after stop)"
 
     # One subshell per run: the keep-set and the two controls leave with it, so
     # run 3 cannot inherit run 1's environment.
