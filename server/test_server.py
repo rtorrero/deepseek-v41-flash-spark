@@ -327,6 +327,84 @@ def test_max_tokens_length():
     assert s["finish"] == "length" and s["usage"]["completion_tokens"] == 5 and s["done"]
 
 
+def test_reasoning_budget_resolution():
+    """How a request asks for the two reasoning-span controls (server/think_controls.py).
+
+    The full precedence and the validation live in server/test_think_controls.py, which needs no
+    server; this is the same resolver seen through HTTP, where a client actually sets it.
+    """
+    def probe(**kw):
+        status, r = post("/v1/debug/prompt", {"messages": [{"role": "user", "content": "q"}], **kw})
+        assert status == 200, r
+        return r["reasoning_budget"], r["think_repeat_break"]
+
+    assert probe() == (0, 0)                                    # both off unless asked for
+    assert probe(reasoning_budget=8000) == (8000, 0)
+    assert probe(reasoning={"effort": "high", "max_tokens": 8000}) == (8000, 0)
+    assert probe(chat_template_kwargs={"reasoning_budget": 500}) == (500, 0)
+    assert probe(think_repeat_break=12) == (0, 12)
+    assert probe(reasoning_budget=4000, think_repeat_break=12) == (4000, 12)
+    status, err = post("/v1/debug/prompt", {"messages": [{"role": "user", "content": "q"}],
+                                            "reasoning_budget": -5})
+    assert status == 400 and err["error"]["param"] == "reasoning_budget", err
+    status, err = post("/v1/debug/prompt", {"messages": [{"role": "user", "content": "q"}],
+                                            "think_repeat_break": 1})
+    assert status == 400 and err["error"]["param"] == "think_repeat_break", err
+
+
+def test_reasoning_budget_closes_the_think_block():
+    """The budget cuts the deliberation and the answer is still produced.
+
+    The mock engine honours the same decision object the real decode loop masks with
+    (engine_api.MockEngine._with_think_controls), so everything the HTTP layer owes a caller can be
+    checked here: the reasoning stops at the budget, the answer is whole, `reasoning_tokens` is the
+    budget, and `reasoning_budget_hit` says the server ended the reasoning rather than the model.
+    """
+    status, full = chat(reasoning_effort="high")
+    assert status == 200, full
+    long_reasoning = full["choices"][0]["message"]["reasoning_content"]
+    assert "reasoning_budget_hit" not in full["usage"]["completion_tokens_details"], full["usage"]
+
+    status, r = chat(reasoning_effort="high", reasoning_budget=5)
+    assert status == 200, r
+    msg = r["choices"][0]["message"]
+    d = r["usage"]["completion_tokens_details"]
+    assert d["reasoning_tokens"] == 5, d
+    assert d["reasoning_budget_hit"] is True, d
+    assert msg["reasoning_content"] and len(msg["reasoning_content"]) < len(long_reasoning)
+    assert long_reasoning.startswith(msg["reasoning_content"]), msg["reasoning_content"]
+    assert "</think>" not in msg["reasoning_content"] and "</think>" not in msg["content"]
+    assert msg["content"].startswith("Hello from the mock engine") \
+        and msg["content"].endswith("without a GPU."), "the answer is untouched"
+    assert r["choices"][0]["finish_reason"] == "stop"
+    tc = r["x_engine_stats"]["think_controls"]
+    assert tc["budget"] == 5 and tc["budget_forced"] >= 1 and tc["repeat_ngram"] == 0, tc
+
+    # ... and it streams the same way
+    s = reassemble(post_stream("/v1/chat/completions", {
+        "model": "x", "messages": [{"role": "user", "content": "hi"}], "stream": True,
+        "reasoning_effort": "high", "reasoning_budget": 5}))
+    assert s["done"] and s["reasoning"] == msg["reasoning_content"] and s["content"] == msg["content"]
+    assert s["usage"]["completion_tokens_details"]["reasoning_budget_hit"] is True
+
+
+def test_reasoning_controls_are_scoped_to_thinking():
+    """With thinking off there is no reasoning span, so neither control is built and the reply is
+    the one every other test sees. A budget larger than the deliberation never fires either."""
+    status, r = chat(reasoning_budget=5, think_repeat_break=12)          # thinking off by default
+    assert status == 200, r
+    assert r["choices"][0]["message"]["content"].startswith("Hello from the mock engine")
+    assert "reasoning_budget_hit" not in r["usage"]["completion_tokens_details"]
+    assert "think_controls" not in r["x_engine_stats"], r["x_engine_stats"]
+
+    status, r = chat(reasoning_effort="high", reasoning_budget=100_000, think_repeat_break=12)
+    assert status == 200, r
+    d = r["usage"]["completion_tokens_details"]
+    assert 0 < d["reasoning_tokens"] and "reasoning_budget_hit" not in d, d
+    tc = r["x_engine_stats"]["think_controls"]
+    assert tc["repeat_ngram"] == 12 and tc["budget_forced"] == 0 and tc["repeat_breaks"] == 0, tc
+
+
 def test_completions():
     status, r = post("/v1/completions", {"model": "x", "prompt": "<｜User｜>hi<｜Assistant｜></think>",
                                          "max_tokens": 64, "seed": 7})

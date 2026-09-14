@@ -46,6 +46,15 @@ Contract (see ``Engine``):
   (beyond one token that has no legal use outside it), and the plain-text gate
   masks that one token, so an engine may call both unconditionally.
   ``server/tool_grammar.py`` implements them.
+* Optional ``think`` keyword: reasoning-span controls, passed to any engine whose
+  ``supports_think_controls`` is true, and only for a request with thinking on.
+  Same two-call contract as the gate above -- ``observe(ids)`` for every settled
+  token and ``mask_rows(logits, block_ids)`` before the accept/reject decision --
+  except that it only ever masks **row 0**, because both of its decisions are
+  functions of the settled history. Call it *after* any penalty pass: it can
+  force ``</think>`` by masking everything else out of the row, and a penalty
+  applied afterwards could ban that one surviving token. See
+  ``server/think_controls.py``; with ``think=None`` nothing changes.
 * Optional ``context_margin`` (int, default 8 as read by the server): tokens
   the engine needs beyond ``len(prompt_ids) + max_tokens`` (DSpark draft
   block); the server clamps ``max_tokens`` so that
@@ -75,6 +84,8 @@ class Engine(ABC):
     max_context: int = 32768
     #: does ``generate`` honour a ``grammar`` gate? The server only builds one if it does.
     supports_grammar: bool = False
+    #: does ``generate`` honour a ``think`` control object? Same rule: no builder if not.
+    supports_think_controls: bool = False
 
     @abstractmethod
     def generate(
@@ -120,6 +131,13 @@ class MockEngine(Engine):
     * If the prompt ends with ``<think>`` the reply starts with a reasoning
       block terminated by ``</think>``; if it ends with ``</think>`` (chat
       mode) the reply is content only.
+    * A ``think`` control object is honoured: before each reasoning token the
+      mock asks it the same question the real decode loop asks (``force_token``)
+      and, when the budget is spent, emits ``</think>`` there instead and carries
+      on with the answer. That is what the real engine achieves by masking every
+      other token out of the row, so the HTTP layer -- the resolved budget, the
+      split into ``reasoning_content``/``content``, ``reasoning_tokens`` and
+      ``reasoning_budget_hit`` -- can be tested end to end without a GPU.
     * If the prompt carries a V4.1 tool schema block the reply is a valid DSML
       tool call against the first listed tool (first declared parameter,
       string-typed), so tool-call parsing can be verified.
@@ -186,7 +204,32 @@ class MockEngine(Engine):
             parts.append(MOCK_CONTENT)
         return "".join(parts)
 
+    def _with_think_controls(self, ids: List[int], think) -> List[int]:
+        """Replay ``ids`` past the controls, cutting the reasoning where they say.
+
+        The canned ids are never re-tokenized -- the list is walked as it is and
+        the forced ``</think>`` replaces the token that would have come next --
+        so with the controls off, or with a budget the canned reasoning never
+        reaches, the reply is byte-for-byte the one every other test sees.
+        """
+        if think is None or not getattr(think, "active", False) or self.think_end_id not in ids:
+            return ids
+        close_at = ids.index(self.think_end_id)
+        out: List[int] = []
+        for i, t in enumerate(ids):
+            forced = think.force_token()
+            if forced is not None:
+                think.observe([forced])
+                return out + [forced] + ids[close_at + 1:]
+            out.append(t)
+            think.observe([t])
+            if not think.in_think:          # the canned close went by; the rest is the answer
+                return out + ids[i + 1:]
+        return out
+
     # -- Engine ----------------------------------------------------------
+    supports_think_controls = True
+
     def generate(
         self,
         prompt_ids: List[int],
@@ -196,9 +239,10 @@ class MockEngine(Engine):
         top_p: float,
         stop_token_ids: Set[int],
         seed: Optional[int],
+        think=None,
     ) -> Iterator[List[int]]:
-        ids = self._encode(self._reply_text(prompt_ids)) + [self.eos_token_id]
-        ids = ids[:max_tokens]
+        ids = self._with_think_controls(self._encode(self._reply_text(prompt_ids)), think)
+        ids = (ids + [self.eos_token_id])[:max_tokens]
         rng = random.Random(seed if seed is not None else 1234)
         t0 = time.perf_counter()
         emitted = 0
