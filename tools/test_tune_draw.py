@@ -365,6 +365,34 @@ at = next(i for i, r in enumerate(rows) if "No gate" in r)
 check("a profile with no gate reads untested", "untested" in rows[at])
 check("  and gets no gate line of its own", "gated" not in rows[at + 2], repr(rows[at + 2]))
 
+
+# --- a profile gated with thinking off says so on its own row ----------------
+# It is the one thing on the row a reader has to act on before running it: the
+# counts beside it were produced with thinking off, and with it on the same
+# keep-set loops on the same prompts (both language bundles, 2026-09-14).
+st = T.State(host, topic_index, topic_stats, 0.36, 32768, "cb3", [],
+             rank="maxmin", source="saliency")
+profs = {p["name"]: p for p in st.profiles()}
+world = profs["World languages"]
+check("the profile knows its thinking default", world["thinking"] == "off", world["thinking"])
+check("  and the gate line carries it wherever there is room",
+      all("thinking off by default" in T.gate_line(world, st, w) for w in (100, 140, 200)),
+      T.gate_line(world, st, 100))
+check("  a narrow line drops it rather than running off the row",
+      len(T.gate_line(world, st, 60)) <= 60, T.gate_line(world, st, 60))
+check("  a profile that does not ask for one never says it",
+      "thinking" not in T.gate_line(profs["Frontend"], st, 200),
+      T.gate_line(profs["Frontend"], st, 200))
+
+st.pcursor = [p["name"] for p in st.profiles()].index("World languages")
+rows = [render(st, 40, 160).row(y) for y in range(40)]
+at = next(i for i, r in enumerate(rows) if "World languages" in r)
+check("the profile screen shows it", "thinking off by default" in rows[at + 2], repr(rows[at + 2]))
+for h, w in ((20, 70), (24, 80), (30, 100), (40, 160), (60, 200)):
+    win = render(st, h, w)
+    if any(len(win.row(y)) > w for y in range(h)):
+        check(f"the language profile at {w}x{h}", False, "a row is wider than the window")
+
 print()
 print(f"{len(fails)} failed" if fails else "all checks passed")
 sys.exit(1 if fails else 0)

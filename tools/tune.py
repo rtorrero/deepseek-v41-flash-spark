@@ -14,6 +14,7 @@ the footer says which topic is worst served and what it would take to fix.
   ./tune.sh                       interactive
   ./tune.sh --list                the topics this keep-set carries
   ./tune.sh --topics a,b --print  the environment a selection implies
+  ./tune.sh --keep auto           let the context length choose the keep fraction
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ import webbrowser
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import atlas_export as AX  # noqa: E402
 import budget as B  # noqa: E402
+import keep_for_context as K  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -78,6 +80,17 @@ BLOCKS = " ▏▎▍▌▋▊▉█"
 # at keep 0.36, that is english at 0.522 against css at 0.820. `maxmin` spends
 # the same budget on the worst-served topic instead and lands every one of the
 # seven between 0.676 and 0.699, which is the quantity a bundle is chosen for.
+#
+# The sixth is optional and is the profile's THINKING default -- `on` unless it
+# says otherwise, and `off` where thinking on is what breaks the profile rather
+# than what improves it. It is a measurement like the rest: both language
+# bundles pass 4 of 4 on their natural-language prompts with thinking off and
+# loop on some of them with it on (results/keepsets/world_languages/GATE.md and
+# european_languages/GATE.md, 2026-09-14), and whole-file generation is the same
+# (RESULTS.md, 2026-09-14). `--print` and `--write` emit it as DEFAULT_THINKING,
+# which is the variable ./start.sh already reads, so applying such a profile
+# configures the default the way its gate was run -- and a request can still ask
+# for thinking explicitly, which is what makes it a default and not a switch.
 PROFILES = [
     # Every profile carries `reasoning` and `reasoning_code`: a user runs any of these with
     # thinking on, and the experts that write deliberation -- and the ones that END it and begin
@@ -118,12 +131,18 @@ PROFILES = [
     # opposite directions: European went from 6 of 10 to 3 of 10 (fr/de still loop, pt/es fell),
     # World from 3 of 10 to 6 of 10 (zh and ru now finish). So the topic ships in World only.
     # Thinking on in a non-English language remains the weakest row; thinking off is served.
+    # Both bundles default to thinking OFF, and that is the gate record talking: with it off
+    # every language in both came out clean -- 4 of 4 on the natural-language prompts of each
+    # GATE.md, 2026-09-14 -- and whole-file generation held; with it on, French, German,
+    # Chinese and Japanese corrupted a word and looped. A keep-set this size cannot carry
+    # deliberation in a language it was never traced deliberating in, and the honest default
+    # is not to pretend otherwise. A request that asks for thinking still gets it.
     ("European languages", "English, German, French, Spanish, Italian, Portuguese, translation",
      ["english", "german", "french", "spanish", "italian", "portuguese", "translation",
-      "reasoning", "reasoning_code"], "european_languages", "maxmin"),
+      "reasoning", "reasoning_code"], "european_languages", "maxmin", "off"),
     ("World languages", "English, Arabic, Chinese, Japanese, Russian, Turkish, translation",
      ["english", "arabic", "chinese", "japanese", "russian", "turkish", "translation",
-      "reasoning", "reasoning_code", "reasoning_lang"], "world_languages", "maxmin"),
+      "reasoning", "reasoning_code", "reasoning_lang"], "world_languages", "maxmin", "off"),
     ("Writing", "Journalism, marketing copy, essays, translation",
      ["english", "journalism", "marketing", "academic", "translation",
       "reasoning", "reasoning_code"], "writing", "maxmin"),
@@ -131,7 +150,11 @@ PROFILES = [
     # profile this box can serve and is no longer offered as one; the topic screen still lets a
     # user select every topic by hand, and the screen will show what that costs.
 ]
-KEEP_STEPS = [round(0.02 * i, 2) for i in range(3, 31)]          # 6 % .. 60 %
+# The keep ladder, and the resolver `PRUNE_KEEP=auto` uses, in one place:
+# tools/keep_for_context.py. The screen slides the keep along these steps and
+# ./start.sh resolves `auto` onto them, and a screen that offered a rung the
+# launcher does not know would be offering a number nobody can serve.
+KEEP_STEPS = K.KEEP_STEPS                                        # 6 % .. 60 %
 CTX_STEPS = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
 # The coverage a selected topic should reach. There is no universal right
 # value: 0.85 is where the shipped keep-sets sit for the domains they were
@@ -502,7 +525,17 @@ def read_profiles(path: str) -> tuple:
             if t not in seen:
                 seen.add(t)
                 want.append(t)
-        out.append((" ".join(name.split()), " ".join(desc.split()), want, None, where, None))
+        # Optional, and the same field the shipped profiles carry: a bundle whose
+        # gate was run with thinking off can say so here too. Anything other than
+        # on/off costs this profile and nothing else, like every other problem in
+        # the file -- silently serving `on` for a typo would be the one outcome
+        # that matters, since it is the setting the profile was written to change.
+        think = e.get("thinking")
+        if think is not None and think not in ("on", "off"):
+            problems.append(f"{label}: thinking must be \"on\" or \"off\"")
+            continue
+        out.append((" ".join(name.split()), " ".join(desc.split()), want, None, where,
+                    None, think))
     return out, problems
 
 
@@ -516,16 +549,34 @@ def load_profiles(paths) -> tuple:
     return profiles, problems
 
 
+THINKING_DEFAULT = "on"
+
+
+def _seven(pr, source=None) -> tuple:
+    """One profile in the single shape the rest of the file reads:
+
+        (name, description, topics, record, source, rank, thinking)
+
+    Both tails are optional where they are written -- a shipped profile names
+    its ranking rule and may name a thinking default, a profile from a file
+    names neither -- and None means "this one does not ask", not "off"."""
+    pr = tuple(pr)
+    if source is not None:                     # a shipped one: insert its origin
+        pr = pr[:4] + (source,) + pr[4:]
+    return pr + (None,) * (7 - len(pr))
+
+
 def merge_profiles(built_in, user) -> list:
     """The shipped profiles in their own order, with a user profile of the same
     name replacing one in place rather than appearing twice below it.
 
-    (name, description, topics, record, source, rank) either way -- the rank
-    last so that a shipped profile and one from a file are read the same way,
-    with None for "this one does not ask for a ranking rule". `record` is the
-    directory under results/keepsets/ holding this profile's gate log, and None
-    for a profile from a file, which has none."""
-    out = [(n, b, t, g, BUILT_IN, r) for n, b, t, g, r in built_in]
+    (name, description, topics, record, source, rank, thinking) either way --
+    the two optional fields last so that a shipped profile and one from a file
+    are read the same way, with None for "this one does not ask for a ranking
+    rule" and None for "this one does not ask for a thinking default".
+    `record` is the directory under results/keepsets/ holding this profile's
+    gate log, and None for a profile from a file, which has none."""
+    out = [_seven(pr, BUILT_IN) for pr in built_in]
     at = {n.lower(): i for i, n in enumerate(x[0] for x in out)}
     for pr in user:
         i = at.get(pr[0].lower())
@@ -534,7 +585,7 @@ def merge_profiles(built_in, user) -> list:
             out.append(pr)
         else:
             out[i] = pr
-    return out
+    return [_seven(pr) for pr in out]
 
 
 def unknown_topics(user, index) -> list:
@@ -543,7 +594,7 @@ def unknown_topics(user, index) -> list:
     a profile silently short two topics still looks like it applied."""
     have = set(index.topics) if index else set()
     out = []
-    for name, _blurb, topics, _gated, source, _rank in user:
+    for name, _blurb, topics, _gated, source, *_rest in user:
         miss = [t for t in topics if t not in have]
         if miss:
             out.append(f"{source}: {name!r} names {len(miss)} topic"
@@ -596,9 +647,22 @@ def describe_selection(topics) -> str:
 class State:
     def __init__(self, host, index, stats_path, keep, max_seq, fmt, selection,
                  transient_slots=B.TRANSIENT_SLOTS_DEFAULT, keep_free_gb=B.KEEP_FREE_GB_DEFAULT,
-                 user_profiles=(), profiles_path=None, rank=B.RANK_DEFAULT, source=None):
+                 user_profiles=(), profiles_path=None, rank=B.RANK_DEFAULT, source=None,
+                 keep_auto=False, thinking=None):
         self.host, self.index, self.stats_path = host, index, stats_path
         self.keep, self.max_seq, self.fmt = keep, max_seq, fmt
+        # True while the keep fraction is nobody's decision but the context
+        # length's. `--print` then writes PRUNE_KEEP=auto rather than the number
+        # it happens to resolve to today, so that a .env written at 32k does not
+        # silently become the wrong keep fraction the day MAX_SEQ is raised.
+        # Touching the keep slider, or applying a profile that was gated at a
+        # fraction, is a decision, and clears it.
+        self.keep_auto = keep_auto
+        # The thinking default this configuration implies (DEFAULT_THINKING), or
+        # None for "say nothing and leave whatever .env has alone". Only a
+        # profile sets it: it is the profile's gate record that knows whether
+        # deliberation helps or loops on the topics it carries.
+        self.thinking = thinking
         # How the selected topics are combined into one ranking (DSV41_PRUNE_RANK).
         # Every coverage number on this screen is read off a keep-set built with
         # it, and the engine will build the keep-set with it too, or the bars
@@ -651,7 +715,7 @@ class State:
         shows it, with its budget, on the next frame."""
         self.user_profiles = [p for p in self.user_profiles if p[0].lower() != name.lower()]
         self.user_profiles.append((name, blurb, sorted(topics), None,
-                                   short_path(self.profiles_path), None))
+                                   short_path(self.profiles_path), None, None))
         self._profiles = None
 
     def profiles(self):
@@ -673,7 +737,7 @@ class State:
         ceiling = next((k for k in reversed(KEEP_STEPS) if loads(k)), KEEP_STEPS[0])
 
         gates = read_gates_index()
-        for name, blurb, topics, record, source, rank in self.profile_defs():
+        for name, blurb, topics, record, source, rank, thinking in self.profile_defs():
             want = list(self.index.topics) if (topics is None and self.index) else (topics or [])
             avail = [t for t in want if t in have]
             missing = [t for t in want if t not in have]
@@ -744,13 +808,29 @@ class State:
                         "keep": keep, "plan": p, "status": status, "tone": tone,
                         "worst": worst, "gate": gate, "record": record,
                         "under_gate": under_gate, "rank": rank,
+                        "thinking": thinking or THINKING_DEFAULT,
                         "source": source, "mine": source != BUILT_IN})
         self._profiles = out
         return out
 
+    def resolve_keep(self):
+        """What `auto` comes to for the current context on this box --
+        tools/keep_for_context.py, the same answer ./start.sh will resolve."""
+        return K.resolve(self.host, self.max_seq, K.AUTO, fmt=self.fmt,
+                         transient_slots=self.transient_slots,
+                         keep_free_gb=self.keep_free_gb)
+
+    def follow_auto(self):
+        """An unpinned keep fraction is an answer to the context length, so it
+        moves when the context does. Pinned, nothing happens: a number the user
+        chose is not something a slider elsewhere gets to overwrite."""
+        if self.keep_auto:
+            self.keep = self.resolve_keep().keep
+
     def set_context(self, seq):
         if seq != self.max_seq:
             self.max_seq, self._profiles = seq, None   # every profile's budget moves with it
+            self.follow_auto()
 
     def set_rank(self, rank):
         if rank != self.rank:
@@ -799,6 +879,11 @@ class State:
         else:
             self.sel = set()
         self.keep = pr["keep"]
+        # The profile named a fraction (its own gate's, or the one the coverage
+        # target asks for), so the keep is no longer just the context's answer.
+        self.keep_auto = False
+        # ... and the thinking default its gate was run with.
+        self.thinking = pr.get("thinking") or THINKING_DEFAULT
         self.set_rank(g.get("rank") or pr["rank"])
 
     def plan(self):
@@ -892,10 +977,18 @@ def gate_line(pr, st: "State", width: int) -> str:
     on = "" if same else f" on {pair}"
     fin = (f" · {g['finished']} of {g['runs']} finished"
            if g["finished"] is not None else "")
-    forms = [f"gated {date}{keep}{on}{fin} a correct answer" if fin
-             else f"gated {date}{keep}{on}",
-             f"gated {date}{keep}{on}{fin}",
-             f"gated {date}{keep}{on}",
+    # A profile whose gate was run with thinking OFF says so here, because it is
+    # the one thing on the row a reader has to act on before running it: the
+    # counts on the right were produced that way, and with thinking on the same
+    # keep-set loops on the same prompts (both language bundles, 2026-09-14).
+    think = " · thinking off by default" if pr.get("thinking") == "off" else ""
+    forms = [f"gated {date}{keep}{on}{fin} a correct answer{think}" if fin
+             else f"gated {date}{keep}{on}{think}",
+             f"gated {date}{keep}{on}{fin}{think}",
+             f"gated {date}{keep}{on}{think}",
+             f"gated {date}{keep}{think}",
+             f"gated {date}{on}{think}",
+             f"gated {date}{think}",
              f"gated {date}{on}"]
     line = fits(forms, width - (24 if pr["under_gate"] else 0))
     if pr["under_gate"]:
@@ -1118,6 +1211,10 @@ def draw_easy(w, st: State):
             put(w, y + 2, 3, miss, C["warn"], maxw=max(10, W - 5))
         elif pr["gate"]:
             put(w, y + 2, 3, gate_line(pr, st, W - 5), C["muted"], maxw=max(10, W - 5))
+        elif pr["topics"] and pr["thinking"] == "off":
+            # no gate record, but it still asks for a thinking default, and that
+            # is the line it would otherwise have had
+            put(w, y + 2, 3, "thinking off by default", C["muted"], maxw=max(10, W - 5))
     if len(profs) > rows:
         below = len(profs) - rows - st.pscroll
         if below > 0:
@@ -1589,9 +1686,10 @@ def loop(w, st: State) -> str | None:
             if st.pane == 2:
                 st.max_seq = step(CTX_STEPS, st.max_seq, d)
             else:
-                st.keep = step(KEEP_STEPS, st.keep, d)
+                st.keep, st.keep_auto = step(KEEP_STEPS, st.keep, d), False
         elif k == ord("f"):
             st.fmt = "fp4" if st.fmt == "cb3" else "cb3"
+            st.follow_auto()          # a different slot size, a different ceiling
         elif k in (ord("s"), ord("S")):         # keep this selection as a profile
             if not st.sel:
                 st.msg = "select the topics first, then s keeps them as a profile"
@@ -1601,7 +1699,7 @@ def loop(w, st: State) -> str | None:
             need = (st.index.keep_for(tuple(sorted(st.sel)), COVERAGE_TARGET, rank=st.rank)
                     if st.index else None)
             if need:
-                st.keep = step(KEEP_STEPS, need, 0)
+                st.keep, st.keep_auto = step(KEEP_STEPS, need, 0), False
                 if st.keep < need:
                     st.keep = step(KEEP_STEPS, st.keep, 1)
                 what = "every selected topic" if st.sel else "every topic in this keep-set"
@@ -2061,13 +2159,19 @@ def brief(st: State) -> str:
 # --- output -----------------------------------------------------------------
 
 MANAGED = ("EXPERT_TOPICS", "PRUNE_KEEP", "MAX_SEQ", "ARENA_GB", "TRACE_STATS", "EXPERT_FORMAT",
-           "TRANSIENT_SLOTS", "KEEP_FREE_GB", "DSV41_PRUNE_RANK", "DSV41_PRUNE_SOURCE")
+           "TRANSIENT_SLOTS", "KEEP_FREE_GB", "DSV41_PRUNE_RANK", "DSV41_PRUNE_SOURCE",
+           "DEFAULT_THINKING")
 
 
 def env_for(st: State) -> dict:
     p = st.plan()
     e = {
-        "PRUNE_KEEP": f"{st.keep:.2f}",
+        # `auto` where the keep fraction is the context's answer and not a
+        # decision: ./start.sh resolves it against the memory the box has at
+        # start time, so a .env written here is still right after MAX_SEQ moves
+        # or a second process gives its memory back. A pinned number is written
+        # as the number, because that is what pinning it meant.
+        "PRUNE_KEEP": K.AUTO if st.keep_auto else f"{st.keep:.2f}",
         # The coverage on the screen was read off a keep-set built with this
         # rule; written out so that the run reproduces the screen. The engine
         # reads it under its own name, straight out of the environment .env is
@@ -2078,7 +2182,13 @@ def env_for(st: State) -> dict:
         # ranked saliency keeps a different set of experts at the same budget.
         "DSV41_PRUNE_SOURCE": st.source,
         "MAX_SEQ": str(st.max_seq),
-        "ARENA_GB": f"{math.ceil(p.arena)}",
+        # Pinned to what the kept set needs -- except under `auto`, where the
+        # keep fraction is not decided until ./start.sh runs and pinning an
+        # arena here would decide it after all (a pinned arena caps the keep it
+        # can hold). Empty is dropped from .env, and ./start.sh then sizes the
+        # arena from the keep it resolved, which comes to the same number as
+        # this one without freezing it at today's context length.
+        "ARENA_GB": "" if st.keep_auto else f"{math.ceil(p.arena)}",
         "EXPERT_FORMAT": st.fmt,
         # written because the arena above was sized against them
         "TRANSIENT_SLOTS": str(st.transient_slots),
@@ -2087,7 +2197,29 @@ def env_for(st: State) -> dict:
     }
     if st.sel:
         e["EXPERT_TOPICS"] = ",".join(sorted(st.sel))
+    # Only a profile has anything to say about thinking, and only then is the
+    # key written: dropping it otherwise would quietly replace whatever .env
+    # already says with this tool's opinion, and this tool has none.
+    if st.thinking:
+        e["DEFAULT_THINKING"] = st.thinking
     return e
+
+
+def env_comments(st: State) -> dict:
+    """Lines to print under a setting that needs one. `PRUNE_KEEP=auto` is a
+    promise about a resolution nobody has seen yet, so the value it resolves to
+    today goes next to it -- on stdout with the settings, because a reader
+    redirecting this to a file is exactly the reader who needs it."""
+    out = {}
+    p = st.plan()
+    if st.keep_auto:
+        out["PRUNE_KEEP"] = st.resolve_keep().line
+        out["ARENA_GB"] = (f"left to ./start.sh, which sizes it for the keep it resolves "
+                           f"({math.ceil(p.arena)} GB at this context)")
+    if st.thinking:
+        out["DEFAULT_THINKING"] = (f"the default for requests that say nothing; any request may "
+                                   f"still ask for thinking {'on' if st.thinking == 'off' else 'off'}")
+    return out
 
 
 def write_env(env: dict, path: str) -> str:
@@ -2122,7 +2254,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="choose what this box should be good at")
     ap.add_argument("--stats", help="coverage.json to read topics from")
     ap.add_argument("--topics", default=os.environ.get("EXPERT_TOPICS", ""))
-    ap.add_argument("--keep", type=float, default=float(os.environ.get("PRUNE_KEEP", "0.39")))
+    ap.add_argument("--keep", default=os.environ.get("PRUNE_KEEP") or "0.39", metavar="VALUE",
+                    help=f"the keep fraction to start on, or '{K.AUTO}' for the largest step "
+                         f"that fits --max-seq on this box (default %(default)s, from "
+                         f"PRUNE_KEEP). `{K.AUTO}` is written back as `{K.AUTO}`, so ./start.sh "
+                         f"resolves it again against the memory it finds at start time")
     ap.add_argument("--max-seq", type=int, default=int(os.environ.get("MAX_SEQ", "32768")))
     ap.add_argument("--format", default=os.environ.get("EXPERT_FORMAT", "cb3"), choices=("cb3", "fp4"))
     ap.add_argument("--rank", default=B.rank_from_env(), metavar="RULE",
@@ -2143,6 +2279,11 @@ def main() -> int:
     ap.add_argument("--keep-free-gb", type=float,
                     default=float(os.environ.get("KEEP_FREE_GB") or B.KEEP_FREE_GB_DEFAULT),
                     help="host memory the launcher leaves free")
+    ap.add_argument("--thinking", default=os.environ.get("DEFAULT_THINKING") or None,
+                    metavar="ON|OFF",
+                    help="the thinking default to write (DEFAULT_THINKING). A profile that was "
+                         "gated with thinking off sets this itself; unset, nothing is written "
+                         "and .env keeps whatever it says")
     ap.add_argument("--coverage-target", type=float, default=COVERAGE_TARGET,
                     help="coverage every selected topic should reach (default %(default).2f)")
     ap.add_argument("--render", metavar="HxW", default=None,
@@ -2173,6 +2314,21 @@ def main() -> int:
     a = ap.parse_args()
 
     COVERAGE_TARGET = a.coverage_target
+    # `auto` is resolved once the host is read, a few lines down; the shape of
+    # what was asked for is checked here so that a typo stops the tool rather
+    # than being served as 0.39 three minutes into a load.
+    keep_auto = str(a.keep).strip().lower() == K.AUTO
+    if not keep_auto:
+        try:
+            a.keep = float(a.keep)
+        except ValueError:
+            print(f"--keep wants a number or '{K.AUTO}' (got {a.keep!r}, "
+                  f"perhaps from PRUNE_KEEP)", file=sys.stderr)
+            return 2
+    if a.thinking is not None and a.thinking not in ("on", "off"):
+        print(f"--thinking wants on or off (got {a.thinking!r}, perhaps from DEFAULT_THINKING)",
+              file=sys.stderr)
+        return 2
     if a.rank not in B.RANKS:
         # Not argparse `choices`: this defaults from the environment, and a typo
         # in .env has to be refused here rather than served as `sum` -- which is
@@ -2221,6 +2377,12 @@ def main() -> int:
               file=sys.stderr)
         return 2
     host = B.read_host()
+    if keep_auto:
+        # The same call ./start.sh makes, so the screen budgets the keep-set the
+        # launcher would actually build for this context.
+        a.keep = K.resolve(host, a.max_seq, K.AUTO, fmt=a.format,
+                           transient_slots=a.transient_slots,
+                           keep_free_gb=a.keep_free_gb).keep
     try:
         sp_ = find_stats(a.stats, a.source)
     except MissingStats as e:
@@ -2261,7 +2423,8 @@ def main() -> int:
 
     st = State(host, index, sp_, a.keep, a.max_seq, a.format, sel,
                transient_slots=a.transient_slots, keep_free_gb=a.keep_free_gb,
-               user_profiles=user, profiles_path=files[-1], rank=a.rank, source=a.source)
+               user_profiles=user, profiles_path=files[-1], rank=a.rank, source=a.source,
+               keep_auto=keep_auto, thinking=a.thinking)
     st.problem = problems[0] if problems else ""
     if unknown:
         st.msg = f"dropped, not in this keep-set: {', '.join(unknown)}"
@@ -2316,9 +2479,13 @@ def main() -> int:
                 if pr["under_gate"]:
                     cfg += f" — this box holds only {pr['keep'] * 100:.0f} %"
                 print(f"  {'':<22} gated {g['run']}{cfg}{fin}")
+                if pr["thinking"] == "off":
+                    print(f"  {'':<22} thinking off by default")
                 print(f"  {'':<22} {g['record']}")
             elif pr["topics"]:
                 print(f"  {'':<22} no generation gate has been run on these topics")
+                if pr["thinking"] == "off":
+                    print(f"  {'':<22} thinking off by default")
             print()
         return 0
 
@@ -2377,8 +2544,11 @@ def main() -> int:
             print(f"wrote {len(env)} settings to .env (previous kept as .env.bak)")
         if host.busy:
             print(f"# already running here: {host.busy} — this box holds one at a time", file=sys.stderr)
+        comments = env_comments(st)
         for k, v in env.items():
             print(f"{k}={v}")
+            if k in comments:
+                print(f"# {comments[k]}")
         print(f"# {p.kept:,} experts resident ({p.resident_frac:.1%}), {p.resident:.1f} GB resident, "
               f"{p.free_after_load:.1f} GB free after load — {p.verdict}", file=sys.stderr)
         return 0 if p.verdict != "over" else 1

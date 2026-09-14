@@ -198,7 +198,9 @@ def build_routing(cov_path: str, profiles, gates):
     gate_by_record = {r["record"]: r for r in gates["runs"]}
     prune_sets = OrderedDict()
     profile_meta = []
-    for name, desc, sel, record, rank in profiles:
+    # The trailing fields are optional in tune.py's literal -- a profile may name a
+    # thinking default after its ranking rule -- and none of them is drawn here.
+    for name, desc, sel, record, rank, *_rest in profiles:
         rec = gate_by_record.get(record)
         if rec is None:
             continue

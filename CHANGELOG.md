@@ -104,8 +104,79 @@ routed experts) are a measurement of that arena, not of the recipe — do not qu
 
 ## 0.6.0-wip — 2026-09-14
 
+**Two configuration settings stop being numbers to memorise.** The keep fraction is an answer to
+the context length, and the thinking default is a property of the keep-set — so both are now
+derived where they are decided, instead of being copied out of a results file by hand.
+
 ### Added
 - **CI runs the torch-free tests.** `.github/workflows/tests.yml` runs the sixteen `tools/test_*.py` and `server/test_*.py` scripts that need only a CPU on every push and pull request (Python 3.12, numpy); the torch/CUDA tests and `server/test_server.py`, which needs the checkpoint tokenizer, are skipped by name and reported as such.
+- **`PRUNE_KEEP=auto`**, and it is the recommendation `env.example` ships. The KV and indexer
+  caches are allocated for `MAX_SEQ` up front and one prefill chunk costs more behind a longer
+  context, so a keep fraction that serves 32k is over budget at 256k — and it goes over by being
+  killed by the memory watchdog on the first long request, not by refusing to start. `./start.sh`
+  now resolves `auto` before it launches anything and prints the one line it decided on:
+
+  ```
+  PRUNE_KEEP=auto -> 0.36 for MAX_SEQ=262144 (fits with 3.3 GB spare)
+  ```
+
+  On a 121 GiB box that is **0.38 up to 128k and 0.36 at 256k** — 0.36 being the fraction the
+  filled-256k run was measured at, and 0.40 the one that was killed 582 s into a 195k-token
+  prefill ([`RESULTS.md`](RESULTS.md), 2026-09-13 22:50 and the 2026-09-14 addenda). A number
+  still works and is passed through untouched.
+- **`tools/keep_for_context.py`** — the resolver, and the same question anybody can ask by hand.
+  The largest *step* of the keep ladder whose plan clears both gates (the launcher's own
+  pre-flight, and a prefill chunk plus the watchdog floor once it is up), computed from
+  `tools/budget.py`'s model — no torch, no CUDA, no model load, milliseconds. It honours a pinned
+  `ARENA_GB` (the kept set has to fit inside it, less the transient ring) and says which arena did
+  the capping; when the pinned arena is itself too big for the context it says that, rather than
+  walking the ladder down after something a keep fraction cannot fix. Below 0.36 it answers and
+  warns: no keep-set that small has ever been through a generation gate here. `--bare` prints the
+  number for a shell, `--arena` the arena that keep needs.
+- **`./start.sh --print-env`** — resolve everything `.env` and the environment imply, print it
+  with the command that would have run, and start nothing. It skips the model, port and memory
+  guards, so it answers away from the box; `start.sh` also no longer uses a bash-4 associative
+  array, so it runs under the 3.2 that ships with macOS.
+- **A thinking default per profile.** A profile in `tools/tune.py` may name one as a sixth field,
+  and `./tune.sh --print/--write` emits it as `DEFAULT_THINKING` — the variable `./start.sh`
+  already reads. Both language bundles ship `off`: with thinking off every language in them came
+  out clean on their gate, and with it on French, German, Chinese and Japanese corrupted a word
+  and looped (`results/keepsets/european_languages/GATE.md`,
+  `results/keepsets/world_languages/GATE.md`, 2026-09-14; whole-file generation behaves the same,
+  `RESULTS.md`). The profile screen says `thinking off by default` on the gate line, and a profile
+  from a file may carry `"thinking": "on"|"off"` too. It is a default for requests that say
+  nothing — any request can still ask for the other.
+
+### Changed
+- `env.example` ships `PRUNE_KEEP=auto` with `ARENA_GB` **empty**. When the keep fraction is
+  resolved and no arena is pinned, `./start.sh` sizes the arena for the kept set: the engine's own
+  automatic sizing takes 82 % of what is free, about 89.6 GB on this box, which is more arena than
+  a filled context can afford. Pin both together to reproduce a measurement exactly.
+- `./tune.sh --keep auto` follows the context slider, writes `auto` back as `auto` with the value
+  it resolves to today on a comment line, and leaves `ARENA_GB` empty for the launcher to size —
+  so a `.env` written at 32k is still the right configuration at 256k.
+- `DEFAULT_THINKING` joins the keys `./tune.sh` manages in `.env` (eleven now). It is written only
+  when a profile named one or the environment already carried one, never invented.
+
+### Fixed
+- `./start.sh` no longer exits silently, before printing anything, on a checkout with no
+  `results/trace-*/stats/coverage.json`: the fallback lookup ends in a failed test, and under
+  `set -e` an assignment took that exit status with it.
+
+### Documentation
+- [`docs/tune.md`](docs/tune.md) — "The keep fraction can choose itself", and why thinking is part
+  of a gate result rather than a preference.
+- [`docs/memory-budget.md`](docs/memory-budget.md) — "Asking the ladder instead of reading it",
+  with what each context length can afford on this box.
+- [`docs/tune-reference.md`](docs/tune-reference.md) — `--keep auto`, `--thinking`, the
+  `thinking` field in a profiles file, and the new gate-line element.
+
+### Checks
+- `tools/test_keep_for_context.py` — the resolution at every context length against a fake host,
+  monotonicity in the context, `ARENA_GB` capping, the gate-floor warning, numeric passthrough,
+  the CLI's exit codes, and `./start.sh --print-env` resolving it end to end.
+- `tools/test_tune_profiles.py` and `tools/test_tune_draw.py` cover the thinking field, what
+  `--print` writes for it, and the gate line at every width.
 
 ## 0.5.0 — 2026-09-14
 

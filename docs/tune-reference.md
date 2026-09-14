@@ -29,13 +29,14 @@ job, a bare `./tune.sh` behaves as `--print`.
 |---|---|---|
 | `--stats PATH` | see below | the `coverage.json` to read topics and histograms from |
 | `--topics a,b` | `EXPERT_TOPICS` | the selection to start from, comma separated |
-| `--keep F` | `PRUNE_KEEP`, else `0.39` | the fraction of each layer's 384 routed experts that stays resident. Applying a profile replaces it: a shipped one sets the keep fraction its generation gate ran at, a profile from a file the smallest one that reaches the coverage target |
+| `--keep F\|auto` | `PRUNE_KEEP`, else `0.39` | the fraction of each layer's 384 routed experts that stays resident. `auto` resolves it against `--max-seq` on this box — the largest step of the keep ladder that still leaves room for a prefill chunk behind a filled context (`tools/keep_for_context.py`) — and is written back as `auto`, not as today's number, with the value it resolves to on a comment line beside it. It then follows the context slider, and `ARENA_GB` is left for `./start.sh` to size. Applying a profile pins it: a shipped one sets the keep fraction its generation gate ran at, a profile from a file the smallest one that reaches the coverage target |
 | `--max-seq N` | `MAX_SEQ`, else `32768` | context length the KV cache is sized for |
 | `--format cb3\|fp4` | `EXPERT_FORMAT`, else `cb3` | the arena's expert layout, which sets the slot size |
 | `--rank sum\|max\|maxmin` | `DSV41_PRUNE_RANK`, else `sum` | how several selected topics are combined into one ranking of the same budget, which decides *which* experts the keep fraction holds. Shown on both screens next to the keep fraction, and written out with it. Applying a profile with a gate record sets the rule that record was measured with (`maxmin` for all ten shipped ones); a profile from a file names no rule and leaves it alone |
 | `--source counts\|saliency` | `DSV41_PRUNE_SOURCE`, else `counts` | which measurement the experts are ranked by: `counts` is routing frequency, `saliency` is the summed `gate_weight x ||expert output||` (REAP, arXiv 2510.13999). Orthogonal to `--rank` — the rules are the same, the numbers they rank are not. Shown beside the rank and written out with it. Applying a profile with a gate record switches to the family that record was measured on, reloading the index so the bars and the budget move with it; where the keep-set carries no histograms of that family, nothing switches and the mismatch is named. A `coverage.json` traced before 2026-09-13 carries no `saliency_<topic>` histograms and the tool then finds no topics at all. See [`docs/keep-sets.md`](keep-sets.md#frequency-is-not-contribution) |
 | `--transient-slots N` | `TRANSIENT_SLOTS`, else `8` | prefill slots outside the LRU; the arena is sized to hold these too |
 | `--keep-free-gb F` | `KEEP_FREE_GB`, else `6.0` | host memory the launcher is told to leave free |
+| `--thinking on\|off` | `DEFAULT_THINKING` | the thinking default to write out. A shipped profile that names one sets it when applied — both language bundles say `off` — and unset, nothing is written and `.env` keeps whatever it says |
 | `--coverage-target F` | `DSV41_COVERAGE_TARGET`, else `0.85` | the coverage every selected topic should reach; sets the bar colours and what `m` fits to |
 | `--render HxW` | — | print the screen as text at that size and exit. **Height first**: `30x96` is 30 rows of 96 columns |
 | `--list` | — | print the topics with their coverage at `--keep` and their traced token counts, then exit |
@@ -178,10 +179,11 @@ profile kept there survives a fresh clone and leaves the working tree clean.
 ```
 
 A bare JSON list of the same objects is accepted as well. A profile is a `name`, a one-line
-`description` (optional) and a non-empty list of `topics`. Whitespace in the name and the
-description is collapsed, so both stay one line on the screen, and a topic named twice counts once:
-the ranking gives every selected topic one vote per layer, and writing it twice does not mean two.
-Any other field is ignored, `gated` included: **a profile from a file owns no gate record** and the
+`description` (optional), a non-empty list of `topics`, and optionally `"thinking": "on"` or
+`"off"` — the same field the shipped profiles carry, written out as `DEFAULT_THINKING` when the
+profile is applied. Whitespace in the name and the description is collapsed, so both stay one line
+on the screen, and a topic named twice counts once: the ranking gives every selected topic one vote
+per layer, and writing it twice does not mean two. Any other field is ignored, `gated` included: **a profile from a file owns no gate record** and the
 screen says `untested` for it, because the gate is a generation run on a keep-set and not a
 property of a name and a list of topics. It is budgeted from the coverage target for the same
 reason — there is no measured keep fraction for it to use. See
@@ -194,7 +196,7 @@ What happens when a file is wrong:
 |---|---|
 | the file is not there | nothing; there are simply no profiles from it |
 | it is not valid JSON, or not a list of profiles | one line on stderr naming the file and the parser's complaint, then the built-in profiles as usual. The interactive screen repeats it in the row under the header, where stderr cannot be seen |
-| one entry has no name, is not an object, or has no usable `topics` | one line naming that entry, by name where it has one and by position where it does not. Every other entry in the file is still loaded |
+| one entry has no name, is not an object, has no usable `topics`, or names a `thinking` that is neither `on` nor `off` | one line naming that entry, by name where it has one and by position where it does not. Every other entry in the file is still loaded |
 | an entry names a topic this keep-set does not carry | one line naming the profile and every missing topic. The profile still applies, with the topics that do exist, and the profile screen prints `not in this keep-set: ...` under it |
 
 The last row is the one that matters in practice. Topic names differ between keep-sets, so a
@@ -383,6 +385,7 @@ not, and neither is a run on a different bundle.
 | `at keep 36 %` | `\| keep-set \|` in the card, and for runs recorded before that row existed, `results/keepsets/gates.json` |
 | `on maxmin/saliency` | the same, and shown **only** when that pair is not the one the screen is set to — the bars and the counts then describe two different keep-sets |
 | `— this box holds only 38 %` | the gated keep fraction does not fit here, so what `r` would start is not what was measured |
+| `· thinking off by default` | the profile carries a thinking default of `off` (the sixth field of its entry in `PROFILES`), so the counts beside it were produced with thinking off and `--write` writes `DEFAULT_THINKING=off`. Dropped first when the row is narrow |
 
 Colour follows `finished` where it was counted and `strict` otherwise: green at 0.8 of the runs or
 better, amber at 0.5, red below.
@@ -411,6 +414,13 @@ keep-set that was gated.
 
 A profile from a file names no pair and changes neither. An explicit `--rank` or `--source` on the
 command line is overridden by a record, the same way `--rank` already was by a profile's own rule.
+
+It also sets the **thinking default**, written out as `DEFAULT_THINKING`: the value the profile
+names, and `on` where it names none. The two language bundles name `off`. This is a gate result
+like the keep fraction — both bundles pass their natural-language prompts with thinking off and
+loop on some of them with it on (2026-09-14) — and a keep-set this size cannot carry deliberation
+in a language it was never traced deliberating in. A profile from a file may name one too, as
+`"thinking": "off"`; anything other than `on` or `off` there costs that profile and is reported.
 
 #### Which keep fraction a profile is budgeted at
 
@@ -516,6 +526,29 @@ ARENA_GB=81
 `tools/test_budget.py` checks at every keep step and every ring size that this rounding never
 leaves a kept expert outside the arena.
 
+With `--keep auto` neither number is frozen. `PRUNE_KEEP` is written as the word, and `ARENA_GB`
+is written empty — which drops it from `.env` — so that `./start.sh` resolves the keep for
+whatever `MAX_SEQ` says at start time and then sizes the arena for it. A `.env` written at 32k is
+then still right at 256k, which a pinned pair is not:
+
+```
+$ ./tune.sh --topics coding --keep auto --max-seq 262144 --print
+PRUNE_KEEP=auto
+# PRUNE_KEEP=auto -> 0.36 for MAX_SEQ=262144 (fits with 3.3 GB spare)
+DSV41_PRUNE_RANK=sum
+DSV41_PRUNE_SOURCE=counts
+MAX_SEQ=262144
+ARENA_GB=
+# left to ./start.sh, which sizes it for the keep it resolves (81 GB at this context)
+...
+```
+
+`DEFAULT_THINKING` is written when a profile named one, or when the environment `.env` was
+sourced into already carries one — never invented. Both language bundles name `off`, because with
+thinking on the same keep-set loops on the same prompts their gate passed with it off
+(`results/keepsets/european_languages/GATE.md`, `world_languages/GATE.md`, 2026-09-14). It is the
+default for requests that say nothing; any request can still ask for the other.
+
 `--write` adds `wrote N settings to .env (previous kept as .env.bak)`. It touches only the keys
 listed above: existing lines are rewritten in place, a managed key the selection does not set is
 dropped, anything else in the file is left alone, and the previous file is kept as `.env.bak`. If
@@ -561,6 +594,7 @@ sections that do not need any. The task guide for it is in
 
 ```bash
 python3 tools/test_budget.py         # the cost model against two loads this box actually ran
+python3 tools/test_keep_for_context.py  # PRUNE_KEEP=auto, and ./start.sh resolving it
 python3 tools/test_tune_draw.py      # the screens render at seven sizes without colliding
 python3 tools/test_tune_profiles.py  # profiles from a file, including the files that are wrong
 python3 tools/test_tune_brief.py     # the brief comes from the keep-set, and its commands are real

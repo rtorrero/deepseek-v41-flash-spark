@@ -132,6 +132,20 @@ A profile you write yourself reads `untested`, and is budgeted from the coverage
 there is no measured keep fraction for it. Running the gate on it is described in
 [`docs/tune-tasks.md`](tune-tasks.md).
 
+### Thinking is part of the gate result
+
+Two profiles carry `· thinking off by default` on that line, and it is the same kind of fact as
+the keep fraction. **European languages** and **World languages** pass every natural-language
+prompt on their gate with thinking off — 4 of 4 on each — and with thinking on, French, German,
+Chinese and Japanese corrupt a word and then loop trying to repair it (`GATE.md`, 2026-09-14;
+whole-file generation behaves the same way, RESULTS.md). A keep-set this size cannot carry
+deliberation in a language it was never traced deliberating in, and `reasoning_lang` — thinking
+*in* the language — buys World languages three runs and costs European languages three.
+
+So the profile names its default, `./tune.sh` writes it as `DEFAULT_THINKING`, and `./start.sh`
+reads it as the setting for requests that say nothing. Any request can still ask for thinking on;
+what changes is what the box does when nobody says.
+
 The records themselves are [`results/keepsets/*/GATE.md`](../results/keepsets/), one dated section
 per run, appended and never rewritten. `results/keepsets/gates.json` says which run is each
 profile's current record and which keep-set that run measured — the one thing a gate card written
@@ -335,12 +349,52 @@ without serving them. What the page is, what was patched into it and why are in
 
 `--print` exits non-zero when the selection will not load, so it works as a check in a script.
 The interactive `r` writes the same settings and then runs `./start.sh`; `w` writes them and
-stops. `.env` is only touched for the ten keys the tool manages — `EXPERT_TOPICS`, `PRUNE_KEEP`,
-`MAX_SEQ`, `ARENA_GB`, `EXPERT_FORMAT`, `TRACE_STATS`, `TRANSIENT_SLOTS` and `KEEP_FREE_GB`, which
-it must write because the arena was sized against them, and `DSV41_PRUNE_RANK` and
-`DSV41_PRUNE_SOURCE`, which it must write because a keep fraction reproduced without its ranking
-pair reproduces a different set of experts. Those last two are written under the engine's own
+stops. `.env` is only touched for the eleven keys the tool manages — `EXPERT_TOPICS`,
+`PRUNE_KEEP`, `MAX_SEQ`, `ARENA_GB`, `EXPERT_FORMAT`, `TRACE_STATS`, `TRANSIENT_SLOTS` and
+`KEEP_FREE_GB`, which it must write because the arena was sized against them, `DSV41_PRUNE_RANK`
+and `DSV41_PRUNE_SOURCE`, which it must write because a keep fraction reproduced without its
+ranking pair reproduces a different set of experts, and `DEFAULT_THINKING`, which a profile sets
+when its gate was run with thinking off. Those middle two are written under the engine's own
 names, which is how the engine reads them. The previous file is kept as `.env.bak`.
+
+## The keep fraction can choose itself
+
+`PRUNE_KEEP` is an answer to `MAX_SEQ` and not a number to memorise. The KV and indexer caches are
+allocated for the whole context up front and one prefill chunk costs more behind a longer context,
+so the same arena that serves 32k is over budget at 256k — and it goes over by being killed by the
+memory watchdog on the first long request, not by refusing to start. `PRUNE_KEEP=auto` puts that
+arithmetic where the decision is:
+
+```bash
+./tune.sh --keep auto --print               # what the current context can afford, as .env
+python3 tools/keep_for_context.py --max-seq 262144
+./start.sh --print-env                      # the whole resolved configuration, starting nothing
+```
+
+```
+PRUNE_KEEP=auto -> 0.36 for MAX_SEQ=262144 (fits with 3.3 GB spare)
+```
+
+`./start.sh` resolves it before it launches anything, prints that line, and exports the number the
+engine is then handed. On a 121 GiB box the answer is **0.38 up to 128k and 0.36 at 256k** — the
+fraction the 256k run was measured at (RESULTS.md, 2026-09-13 22:50). The resolver is
+`tools/keep_for_context.py`: the largest step of the keep ladder whose plan still clears both
+gates — the launcher's own pre-flight, and a prefill chunk plus the watchdog floor once it is up —
+computed from the same `tools/budget.py` model the panel on the right of this screen shows, with
+no torch and no model load.
+
+Three things it will not do. It will not go above what `ARENA_GB` holds, if one is pinned, and
+says which arena did the capping; when the pinned arena itself is too big for the context, it says
+that instead of walking the ladder down, because a pinned arena is not something a keep fraction
+can fix. It will not clamp a number you pinned yourself — that is passed through and costed. And
+it will not refuse to answer below 0.36: nothing under that has ever been through a generation
+gate here, so a smaller box is told what fits **and** told that what fits is ungated.
+
+`--keep auto` on the screen follows the context slider, and `--print` writes the word `auto` back
+rather than today's number, with the value it resolves to on a comment line beside it. `ARENA_GB`
+is then left empty, and `./start.sh` sizes it for the keep it resolved: a `.env` written at 32k is
+still the right configuration at 256k. Pin a number instead — and pin `ARENA_GB` with it — to
+reproduce a measurement exactly.
 
 ## Where topics come from
 
@@ -399,6 +453,7 @@ what the shipped profiles in `results/keepsets/` do.
 
 ```bash
 python3 tools/test_budget.py         # the cost model against two loads this box actually ran
+python3 tools/test_keep_for_context.py  # PRUNE_KEEP=auto, and ./start.sh resolving it
 python3 tools/test_tune_draw.py      # the screens render at seven sizes without colliding
 python3 tools/test_tune_profiles.py  # profiles, and the gate records behind them
 python3 tools/test_tune_brief.py     # the brief comes from the keep-set, and its commands are real

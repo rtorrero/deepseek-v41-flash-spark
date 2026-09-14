@@ -249,7 +249,7 @@ KEEPSETS = os.path.join(ROOT, "results", "keepsets")
 gates_index = T.read_gates_index()
 check("the gate index parses", len(gates_index) > 0, True)
 
-for name, _blurb, topics, record, _rank in T.PROFILES:
+for name, _blurb, topics, record, _rank, *_think in T.PROFILES:
     where = os.path.join(KEEPSETS, record, T.GATE_BASENAME)
     check(f"{name}: its record is in the checkout", os.path.exists(where), True)
     # gate_profile.py writes there by default, so the two have to agree or the
@@ -432,6 +432,102 @@ st_thin.apply_profile(back)
 check("  the screen keeps the family it can serve", st_thin.source, "counts")
 check("  and goes on naming the pair the record used",
       all("maxmin/saliency" in T.gate_line(back, st_thin, w) for w in (60, 80, 96, 140)), True)
+
+
+# --- the thinking default a profile carries ---------------------------------
+# Both language bundles pass their natural-language prompts with thinking off
+# and loop on some of them with it on (results/keepsets/*/GATE.md, 2026-09-14),
+# so the profile carries the default its gate was run with and `--print` writes
+# it as DEFAULT_THINKING -- the variable ./start.sh already reads.
+OFF = {"European languages", "World languages"}
+shipped = {p[0]: (p[5] if len(p) > 5 else None) for p in T.PROFILES}
+check("the two language bundles ship thinking off",
+      {n for n, t in shipped.items() if t == "off"}, OFF)
+check("every other shipped profile leaves it unsaid",
+      {t for n, t in shipped.items() if n not in OFF}, {None})
+check("a shipped tuple is five fields or six",
+      sorted({len(p) for p in T.PROFILES}), [5, 6])
+check("nothing ships a value that is not on or off",
+      {t for t in shipped.values() if t is not None} <= {"on", "off"}, True)
+
+merged = T.merge_profiles(T.PROFILES, [])
+check("merging normalises every profile to the same seven fields",
+      {len(p) for p in merged}, {7})
+check("  with the thinking default last",
+      {p[0] for p in merged if p[6] == "off"}, OFF)
+check("  and a user profile, which names none, padded rather than dropped",
+      len(T.merge_profiles(T.PROFILES, [("Mine", "d", ["english"], None, "f.json", None)])[-1]), 7)
+
+by_name = {p["name"]: p for p in state([]).profiles()}
+check("unsaid means on, so every profile has one", {p["thinking"] for p in by_name.values()},
+      {"on", "off"})
+check("  and it is off on exactly the two",
+      {n for n, p in by_name.items() if p["thinking"] == "off"}, OFF)
+
+st_think = state([])
+st_think.apply_profile(by_name["World languages"])
+check("applying one takes its thinking default", st_think.thinking, "off")
+check("  and --print writes it", T.env_for(st_think).get("DEFAULT_THINKING"), "off")
+st_think.apply_profile(by_name["Frontend"])
+check("applying a profile that does not ask for one writes the default",
+      T.env_for(st_think).get("DEFAULT_THINKING"), "on")
+check("DEFAULT_THINKING is managed, so .env is rewritten in place rather than gaining a second",
+      "DEFAULT_THINKING" in T.MANAGED, True)
+check("nothing is written when no profile and no environment said anything",
+      "DEFAULT_THINKING" in T.env_for(state([])), False)
+
+r = run_clean(["--stats", STATS, "--profile", "world", "--print"])
+check("--profile on the CLI writes the profile's thinking default",
+      "DEFAULT_THINKING=off" in r.stdout, True)
+check("  with a line saying a request can still ask for the other",
+      "still ask for thinking on" in r.stdout, True)
+r = run_clean(["--stats", STATS, "--profile", "frontend", "--print"])
+check("a profile that does not ask for one writes on", "DEFAULT_THINKING=on" in r.stdout, True)
+r = run_clean(["--stats", STATS, "--print"], DEFAULT_THINKING="off")
+check("with no profile, .env's own value round-trips rather than being dropped",
+      "DEFAULT_THINKING=off" in r.stdout, True)
+r = run_clean(["--stats", STATS, "--print"], DEFAULT_THINKING="maybe")
+check("a DEFAULT_THINKING that is neither stops the tool", r.returncode, 2)
+check("  by name", "--thinking wants on or off" in r.stderr, True)
+
+# a profiles file may carry one too, and a bad one costs that profile alone
+f = write("thinking.json", {"profiles": [
+    {"name": "Quiet", "description": "no deliberation", "topics": ["english"], "thinking": "off"},
+    {"name": "Broken", "description": "d", "topics": ["english"], "thinking": "sometimes"}]})
+got, problems = T.read_profiles(f)
+check("a user profile can name a thinking default", [p[0] for p in got], ["Quiet"])
+check("  and it is read", got[0][6], "off")
+check("  while a value that is neither is one problem, named",
+      len(problems) == 1 and "thinking must be" in problems[0], True)
+
+# --- the keep fraction the context chose ------------------------------------
+# PRUNE_KEEP=auto is written back as `auto`, not as the number it resolves to
+# today: a .env pinned at 32k is the wrong keep-set the day MAX_SEQ is raised.
+r = run_clean(["--stats", STATS, "--print", "--keep", "auto", "--max-seq", "262144"],
+              DSV41_HOST_TOTAL_GB="130.6", DSV41_HOST_AVAIL_GB="117")
+check("--keep auto writes auto", "PRUNE_KEEP=auto" in r.stdout, True)
+check("  with what it resolves to today beside it",
+      "# PRUNE_KEEP=auto -> 0.36 for MAX_SEQ=262144" in r.stdout, True)
+check("  and the arena left to ./start.sh rather than frozen at this context",
+      "ARENA_GB=\n" in r.stdout, True)
+r = run_clean(["--stats", STATS, "--print", "--keep", "0.36", "--max-seq", "262144"],
+              DSV41_HOST_TOTAL_GB="130.6", DSV41_HOST_AVAIL_GB="117")
+check("a pinned keep is written as the number", "PRUNE_KEEP=0.36" in r.stdout, True)
+check("  and pins the arena with it", "ARENA_GB=81" in r.stdout, True)
+r = run_clean(["--stats", STATS, "--print", "--keep", "nope"])
+check("a keep that is neither a number nor auto stops the tool", r.returncode, 2)
+
+# its own host: the check below is about the 256k answer, and this file's `host`
+# carries 118.6 GB, where 0.38 still fits a filled 256k by 0.9 GB.
+st_auto = T.State(B.Host("gb10-121", 130.6e9, 117.0e9, True), index, STATS, 0.38, 32768,
+                  "cb3", (), keep_auto=True)
+check("the screen's auto keep follows the context", st_auto.resolve_keep().keep <= 0.40, True)
+st_auto.set_context(262144)
+check("  so moving to 256k moves the keep with it", st_auto.keep, 0.36)
+check("  and it is still auto", st_auto.keep_auto, True)
+st_auto.apply_profile(by_name["Frontend"])
+check("applying a profile pins it, because the profile named a fraction",
+      st_auto.keep_auto, False)
 
 print()
 print(f"{len(fails)} failed" if fails else "all checks passed")

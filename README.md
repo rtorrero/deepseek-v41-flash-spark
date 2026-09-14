@@ -191,6 +191,30 @@ point is `PRUNE_KEEP=0.36` with `ARENA_GB=81` at 256k; 0.40 is for prompts under
 tokens. `env.example` now ships the rank and the source; the keep fraction and arena stay the
 screen's call.
 
+**Added 2026-09-14 — `PRUNE_KEEP=auto`.** The keep fraction is an answer to `MAX_SEQ`, not a
+number to memorise, so it no longer has to be one. `PRUNE_KEEP=auto` in `.env` is resolved by
+`./start.sh` before it launches anything: `tools/keep_for_context.py` asks the same arithmetic
+`./tune.sh` budgets with for the largest keep step that still leaves room for a prefill chunk
+behind a filled context, prints the one line it decided on, and sizes `ARENA_GB` to match when
+none is pinned.
+
+```
+$ PRUNE_KEEP=auto MAX_SEQ=262144 ./start.sh
+PRUNE_KEEP=auto -> 0.36 for MAX_SEQ=262144 (fits with 3.3 GB spare)
+```
+
+On a 121 GiB GB10 that is **0.38 up to 128k and 0.36 at 256k** — the fraction the 256k run was
+measured at. A number still works and is passed through untouched; `./start.sh --print-env`
+resolves the whole configuration and starts nothing, which is the quickest way to see what a
+context change costs. `./tune.sh --print` writes `auto` back as `auto`, with the value it
+resolves to today on a comment line beside it.
+
+**Per-profile thinking.** A profile now carries the thinking default its generation gate was run
+with, and `./tune.sh` writes it as `DEFAULT_THINKING`. Both language bundles ship `off`: with
+thinking off every language in them came out clean, and with it on French, German, Chinese and
+Japanese corrupted a word and looped (`results/keepsets/*/GATE.md`, 2026-09-14). It is a default
+for requests that say nothing — any request can still ask for thinking on.
+
 ## Two ways to run it
 
 Both are the same server and both read the same `./.env` (copy [`env.example`](env.example)).
@@ -349,7 +373,8 @@ HTTP range requests. Serving needs all of it.
 ## Layout
 
 ```
-start.sh / stop.sh    native launcher: memory and port guards, nohup + pidfile, health wait
+start.sh / stop.sh    native launcher: PRUNE_KEEP=auto, memory and port guards, nohup +
+                      pidfile, health wait; --print-env resolves it all and starts nothing
 run.sh                container dispatcher: setup | serve | logs | stop | shell | bench | config
 compose.yaml          loopback-only service, /models bind mount, unified-memory ulimits
 Dockerfile            arm64 CUDA-13 devel base, torch cu130 + triton; weights mounted, never baked
@@ -360,6 +385,7 @@ engine/               the serving engine: v41_engine.py (generation loop, DSpark
 server/               OpenAI-compatible front end (app.py), standard library only + 15 e2e tests
 tools/                v41_ref.py (pure-torch reference port) · expert_trace.py · expert_stats.py
                       · engram_rows.py · make_corpus.py · fp4_moe.py (the Triton FP4 MoE kernel)
+                      · tune.py + budget.py (the keep-set screen) · keep_for_context.py
 bench/                bench.py + the rules it refuses to break
 corpus/               the teacher-forced trace corpus and its (public, MIT) sources
 results/              measured rows; results/*/stats/coverage.json ranks the warm start
