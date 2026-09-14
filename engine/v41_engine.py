@@ -5,6 +5,7 @@ rejection sampling, cache rollback, and the Engine API the server uses.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -21,6 +22,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 from engine import experts as EX  # noqa: E402
 from engine.escape import EscapeHatch  # noqa: E402
 from engine.engram import EngramTable, make_hash_state  # noqa: E402
+from engine import prefill_topk as PT  # noqa: E402  (torch-free; off unless the env asks)
 from engine.model import MAX_CHUNK, PREFILL_KV_FP8, RING, Caches, Model, Weights  # noqa: E402
 import v41_ref as R  # noqa: E402
 
@@ -920,6 +922,29 @@ class V41Engine:
         self.model.prune_drop = self.prune_mode == "drop" and self.model_prune_mask is not None
         self.model.prune_fallback = (build_prune_fallback(self.model_prune_mask, self.args.n_activated_experts)
                                      if self.model.prune_drop else None)
+        # DSV41_PREFILL_TOPK / DSV41_PREFILL_FOLD (engine/prefill_topk.py, engine/exfold.py):
+        # fewer routed experts in PREFILL, with the excluded ones folded onto the retained ones
+        # rather than dropped. Off unless the top-k is actually reduced, and off means this object
+        # is never built and `Model.moe` never leaves the path it has always taken.
+        self.exfold = None
+        if PT.OVERRIDE is not None and self.model.prune_drop:
+            # `prefill_topk` refuses this too, but it would refuse at the first routed layer of the
+            # first request rather than here. The fallback table `drop` builds has one resident id
+            # per COLUMN of the checkpoint's k, so a reduced k would index past the end of it.
+            raise ValueError(f"{PT.ENV_K} does not combine with DSV41_PRUNE_MODE=drop: the "
+                             f"per-column fallback table is sized for the checkpoint's k")
+        if PT.OVERRIDE is not None and PT.FOLD == "exfold":
+            from engine.exfold import FoldTable
+            path = PT.table_path(os.environ.get(PT.ENV_TABLE), model_dir)
+            self.exfold = FoldTable.load(path, self.args.n_layers, self.args.n_routed_experts,
+                                         device=device, keep_sig=self.keep_signature(), log=log)
+            self.model.exfold = self.exfold
+            log(f"ExFold prefill folding on: top-{PT.OVERRIDE} of {self.args.n_activated_experts} "
+                f"routed experts per prefill token, {self.exfold.bytes() / 1e6:.1f} MB of tables")
+        elif PT.OVERRIDE is not None:
+            log(f"prefill top-{PT.OVERRIDE} with DSV41_PREFILL_FOLD=none: the excluded routes are "
+                f"dropped and the survivors renormalised. This is the control arm, not a "
+                f"configuration to serve on -- see docs/architecture.md.")
         # DSV41_ESCAPE_K: the escape hatch (engine/escape.py). Off unless asked for, and "off"
         # means this object is never built, nothing is attached to the model or the store, and
         # both routing paths run the code they ran before this existed.
@@ -1408,6 +1433,21 @@ class V41Engine:
     supports_penalties = True
     supports_think_controls = True
 
+    def keep_signature(self) -> str:
+        """A short, stable fingerprint of the resident expert set.
+
+        Two engines with the same keep-set produce the same string; an ExFold table carries the
+        one it was calibrated under, so `FoldTable.load` can say when a table and a keep-set have
+        drifted apart. Unpruned engines return "full".
+        """
+        m = getattr(self, "model_prune_mask", None)
+        if m is None:
+            return "full"
+        h = hashlib.sha256()
+        for L in sorted(m):
+            h.update(np.packbits(m[L].detach().cpu().numpy().astype(np.uint8)).tobytes())
+        return h.hexdigest()[:16]
+
     def config(self):
         """Static engine configuration -- everything a measured number has to be quoted with."""
         return {
@@ -1428,6 +1468,10 @@ class V41Engine:
             "dense_fp4": ",".join(sorted(R.dense_fp4_groups())) or "off",
             "head_fmt": R.head_fmt(),
             "routed_topk": self.args.n_activated_experts,
+            # fewer routed experts in PREFILL only; 0 = off, which is the shipped configuration
+            "prefill_topk": PT.OVERRIDE or 0,
+            "prefill_fold": PT.FOLD if PT.OVERRIDE else "off",
+            "exfold_table": self.exfold.path if self.exfold is not None else None,
             "sim_cb2_frac": self.sim_cb2_frac,
             "act_quant": self.act_quant,
             "swa_replay": self.swa_replay,

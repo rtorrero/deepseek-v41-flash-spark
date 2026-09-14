@@ -18,6 +18,7 @@ report stays where it belongs.
 | `unpack-cache-<date>.md` | `DSV41_PREFILL_UNPACK_CACHE_GB` on against off, same box, same prompt | `tools/verify_prefill_cache.sh` |
 | `prompt.txt`, `run<N>-probe.json`, `run<N>-audit.json` | `DSV41_PREFILL_FP8_DEQUANT` and `DSV41_PREFILL_FUSED_SINKHORN`, each alone and together | `tools/verify_prefill_fixes.sh` |
 | `RECORDS.md`, `gemm_dispatch-<mode>.json`, `GATE-frontend-<mode>.md` | `DSV41_PREFILL_ATTN_GEMM=fp32\|tf32\|bf16`, the attention softmax's math type | `tools/verify_prefill_hc.sh` |
+| `<stamp>-topk-a.json` / `-c.json` / `-b.json`, `-topk-summary.json`, `-topk-GATE.md` | fewer routed experts per prefill token, folded (`DSV41_PREFILL_TOPK` / `DSV41_PREFILL_FOLD`) against the shipped six | `tools/verify_prefill_topk.sh` |
 
 ## `verify_prefill_fp8.sh`
 
@@ -140,3 +141,23 @@ a non-default mode is worth anything:
 
 The gate output lives here and not in `../keepsets/frontend/GATE.md`: those files are the record of
 the shipped configuration, and an experimental math type has no business in them.
+## `verify_prefill_topk.sh`
+
+One JSON file per run, a summary, and the gate the k=4 configuration was judged by.
+
+```
+<stamp>-topk-a.json       baseline:  DSV41_PREFILL_TOPK unset        (six routed experts)
+<stamp>-topk-c.json       three:     DSV41_PREFILL_TOPK=3  FOLD=exfold
+<stamp>-topk-b.json       four:      DSV41_PREFILL_TOPK=4  FOLD=exfold
+<stamp>-topk-summary.json the three rows together, plus what the bound test predicted
+<stamp>-topk-GATE.md      gate_profile.py --profile Frontend --thinking on, run on (b)
+```
+
+The runs happen in the order a, c, b so that b is the server still standing when the gate runs.
+
+Two things to read the numbers with. The speed ceiling is small and known in advance: the FP4 MoE
+kernels are ~893 ms of a ~3.7 s chunk, so scaling only that share gives ~1.075x prefill at k=4 and
+~1.115x at k=3 — the summary prints those next to what was measured, and a measurement far above
+them means something other than the routed k moved. And the row that decides anything is the gate,
+not the tok/s: a prompt's routing approximation is still being read hundreds of tokens into the
+answer, through the window KV the decoder layers inherit from prefill.
