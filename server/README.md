@@ -7,7 +7,8 @@ on a lock, nothing is rejected.
 ```bash
 python3 server/app.py --model-dir ./models/DeepSeek-V4.1-Flash --engine mock      # HTTP layer only
 python3 server/app.py --model-dir ./models/DeepSeek-V4.1-Flash --engine v41       # real engine
-python3 server/test_server.py                                                     # 15 e2e tests vs the mock
+python3 server/test_server.py                                                     # e2e tests vs the mock
+python3 server/test_think_controls.py                                             # reasoning-span controls, no server needed
 ```
 
 | flag | default | meaning |
@@ -45,7 +46,8 @@ Mid-stream failures are sent as a `data: {"error": ...}` event followed by `data
 
 ### Response extras
 
-* `usage.completion_tokens_details.reasoning_tokens` = tokens generated before `</think>`.
+* `usage.completion_tokens_details.reasoning_tokens` = tokens generated before `</think>`, plus
+  `reasoning_budget_hit: true` (absent otherwise) when a `reasoning_budget` ended the reasoning.
 * `x_engine_stats` = whatever `Engine.stats()` returned (tok/s, acceptance rate, cache hit rate ...)
   plus `server_completion_tok_per_s`. Present on non-stream responses and on the final SSE chunk
   (the one carrying `finish_reason`, which also carries `usage`); `stream_options.include_usage`
@@ -73,6 +75,31 @@ Resolved per request, first match wins:
    | integer 1-100 (or a numeric string) | on | the integer |
 
 4. `--default-thinking` / `--default-effort`.
+
+### Reasoning-span controls
+
+Two guards over the think block, both **off** by default, both no-ops for a request with
+thinking off. Per request, or from the environment for a whole deployment:
+
+| field | fallbacks | env | meaning |
+|---|---|---|---|
+| `reasoning_budget` | `reasoning.max_tokens`, `chat_template_kwargs.reasoning_budget` | `DSV41_THINK_BUDGET` | after this many reasoning tokens the decode loop forces `</think>` and carries on as the answer; `0` = off |
+| `think_repeat_break` | `chat_template_kwargs.think_repeat_break` | `DSV41_THINK_REPEAT_BREAK` | n-gram length; inside the think block only, the token that would extend a third verbatim copy of an n-gram is masked. `0` = off, else `2`-`128` |
+
+`server/think_controls.py` holds both (standard library only: no torch, so the state machine is
+tested without a GPU). The server builds one object per request and hands it to any engine whose
+`supports_think_controls` is true; the engine owes it `observe(ids)` for every settled token and
+`mask_rows(logits, block_ids)` before the accept/reject decision, **after** any penalty pass --
+a forced `</think>` leaves one legal token in the row and a penalty applied afterwards could ban
+it. Only row 0 is ever masked: on the speculative path that rejects the first draft, the block is
+rolled back to one token and the bonus is the token the control asked for. `x_engine_stats
+.think_controls` reports `budget_forced`, `repeat_breaks`, `banned_tokens` and `mask_s`, and the
+server logs one line per request when the budget fires.
+
+They exist for a measured failure: with thinking on, a gate run that passes deliberates for about
+4,000 reasoning tokens and one that fails for about 19,000 (`RESULTS.md` §5.4 and the 2026-09-14
+addenda). The loop breaker is scoped to the reasoning span because the answer-side ban was
+refuted -- `no_repeat_ngram` over an answer destroys CSS, which repeats `px` and `0` legitimately.
 
 A boolean from steps 1-2 decides thinking; an effort from step 3 still sets the budget
 (`enable_thinking: true` + `reasoning_effort: "low"` = thinking on at 50). The effort prefix

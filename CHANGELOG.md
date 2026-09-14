@@ -102,6 +102,30 @@ so there is no measured long generation and no thinking-mode figure in this repo
 The earlier bring-up figures in `NOTES.md` taken on a 20 GB debug arena (6.9 % of the
 routed experts) are a measurement of that arena, not of the recipe — do not quote them.
 
+## Unreleased
+
+### Added
+- **Reasoning-span decode controls**, both **off by default**, so no shipped number moves.
+  `DSV41_THINK_BUDGET` / `reasoning_budget` caps the think block: once the completion has
+  produced that many tokens without closing it, the decode loop forces `</think>` on the next
+  step — on the speculative path too, by masking row 0 so the drafts are rejected and the
+  block's bonus token is the close — and generation continues as the answer.
+  `DSV41_THINK_REPEAT_BREAK` / `think_repeat_break` is a loop breaker scoped to the same span:
+  when the last n tokens repeat a window already seen twice in this reasoning span, the tokens
+  that continued the earlier copies are masked, so a third copy cannot be extended. The answer
+  is never touched by either — an n-gram ban over an answer was refuted here, because CSS
+  repeats `px` and `0` legitimately.
+  The motivation is measured (`RESULTS.md` §5.4 and the 2026-09-14 addenda): with thinking on,
+  a gate run that passes deliberates for about 4,000 reasoning tokens and one that fails for
+  about 19,000; the Backend keep-set at 0.36 answered all ten of its prompts and restated
+  itself 3–8× on seven of them, at 18–38k reasoning tokens.
+  `usage.completion_tokens_details.reasoning_budget_hit` says when the budget fired and
+  `x_engine_stats.think_controls` says what both controls did.
+  New `server/think_controls.py` (standard library only), `server/test_think_controls.py` and
+  `engine/test_think_budget.py` run without torch, a GPU or the checkpoint;
+  `tools/verify_think_controls.sh` takes the gate runs on the box.
+  [`docs/openai-api.md`](docs/openai-api.md#reasoning-span-controls).
+
 ## 0.5.0 — 2026-09-14
 
 **Choosing what the box is good at becomes a thing you can see.** About 40 % of the routed experts
