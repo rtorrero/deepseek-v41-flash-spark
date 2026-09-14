@@ -35,6 +35,12 @@ results/*/state/
 !results/oneshots/*.html
 !results/oneshots/*.txt
 
+# What DSV41_RECORD_DRAFT_DATA writes and what tools/train_mtp.py makes of it: 9.3 GB of recorded
+# hidden states for 300k positions, and the head trained on them. Both belong to the box, not to
+# the repository; what a reader came for is the row in results/mtp/, which stays tracked.
+data/
+weights/
+
 # tools/atlas/ is a vendored build of Weight Atlas (see tools/atlas/UPSTREAM.md). The
 # ~5 MB of routing data it draws is generated from results/keepsets/ by
 # tools/atlas_export.py whenever `a` is pressed in ./tune.sh, so it is not committed.
