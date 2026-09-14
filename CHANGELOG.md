@@ -114,9 +114,49 @@ landed in 0.2.0, and the 7.2 GB the budget model reserves for it was a fit to a 
 itemisation behind it. This entry writes down what is in it and adds an opt-in way to make it
 smaller.
 
-
+**And prefill turns out to be compute-bound, which the page predicting otherwise now says out
+loud.** A page of careful reasoning said a prefill chunk's MoE time would not move with the routed
+k, because the per-expert unpack is paid once per chunk whatever k is. It moves: 54.1 ms at k=6,
+38.3 at k=4, 30.9 at k=3. Fewer routed experts per prefill token is therefore worth having, and it
+lands here as folding rather than dropping.
 
 ### Added
+
+- **`DSV41_PREFILL_TOPK` / `DSV41_PREFILL_FOLD` — fewer routed experts in prefill, folded onto the
+  ones that remain.** `tools/prefill_bound_test.py` settled the question
+  [gemm-dispatch](docs/gemm-dispatch.md) was written to ask: one 2,048-token chunk through one MoE
+  layer costs 54.1 ms of `moe_fn` at k=6, 38.3 ms at k=4 and 30.9 ms at k=3 — 0.57x where the pairs
+  are 0.50x, so the FP4 grouped GEMMs dominate and the unpack is a floor rather than the bill. The
+  prediction on that page said 1.0x and is left standing next to the measurement that refuted it.
+  The reduction is implemented as **ExFold** (arXiv 2608.24938), whose Table 6 is on this model
+  family — DeepSeek-V4-Flash, 256 routed experts, Top-6 routing: at three routed experts per prefill
+  token, direct Top-3 keeps 97.05 % of the Top-6 baseline average and folding keeps 98.42 %. Per
+  token the router still picks its six; `K'` are kept by weight **times** a calibrated output-norm
+  estimate (expert norms span >3x within a layer, so the largest weight is not the largest
+  contribution), and each excluded expert is folded onto the retained expert with the smallest
+  calibrated reconstruction loss by adding `w_s · c_s · S[s,t]` to its weight — one scalar per
+  ordered pair per layer, plus the confidence term the paper adds specifically for this
+  architecture, whose remainder falls back pro rata. Nothing is renormalised: the scalar is the
+  magnitude correction. Decode is untouched (`engine/fastdecode.py` does not import any of it),
+  no graph changes, and prefill has no captured graphs to invalidate. **Expect ~7 % at k=4 and
+  ~12 % at k=3, not the paper's 1.32x** — the FP4 MoE kernels are ~893 ms of a ~3.7 s chunk here,
+  and their H800 figures come from a box with a different balance and from a serving curve with
+  queueing in it. Off by default; off loads no table and takes no branch.
+- **`tools/exfold_prepare.py`** — the one-time calibration, with the server stopped. Observes ~64
+  tokens in each of 64 sequences of this repository's own trace corpus (unsupervised, and unlike
+  the paper's released matrix it sees no benchmark input at all), recovers each routed expert's
+  output through the engine's own MoE kernel rather than a second reference implementation, and
+  fits the scalars and losses from one 6×6 Gram matrix per token per layer. Writes ~47 MB of
+  tables next to the checkpoint. It refuses to run with a top-k override already in force, and the
+  engine refuses to start with `DSV41_PREFILL_FOLD=exfold` and no tables rather than quietly
+  serving the drop arm.
+- **`tools/verify_prefill_topk.sh`** — the run that would gate it, and has not been taken: one
+  identical ~7,000-token prompt at k=6, k=3 and k=4 with prefill tok/s and TTFT read back from the
+  server (including the engine's own report of what `k` it actually used, so a variable that never
+  arrived cannot be reported as "this changes nothing"), then
+  `tools/gate_profile.py --profile Frontend --thinking on` at k=4. The gate is the point: prefill's
+  approximation does not stay in prefill, because the window KV the decoder reads is what the
+  prompt wrote, and an NLL number cannot see the failure mode that produces.
 
 
 - **`DSV41_ESCAPE_K` / `DSV41_ESCAPE_MARGIN` — the escape hatch.** The keep-set is a hard mask, and
@@ -347,6 +387,19 @@ smaller.
 ### Checks
 
 
+- `tools/test_exfold.py` — the routing arithmetic on a toy, torch-free: `k' >= k` is identity, the
+  `w · h` ranking against `w` alone, the minimum-loss target chosen over the next-ranked route, the
+  confidence split between fold and fallback, an unobserved pair folding nothing, a table with no
+  observed pair at all degrading to a pro-rata reweighting rather than to a drop, a scalar above 1
+  deliberately raising the routed mass and a negative one subtracting rather than being clamped.
+  Where torch is importable it runs `engine/exfold.py` over the same toy and holds the tensor path
+  to the reference elementwise; CUDA is never required.
+- `tools/test_prefill_topk.py` — extended for the two new variables and the retirement of the
+  measurement-only one: the fold defaulting to `exfold` whenever the top-k is reduced, an unknown
+  mode refused, the table path resolution, and mechanical pins that the router still issues the
+  *checkpoint's* k (so the fold knows what it excluded), that the reduction sits after the
+  checkpoint's own renormalisation and before the slot lookup, and that the decode path's topk is
+  untouched.
 - `tools/test_keep_for_context.py` — the resolution at every context length against a fake host,
   monotonicity in the context, `ARENA_GB` capping, the gate-floor warning, numeric passthrough,
   the CLI's exit codes, and `./start.sh --print-env` resolving it end to end.

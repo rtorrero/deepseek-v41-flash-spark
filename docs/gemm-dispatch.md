@@ -293,7 +293,7 @@ alone — on this configuration the unpack plus the two FP4 launches). It also r
 python3 tools/prefill_bound_test.py --chunk 2048 --layer 10 --k 6,4,3 --repeats 3
 ```
 
-The override is `DSV41_PREFILL_TOPK_TEST` (`engine/prefill_topk.py`): prefill-only, off by default,
+The override is `DSV41_PREFILL_TOPK` (`engine/prefill_topk.py`): prefill-only, off by default,
 byte-identical off, refused in `DSV41_PRUNE_MODE=drop`, pinned by `tools/test_prefill_topk.py`. It
 is deliberately **not** `DSV41_TOPK`, which rewrites `n_activated_experts` for the whole engine
 including the decode graphs. The script drives it by assigning the module attribute rather than the
@@ -326,3 +326,59 @@ per-expert unpack whose size does not depend on k, and the existing chunk-size m
 cost rather than a per-token one. So `r` near 1 is the expected outcome and ExFold is expected to
 be the *wrong* next thing on this engine. That is a prediction, not a finding — it is what the run
 is for.
+
+---
+
+## Q2, answered — 2026-09-15
+
+The run, on the shipped configuration (`EXPERT_PROFILE=frontend`, `PRUNE_KEEP=0.36`, chunk 2,048,
+layer 10, three repeats, median):
+
+| k | routed `moe_fn` | relative | pairs relative | what pure per-pair compute would give |
+|---|---|---|---|---|
+| 6 | 54.1 ms | 1.000 | 1.000 | 1.000 |
+| 4 | 38.3 ms | 0.708 | 0.667 | 0.667 |
+| 3 | 30.9 ms | 0.571 | 0.500 | 0.500 |
+
+`r = routed(3) / routed(6) = 0.57`. The decision rule's compute-bound branch is `r <= 0.65`.
+
+**The prediction written above this section was wrong, and it is left standing on purpose.** It
+said `r` near 1: the per-expert unpack is paid once per expert per chunk whatever k is, a
+2,048-token chunk still touches nearly every resident expert at k=3, and the chunk-size curve
+(291 / 326 / 369 tok/s at 512 / 1024 / 2048) is the signature of a per-chunk cost. All of that is
+true and none of it dominates. The unpack is a floor, not the bill: at k=3 the time falls almost
+as fast as the pairs do, 0.57 against 0.50, so the FP4 grouped GEMMs are where a prefill chunk's
+MoE time actually goes. Reading the code told us which kernels run; only the measurement told us
+which of them costs.
+
+### The decision, and how big it can be
+
+**Fewer experts per prefill token is worth implementing** — and the honest size of it is small,
+because the MoE is not the whole chunk. The FP4 MoE kernels are ~893 ms of a ~3.7 s chunk (24 %;
+~42.5 ms per layer over the 21 layers a prompt runs with `DSV41_SWA_REPLAY=1`). Scaling only that
+share:
+
+| k | routed MoE | expected prefill speedup |
+|---|---|---|
+| 4 | 0.708x | **1.075x** |
+| 3 | 0.571x | **1.115x** |
+
+So the ceiling here is ~7–12 % on prefill, not the 1.32x the ExFold paper reports on an H800 — on
+that box the MoE is a much larger share of a chunk, and its 8K TTFT figure also carries queueing
+amplification (their own Appendix says so). Anyone quoting 1.32x for this engine is quoting a
+different machine's bottleneck. `tools/verify_prefill_topk.sh` measures what this one does, and
+prints those predictions next to the measurement so the two cannot drift apart.
+
+Which leaves quality as the only real question, and that is why the reduction shipped as **ExFold**
+(arXiv 2608.24938) rather than as a smaller `topk`: on DeepSeek-V4-Flash, at three routed experts
+per prefill token, direct Top-3 reduction keeps 97.05 % of the Top-6 baseline average and folding
+keeps 98.42 %. See [architecture](architecture.md#fewer-experts-in-prefill).
+
+### What this does not license
+
+The two non-MoE items flagged above are untouched and still worth their own runs: the shared
+expert's `FP8Weight.dequant()` at prefill M, and the 20-iteration Sinkhorn under the 16-row tiling
+(~700,000 launches per chunk, with a fused kernel already written and used by decode only). A
+compute-bound MoE makes the second of those *more* interesting, not less — a launch-bound phase is
+invisible in a profile sorted by GPU time, which is exactly what `tools/audit_gemm_dispatch.py`'s
+GPU-busy fraction is for.

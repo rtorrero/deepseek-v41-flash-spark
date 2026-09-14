@@ -29,11 +29,18 @@ The decision rule (also written down in docs/gemm-dispatch.md):
                                       chunk, not pairs computed.
     in between                      -> partly each. Report the number, do not round it to a verdict.
 
-The k override is `DSV41_PREFILL_TOPK_TEST` (engine/prefill_topk.py): prefill-only, off by
-default, byte-identical off, pinned by tools/test_prefill_topk.py. This script drives it by
-assigning the module attribute rather than the environment variable, because an A/B on this box
-has to happen inside ONE process -- a second process lays the 89 GB arena down at a different
-offset and that alone moves a streaming kernel's time (NOTES, 2026-09-11 "the head" section).
+The k override is `DSV41_PREFILL_TOPK` (engine/prefill_topk.py): prefill-only, off by default,
+byte-identical off, pinned by tools/test_prefill_topk.py. This script drives it by assigning the
+module attribute rather than the environment variable, because an A/B on this box has to happen
+inside ONE process -- a second process lays the 89 GB arena down at a different offset and that
+alone moves a streaming kernel's time (NOTES, 2026-09-11 "the head" section). It also leaves
+`PT.FOLD` alone (`none`): this script is a TIMING measurement, and folding changes the weights
+the kernel multiplies by, not the number of routes it runs. The quality arm is
+`tools/verify_prefill_topk.sh`.
+
+This run has been taken. 2026-09-15, chunk 2,048, layer 10, keep 0.36: routed 54.1 ms at k=6,
+38.3 ms at k=4, 30.9 ms at k=3 -- 0.57x where the pairs are 0.50x. Compute-bound; the reduction
+was built. See docs/gemm-dispatch.md.
 """
 
 from __future__ import annotations

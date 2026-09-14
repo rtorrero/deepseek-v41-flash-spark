@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 import v41_ref as R  # noqa: E402
 
 from engine import prefill_topk as PT  # noqa: E402  (torch-free; off unless the env asks)
+from engine import exfold as XF  # noqa: E402  (tables are loaded only when PT asks for them)
 
 # Longest prefill chunk. Bigger chunks are strictly cheaper on this recipe: a prefill chunk streams
 # nearly every expert of every layer through the transient ring whatever its length (a 512-token
@@ -294,6 +295,9 @@ class Model:
         self.freqs_w = R.precompute_freqs_cis(a.rope_head_dim, caches.max_seq + 8, 0, a.rope_theta, a.rope_factor,
                                               a.beta_fast, a.beta_slow, self.dev)
         self.tap = None  # optional diagnostic hook: callable(name, L, tensor)
+        #: engine.exfold.FoldTable, attached by V41Engine when DSV41_PREFILL_FOLD=exfold asked
+        #: for it. None everywhere else, including every shipped configuration.
+        self.exfold = None
         self.engram_rows = None  # callable (layer, hashes [T,24]) -> [T,24,256] float32
         self.hash_state = None  # reference NgramHashState
         if not act_quant:
@@ -614,11 +618,14 @@ class Model:
         if pruned and not drop:
             # the router may only pick surviving experts
             logits = logits.masked_fill(~pm[L], float("-inf"))
-        # DSV41_PREFILL_TOPK_TEST (engine/prefill_topk.py): measurement-only, prefill-only override
-        # of the routed k. Unset -- every served configuration -- this returns `k` unchanged and
-        # the topk below is the one this engine has always issued.
-        if prefill and n_experts != 128:
-            k = PT.prefill_topk(k, drop=drop)
+        # DSV41_PREFILL_TOPK (engine/prefill_topk.py): prefill-only reduction of the routed k.
+        # Unset -- every shipped configuration -- `k_pre` is `k`, the branch after the
+        # renormalisation is one integer comparison, and this function computes what it always did.
+        k_pre = PT.prefill_topk(k, drop=drop) if (prefill and n_experts != 128) else k
+        # The router still picks its own k. The reduction happens AFTER the checkpoint's
+        # normalisation, on the weights the MoE kernel would have been handed, because that is
+        # where ExFold's `alpha_e(x)` lives (arXiv 2608.24938, Eq. 3-4) -- and because the
+        # excluded experts have to be known by name to be folded onto the retained ones.
         indices = logits.topk(k, dim=-1)[1]
         weights = scores.gather(1, indices)
         slot_idx = indices
@@ -635,6 +642,17 @@ class Model:
         # Renormalising over what is left: with every pick dropped the sum is 0, the weights stay 0
         # (0 / 1e-20), and only the shared expert contributes to this layer's output.
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
+        # Fewer experts in prefill. `none` keeps the router's own first k' and renormalises -- the
+        # plain top-k' reduction, and the control arm. `exfold` keeps the k' routes with the
+        # largest weight x calibrated output norm and folds the excluded ones onto them through
+        # the calibrated scalar table (arXiv 2608.24938; docs/architecture.md "Fewer experts in
+        # prefill"). Either way the MoE kernel below runs k' routes per token instead of k.
+        if k_pre < k:
+            if self.exfold is not None:
+                indices, weights = self.exfold.reduce(indices, weights, L, k_pre)
+            else:
+                indices, weights = XF.reduce_plain(indices, weights, k_pre, a.route_scale)
+            slot_idx = indices        # `drop` is refused with the override, so these never diverge
         # The taps carry the router's TRUE choice and the post-zeroing weights, so a profile sees
         # what actually happened rather than the substitution.
         self._tap("route_idx", L, indices); self._tap("route_w", L, weights)

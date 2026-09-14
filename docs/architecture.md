@@ -250,6 +250,87 @@ If Triton is unavailable the engine falls back to a dequantise-then-GEMM path
 (`engine/moe_fallback.py`), which is correct and slow; `/health`'s `engine_config.kernel`
 says which one you got.
 
+## Fewer experts in prefill
+
+Prefill and decode are bound by different things here, so they get different budgets. Decode is
+bound by the bytes a step has to move and is not touched by any of this. Prefill turned out to be
+bound by the routed GEMMs themselves: forcing one layer's router to k = 6, 4 and 3 gives 54.1,
+38.3 and 30.9 ms of `moe_fn` time, and 0.57x at half the pairs is compute, not bandwidth
+([gemm-dispatch](gemm-dispatch.md#q2-answered--2026-09-15) has the run and the prediction it
+contradicted). Cutting the routed k in prefill therefore buys real time — bounded, because the FP4
+MoE kernels are ~893 ms of a ~3.7 s chunk, so ~7 % at k=4 and ~12 % at k=3.
+
+Which leaves quality. Dropping two of a token's six routed experts removes their contribution
+outright, and on this model family that is measurably the wrong way to spend the budget:
+**ExFold** (arXiv 2608.24938) reports, on DeepSeek-V4-Flash — 256 routed experts, Top-6 routing,
+the same router shape as this checkpoint — a Top-6 baseline average of 72.68 across nine
+benchmarks, 70.54 for direct Top-3 reduction (97.05 % of it) and 71.53 for folded Top-3
+(98.42 %). So the reduction here is folded.
+
+### What folding is
+
+The paper's observation is that within a MoE layer the expert outputs are nearly co-directional
+but very different in size: normalising each to unit length lifts the mean pairwise cosine from
+0.335 to 0.529 at one layer and from 0.251 to 0.471 at another, while raw output norms span more
+than 3x within a single layer. If two experts point the same way and differ only in magnitude, a
+retained expert can stand in for an excluded one — provided somebody has measured **by how much**
+to rescale it. That measurement is one scalar per ordered pair of experts per layer, fitted offline
+by weighted least squares, and the whole of ExFold is that scalar plus the bookkeeping to use it.
+
+Per prefill token, with the router's six already chosen and weighted exactly as they are today:
+
+1. **Rank by `w_e · h_e`, keep `K'`.** Not by router weight alone — `h_e` is the calibrated output
+   norm of expert `e`, and because those norms differ by 3x, the largest weight is not the largest
+   contribution. The paper ablates all three rankings and `w · h` wins.
+2. **Each excluded expert picks a target.** `π(s) = argmin_t ℓ(s→t)` over the retained set, where
+   `ℓ` is the calibrated reconstruction error of using `t` in place of `s`. A pair the calibration
+   never saw carries a sentinel loss and can never win this.
+3. **Fold.** `w̃_t += w_s · c_s · S[s,t]`, where `S[s,t]` is the scalar and
+   `c_s = clip(1 − ℓ(s→π(s)), 0, 1)` is a confidence the paper adds *specifically for this model
+   family*, whose router scores and expert magnitudes have a wider spread than the model it
+   developed the method on. The remaining `w_s · (1 − c_s)` is spread over the retained routes in
+   proportion to their original weights. Routes folded onto the same target are coalesced, so the
+   MoE kernel below runs exactly `K'` experts per token.
+
+Nothing is renormalised afterwards, and the routed weight mass is deliberately not conserved: the
+scalar *is* the magnitude correction, so a retained expert standing in for a stronger one takes
+more weight than was removed. Expert weights do not change, the router does not change, and the
+fallback when a table is missing pairs is a proportional reweighting of the retained routes —
+i.e. it degrades towards plain top-k′ rather than towards noise.
+
+### Using it
+
+```
+./stop.sh && python3 tools/exfold_prepare.py     # once: calibrate, ~47 MB of tables
+DSV41_PREFILL_TOPK=4                             # DSV41_PREFILL_FOLD=exfold is the default
+```
+
+`DSV41_PREFILL_TOPK` unset is the shipped engine, byte for byte. `DSV41_PREFILL_FOLD=none` is the
+plain top-k′ control arm — the routes are dropped and the survivors renormalised — kept because
+the fold arm has to be measured against something, not because anything should serve on it.
+Calibration is unsupervised and sees no benchmark: `tools/exfold_prepare.py` observes ~64 tokens
+in each of 64 sequences of this repository's own trace corpus, recovers each routed expert's
+output through the engine's own MoE kernel, and fits the scalars from one 6x6 Gram matrix per
+token per layer. It must run with the server stopped — it lays down the same ~89 GB arena, and two
+of those at once wedge the box.
+
+Two things worth knowing before quoting a number from this. With `DSV41_SWA_REPLAY=1` a prompt only
+runs layers 0–20, so those are the only layers a prefill fold ever applies to and the only ones
+calibration observes. And the paper's 1.41x/1.32x TTFT figures are an eight-GPU H800 server under
+queueing load, where the MoE is a far larger share of a chunk than it is here;
+`tools/verify_prefill_topk.sh` is what this box's number comes from, and it prints the prediction
+beside the measurement.
+
+### What has not been measured
+
+Nothing on this box, yet. The bound test is real and the implementation follows the paper's
+equations, but no prompt has been generated with the fold armed and no gate has judged it.
+`tools/verify_prefill_topk.sh` is the run that would say: three prefill timings at k = 6, 4 and 3
+on one identical ~7,000-token prompt, then `tools/gate_profile.py --profile Frontend --thinking on`
+at k=4. The gate is the one that matters. A prompt's routing approximation does not stay in the
+prompt — the window KV the decoder layers read is what prefill wrote — so the failure to look for
+is a fluent first paragraph followed by a page that comes apart, and an NLL number cannot see that.
+
 ## Where to go next
 
 * [`NOTES.md`](../NOTES.md) — the running log, with the checkpoint layout, the router,
