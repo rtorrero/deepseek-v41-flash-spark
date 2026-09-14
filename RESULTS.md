@@ -1057,3 +1057,24 @@ span the server ended says `[reasoning budget hit at N reasoning tokens]` in its
 per-request truth the run card's environment reading cannot give. `tools/language_gap.py` reads
 both table shapes, and `tools/test_gate_profile.py` covers the units, the fallbacks and both
 shapes.
+
+### 2026-09-14 23:20 — the reasoning budget and the reasoning-span loop breaker, gated
+
+Both controls off by default; measured on Frontend and Backend at keep 0.36 (saliency, `maxmin`,
+thinking on, effort 45), budget 2,000 tokens, breaker n = 12. Strict passes · finished answers:
+
+| profile | no controls | budget 2,000 | budget + breaker |
+|---|---|---|---|
+| Frontend | 7 of 10 · 9 | 6 of 10 · 8 | 6 of 10 · 9 |
+| Backend | 3 of 10 · 10 | 5 of 10 · 9 | 6 of 10 · 8 |
+
+What the budget buys is time: Backend prompts that took four to nine minutes finish in 16 to
+712 seconds, the budget firing on seven of ten. What it costs is where the loop goes: cut at
+2,000 tokens of deliberation, the model carries the loop into the answer (`py-walk` 9,903
+answer tokens, `sql-window` repeating its own sentence 15 times), and one `go-handler` run
+was guard-cut with no answer. The breaker inside the think span adds one strict pass on each
+profile over the budget alone and does not touch answers, by design. An 8,000-token budget
+never fired: the gate's length columns were characters, and no deliberation on these prompts
+reaches 8,000 tokens (passes ≈1,000, loopers 2,500–6,000). Records in
+`results/keepsets/{frontend,backend}/GATE.md`, each run card naming its controls; a run taken
+with controls is not the profile's record (`tools/gate_records.py`).
