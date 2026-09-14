@@ -6,7 +6,7 @@ out costs a three-minute load. This module answers the same question in a
 millisecond, from the same arithmetic, so a configuration can be chosen before
 it is paid for.
 
-Two things are computed here.
+Three things are computed here.
 
 MEMORY is exact. Every term below is either a shape out of the checkpoint's own
 config or a constant the engine itself uses, and the total is compared against
@@ -25,6 +25,15 @@ do not make a step faster on their own: step time is set by the bytes of the
 experts a token activates, and that does not change. Fewer topics reach a given
 coverage at a LOWER keep fraction, and a lower keep fraction is a smaller
 arena -- which is where the memory, and the context window, come from.
+
+THE TAIL is the third, and it exists because coverage stopped resolving anything
+once the box was served on `saliency`: half a layer's saliency mass sits on one
+expert, so a keep-set swap of 513 resident experts moved every bar by 0.005 and
+flipped a generation gate from 6 of 10 to 3 of 10. `TopicIndex.tail_curves`
+measures the same keep-set in PICKS rather than magnitude and reports what a
+TOKEN loses to it -- how many of its six picks in a layer are not resident, and
+how often all six are. Across the ten shipped profiles that spans 2.6x where the
+coverage bar spans 1.03x. tools/tail_metric.py ranks both against the gates.
 
 Which experts a selection keeps also depends on HOW the selected topics are
 combined into one ranking -- the engine's DSV41_PRUNE_RANK. All three rules it
@@ -526,21 +535,31 @@ class TopicIndex:
         # magnitudes and carries no token count at all, so the sample size is
         # read out of the frequency histograms of the same file -- the same
         # trace, the same tokens, whichever family ranks them.
-        counts_totals = self.totals
+        #
+        # The frequency histograms are kept whole and not only summed, because
+        # they are the only thing in the file that counts PICKS. `tail_curves`
+        # below measures a keep-set against them whichever family ranked it:
+        # what breaks a generation is a token whose picks are not resident, and
+        # a pick is a pick whatever magnitude it carried.
+        self.picks = self.counts if source == "counts" else {}
         if source != "counts":
-            counts_totals = {}
             for t in self.topics:
-                tot = 0.0
+                per = {}
+                ok = True
                 for L in range(N_LAYERS):
                     v = pl.get(str(L), {}).get("counts_" + t)
                     if v is None:
-                        tot = 0.0
+                        ok = False
                         break
-                    tot += sum(float(x) for x in v)
-                counts_totals[t] = tot
+                    per[L] = [float(x) for x in v]
+                if ok:
+                    self.picks[t] = per
+        counts_totals = {t: sum(sum(v) for v in self.picks[t].values()) if t in self.picks else 0.0
+                         for t in self.topics}
         self.tokens = {t: int(round(counts_totals.get(t, 0.0) / (N_LAYERS * TOPK)))
                        for t in self.topics}
         self._cache: dict = {}
+        self._tail: dict = {}
         # A topic's normalised histogram does not depend on what it is selected
         # with, and the profile screen ranks ten selections over the same
         # thirty-five topics, so it is normalised once per topic rather than
@@ -624,6 +643,120 @@ class TopicIndex:
         curves = got[0]
         n = keep_n(keep)
         return {t: c[n] for t, c in curves.items()}
+
+    def tail_curves(self, selection: tuple, select: str = "uniform", only: tuple | None = None,
+                    rank: str = RANK_DEFAULT):
+        """What the same keep-set costs a TOKEN rather than a topic's mass.
+
+        Coverage answers "how much of this topic's routing stayed resident".
+        That is a number about the corpus. What a generation trips over is a
+        number about one token: the engine masks the router to the resident
+        experts, so a token whose six picks in a layer are not all resident is
+        computed with experts it did not ask for, and those substitutions are
+        what compound into a redraft, a corrupted identifier, a loop.
+
+        Coverage cannot see that, and under `saliency` it cannot see much of
+        anything: half of a layer's saliency mass sits on one expert, so a
+        keep-set swap of 513 experts moved every bar by 0.005 and flipped the
+        gate (docs/keep-sets.md, 2026-09-14). The tail is where the tokens are.
+
+        Returned per topic, each a curve indexed by experts kept per layer:
+
+          cov_picks   the topic's PICKS that stayed resident. Same arithmetic
+                      as `curves`, read off `self.picks` instead of whatever
+                      family ranked the keep-set -- so a saliency keep-set is
+                      still measured in picks, which is what a token spends.
+          nonres      expected non-resident picks per token per layer, 0 to 6.
+                      EXACT, not an estimate: `counts_<topic>` IS the histogram
+                      of picks, so the mean of a per-token count is the mass
+                      fraction times six, with no assumption about how the six
+                      are distributed. Validated against the per-token arrays of
+                      results/trace-full-20260910 (tools/test_tail_metric.py).
+          all6        the rate at which all six picks of a token-layer are
+                      resident -- the tail property itself -- ESTIMATED as
+                      mean_L r_L^6, i.e. as if the six picks were drawn
+                      independently from the topic's histogram. They are not:
+                      experts co-fire, so the true rate is always HIGHER, never
+                      lower. Measured against the per-token arrays of
+                      results/trace-full-20260910 over twelve (topic, selection,
+                      keep) points from 0.20 to 0.40, the estimate runs 6 % to
+                      75 % low, worst on a topic the keep-set was not spent on,
+                      and its rank correlation with the truth is 0.96. Read it
+                      as a ranking statistic, not as a rate.
+                      tools/test_tail_metric.py holds both of those.
+          worst_layer min over layers of the resident pick fraction. Exact, and
+                      the cheapest tail-sensitive number here: one bad layer is
+                      enough, and a mean over forty hides it.
+
+        Cached on the same key as `curves`, because a slider move must stay a
+        lookup and this walks 40 x 384 per topic to build the curves.
+        """
+        key = (tuple(sorted(selection)), select, only, rank)
+        hit = self._tail.get(key)
+        if hit is not None:
+            return hit
+        got = self.curves(selection, select, only=only, rank=rank)
+        if not got:
+            return {}
+        order = got[1]
+        out = {}
+        for t in (only if only is not None else self.topics):
+            if t not in self.picks:
+                continue
+            # r[L][n] = the fraction of this topic's picks in layer L that the
+            # top-n of that layer's admission order holds. One pass per layer.
+            r = []
+            for L in range(N_LAYERS):
+                p = self.picks[t][L]
+                tot = sum(p)
+                row = [0.0] * (N_EXPERTS + 1)
+                acc = 0.0
+                for n, e in enumerate(order[L], start=1):
+                    acc += p[e]
+                    row[n] = acc
+                for n in range(len(order[L]) + 1, N_EXPERTS + 1):
+                    row[n] = acc      # a short admission order keeps its tail flat
+                if tot > 0:
+                    row = [x / tot for x in row]
+                else:
+                    # A topic with no pick at all in this layer has nothing to
+                    # lose there. It cannot be counted as a miss, and counting
+                    # it as a hit would flatter every other layer's average, so
+                    # it does not vote: `None` drops it from the means below.
+                    row = None
+                r.append(row)
+            live = [row for row in r if row is not None]
+            if not live:
+                continue
+            nl = len(live)
+            cov = [0.0] * (N_EXPERTS + 1)
+            nonres = [0.0] * (N_EXPERTS + 1)
+            all6 = [0.0] * (N_EXPERTS + 1)
+            worst = [0.0] * (N_EXPERTS + 1)
+            for n in range(N_EXPERTS + 1):
+                s = 0.0
+                s6 = 0.0
+                mn = 1.0
+                for row in live:
+                    v = row[n]
+                    s += v
+                    s6 += v ** TOPK
+                    if v < mn:
+                        mn = v
+                cov[n] = s / nl
+                nonres[n] = TOPK * (1.0 - s / nl)
+                all6[n] = s6 / nl
+                worst[n] = mn
+            out[t] = {"cov_picks": cov, "nonres": nonres, "all6": all6, "worst_layer": worst}
+        self._tail[key] = out
+        return out
+
+    def tail(self, selection: tuple, keep: float, select: str = "uniform",
+             rank: str = RANK_DEFAULT, only: tuple | None = None) -> dict:
+        """`tail_curves` read at one keep fraction: {topic: {name: float}}."""
+        got = self.tail_curves(selection, select, only=only, rank=rank)
+        n = keep_n(keep)
+        return {t: {k: v[n] for k, v in d.items()} for t, d in got.items()}
 
     def keep_for(self, selection: tuple, target: float, select: str = "uniform",
                  rank: str = RANK_DEFAULT) -> float | None:

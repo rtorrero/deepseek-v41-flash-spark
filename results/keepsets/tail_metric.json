@@ -1,0 +1,825 @@
+{
+ "stats": "results/keepsets/topics/coverage.json",
+ "gates": "results/keepsets/gates.json",
+ "profiles": [
+  {
+   "profile": "Frontend",
+   "record": "frontend",
+   "run": "2026-09-14 01:22",
+   "gate_file": "results/keepsets/frontend/GATE.md",
+   "measured_in": "RESULTS.md, 2026-09-14 06:20 and 07:20 addenda to \u00a75",
+   "keep": 0.36,
+   "n_keep": 139,
+   "rank": "maxmin",
+   "source": "saliency",
+   "topics": [
+    "html",
+    "css",
+    "javascript",
+    "typescript",
+    "english",
+    "technical",
+    "config",
+    "reasoning",
+    "reasoning_code",
+    "reasoning_design"
+   ],
+   "runs": 10,
+   "strict": 7,
+   "finished": 9,
+   "kinds": {
+    "think-exit": 0,
+    "guard": 0,
+    "corrupt": 0,
+    "content": 1,
+    "repeat": 2
+   },
+   "strict_rate": 0.7,
+   "finished_rate": 0.9,
+   "hard_misses": 1,
+   "cov_sal_worst": 0.9401805061321595,
+   "cov_sal_mean": 0.9571212895099025,
+   "cov_picks_worst": 0.5976171985314884,
+   "nonres_worst": 2.4142968088110695,
+   "nonres_mean": 1.9774642506255102,
+   "all6_worst": 0.05646838841414288,
+   "all6_mean": 0.10415869822639298,
+   "worst_layer": 0.4551444977878189
+  },
+  {
+   "profile": "Backend",
+   "record": "backend",
+   "run": "2026-09-14 03:36",
+   "gate_file": "results/keepsets/backend/GATE.md",
+   "measured_in": "RESULTS.md, 2026-09-14 06:20 addendum to \u00a75",
+   "keep": 0.36,
+   "n_keep": 139,
+   "rank": "maxmin",
+   "source": "saliency",
+   "topics": [
+    "python",
+    "go",
+    "java",
+    "sql",
+    "config",
+    "technical",
+    "english",
+    "reasoning",
+    "reasoning_code"
+   ],
+   "runs": 10,
+   "strict": 3,
+   "finished": 10,
+   "kinds": {
+    "think-exit": 0,
+    "guard": 0,
+    "corrupt": 0,
+    "content": 0,
+    "repeat": 7
+   },
+   "strict_rate": 0.3,
+   "finished_rate": 1.0,
+   "hard_misses": 0,
+   "cov_sal_worst": 0.9460245310501196,
+   "cov_sal_mean": 0.953498100270505,
+   "cov_picks_worst": 0.5990021651134332,
+   "nonres_worst": 2.405987009319401,
+   "nonres_mean": 1.9479487344525142,
+   "all6_worst": 0.05441329939762549,
+   "all6_mean": 0.10637946159128414,
+   "worst_layer": 0.46785277228654804
+  },
+  {
+   "profile": "Systems programming",
+   "record": "systems_programming",
+   "run": "2026-09-13 21:28",
+   "gate_file": "results/keepsets/systems_programming/GATE.md",
+   "measured_in": "RESULTS.md \u00a75.1, the recipe; 154 experts a layer",
+   "keep": 0.4,
+   "n_keep": 154,
+   "rank": "maxmin",
+   "source": "saliency",
+   "topics": [
+    "rust",
+    "cpp",
+    "go",
+    "java",
+    "sql",
+    "config",
+    "technical",
+    "english",
+    "reasoning",
+    "reasoning_code"
+   ],
+   "runs": 11,
+   "strict": 6,
+   "finished": null,
+   "kinds": null,
+   "strict_rate": 0.5454545454545454,
+   "finished_rate": null,
+   "hard_misses": null,
+   "cov_sal_worst": 0.948526242769005,
+   "cov_sal_mean": 0.9571751410370842,
+   "cov_picks_worst": 0.6397568954156077,
+   "nonres_worst": 2.161458627506354,
+   "nonres_mean": 1.7236477098935226,
+   "all6_worst": 0.07877257353824019,
+   "all6_mean": 0.14237298592195782,
+   "worst_layer": 0.5023063164831028
+  },
+  {
+   "profile": "Chat and explanation",
+   "record": "chat_and_explanation",
+   "run": "2026-09-13 19:08",
+   "gate_file": "results/keepsets/chat_and_explanation/GATE.md",
+   "measured_in": "RESULTS.md \u00a75.2, the recipe column",
+   "keep": 0.4,
+   "n_keep": 154,
+   "rank": "maxmin",
+   "source": "saliency",
+   "topics": [
+    "english",
+    "technical",
+    "academic",
+    "journalism",
+    "translation",
+    "reasoning",
+    "reasoning_code"
+   ],
+   "runs": 8,
+   "strict": 6,
+   "finished": null,
+   "kinds": null,
+   "strict_rate": 0.75,
+   "finished_rate": null,
+   "hard_misses": null,
+   "cov_sal_worst": 0.9644783153576015,
+   "cov_sal_mean": 0.9667880990354806,
+   "cov_picks_worst": 0.7058422761931658,
+   "nonres_worst": 1.7649463428410055,
+   "nonres_mean": 1.5221138054985885,
+   "all6_worst": 0.13416968778470686,
+   "all6_mean": 0.18265756090971227,
+   "worst_layer": 0.6059022874894098
+  },
+  {
+   "profile": "Medicine",
+   "record": "medicine",
+   "run": "2026-09-13 19:26",
+   "gate_file": "results/keepsets/medicine/GATE.md",
+   "measured_in": "RESULTS.md \u00a75.2, the recipe column",
+   "keep": 0.4,
+   "n_keep": 154,
+   "rank": "maxmin",
+   "source": "saliency",
+   "topics": [
+    "medical",
+    "academic",
+    "technical",
+    "english",
+    "reasoning",
+    "reasoning_code"
+   ],
+   "runs": 7,
+   "strict": 6,
+   "finished": null,
+   "kinds": null,
+   "strict_rate": 0.8571428571428571,
+   "finished_rate": null,
+   "hard_misses": null,
+   "cov_sal_worst": 0.9640820551996016,
+   "cov_sal_mean": 0.9661093521287416,
+   "cov_picks_worst": 0.7013861432740282,
+   "nonres_worst": 1.791683140355831,
+   "nonres_mean": 1.5536399746575331,
+   "all6_worst": 0.12886667557335935,
+   "all6_mean": 0.175617123725708,
+   "worst_layer": 0.6018073990398193
+  },
+  {
+   "profile": "Law and finance",
+   "record": "law_and_finance",
+   "run": "2026-09-13 19:44",
+   "gate_file": "results/keepsets/law_and_finance/GATE.md",
+   "measured_in": "RESULTS.md \u00a75.2, the recipe column",
+   "keep": 0.4,
+   "n_keep": 154,
+   "rank": "maxmin",
+   "source": "saliency",
+   "topics": [
+    "legal",
+    "finance",
+    "academic",
+    "english",
+    "reasoning",
+    "reasoning_code"
+   ],
+   "runs": 7,
+   "strict": 5,
+   "finished": null,
+   "kinds": null,
+   "strict_rate": 0.7142857142857143,
+   "finished_rate": null,
+   "hard_misses": null,
+   "cov_sal_worst": 0.9648765489959297,
+   "cov_sal_mean": 0.9672671927136767,
+   "cov_picks_worst": 0.7061388025981362,
+   "nonres_worst": 1.7631671844111827,
+   "nonres_mean": 1.5201591112186932,
+   "all6_worst": 0.13423924031811368,
+   "all6_mean": 0.18353232906446112,
+   "worst_layer": 0.6016191283065048
+  },
+  {
+   "profile": "Data and research",
+   "record": "data_and_research",
+   "run": "2026-09-14 03:56",
+   "gate_file": "results/keepsets/data_and_research/GATE.md",
+   "measured_in": "RESULTS.md, 2026-09-14 06:20 addendum to \u00a75",
+   "keep": 0.36,
+   "n_keep": 139,
+   "rank": "maxmin",
+   "source": "saliency",
+   "topics": [
+    "python",
+    "rlang",
+    "sql",
+    "latex",
+    "academic",
+    "technical",
+    "english",
+    "config",
+    "reasoning",
+    "reasoning_code"
+   ],
+   "runs": 11,
+   "strict": 8,
+   "finished": 10,
+   "kinds": {
+    "think-exit": 0,
+    "guard": 1,
+    "corrupt": 0,
+    "content": 0,
+    "repeat": 2
+   },
+   "strict_rate": 0.7272727272727273,
+   "finished_rate": 0.9090909090909091,
+   "hard_misses": 1,
+   "cov_sal_worst": 0.9448578885583938,
+   "cov_sal_mean": 0.9499656126888837,
+   "cov_picks_worst": 0.5946731149392828,
+   "nonres_worst": 2.4319613103643034,
+   "nonres_mean": 1.9563589173906695,
+   "all6_worst": 0.05258498750386685,
+   "all6_mean": 0.1041823468703091,
+   "worst_layer": 0.4630048009036995
+  },
+  {
+   "profile": "European languages",
+   "record": "european_languages",
+   "run": "2026-09-13 22:05",
+   "gate_file": "results/keepsets/european_languages/GATE.md",
+   "measured_in": "RESULTS.md, 2026-09-14 02:55 addendum to \u00a75 (the 0.40 record without reasoning_lang)",
+   "keep": 0.4,
+   "n_keep": 154,
+   "rank": "maxmin",
+   "source": "saliency",
+   "topics": [
+    "english",
+    "german",
+    "french",
+    "spanish",
+    "italian",
+    "portuguese",
+    "translation",
+    "reasoning",
+    "reasoning_code"
+   ],
+   "runs": 10,
+   "strict": 6,
+   "finished": null,
+   "kinds": null,
+   "strict_rate": 0.6,
+   "finished_rate": null,
+   "hard_misses": null,
+   "cov_sal_worst": 0.9610469642644746,
+   "cov_sal_mean": 0.9649087616521539,
+   "cov_picks_worst": 0.6893697637202295,
+   "nonres_worst": 1.863781417678623,
+   "nonres_mean": 1.6445216925661235,
+   "all6_worst": 0.11795495153773047,
+   "all6_mean": 0.15679989745746434,
+   "worst_layer": 0.586463334274687
+  },
+  {
+   "profile": "World languages",
+   "record": "world_languages",
+   "run": "2026-09-14 02:29",
+   "gate_file": "results/keepsets/world_languages/GATE.md",
+   "measured_in": "RESULTS.md, 2026-09-14 03:40 addendum to \u00a75",
+   "keep": 0.36,
+   "n_keep": 139,
+   "rank": "maxmin",
+   "source": "saliency",
+   "topics": [
+    "english",
+    "arabic",
+    "chinese",
+    "japanese",
+    "russian",
+    "turkish",
+    "translation",
+    "reasoning",
+    "reasoning_code",
+    "reasoning_lang"
+   ],
+   "runs": 10,
+   "strict": 6,
+   "finished": 7,
+   "kinds": {
+    "think-exit": 1,
+    "guard": 2,
+    "corrupt": 0,
+    "content": 0,
+    "repeat": 1
+   },
+   "strict_rate": 0.6,
+   "finished_rate": 0.7,
+   "hard_misses": 3,
+   "cov_sal_worst": 0.9360170844097249,
+   "cov_sal_mean": 0.9445389335121961,
+   "cov_picks_worst": 0.5783712228184129,
+   "nonres_worst": 2.5297726630895223,
+   "nonres_mean": 2.1385924914050425,
+   "all6_worst": 0.052707221285905624,
+   "all6_mean": 0.08490256929227835,
+   "worst_layer": 0.3860123281175913
+  },
+  {
+   "profile": "Writing",
+   "record": "writing",
+   "run": "2026-09-13 20:45",
+   "gate_file": "results/keepsets/writing/GATE.md",
+   "measured_in": "RESULTS.md \u00a75.2, the recipe column",
+   "keep": 0.4,
+   "n_keep": 154,
+   "rank": "maxmin",
+   "source": "saliency",
+   "topics": [
+    "english",
+    "journalism",
+    "marketing",
+    "academic",
+    "translation",
+    "reasoning",
+    "reasoning_code"
+   ],
+   "runs": 8,
+   "strict": 5,
+   "finished": null,
+   "kinds": null,
+   "strict_rate": 0.625,
+   "finished_rate": null,
+   "hard_misses": null,
+   "cov_sal_worst": 0.9648383614643525,
+   "cov_sal_mean": 0.9675186752190991,
+   "cov_picks_worst": 0.7074119834321754,
+   "nonres_worst": 1.7555280994069478,
+   "nonres_mean": 1.5135027017624378,
+   "all6_worst": 0.13566099067050566,
+   "all6_mean": 0.18549082363631753,
+   "worst_layer": 0.6040271712760795
+  }
+ ],
+ "swaps": [
+  {
+   "profile": "European languages",
+   "record": "european_languages",
+   "cite": "RESULTS.md, 2026-09-14 02:55 addendum to \u00a75",
+   "a": {
+    "run": "2026-09-13 22:05",
+    "keep": 0.4,
+    "rank": "maxmin",
+    "source": "saliency",
+    "topics": [
+     "english",
+     "french",
+     "german",
+     "italian",
+     "portuguese",
+     "reasoning",
+     "reasoning_code",
+     "spanish",
+     "translation"
+    ],
+    "runs": 10,
+    "strict": 6,
+    "finished": null,
+    "strict_rate": 0.6,
+    "cov_sal_worst": 0.9610469642644746,
+    "cov_sal_mean": 0.9649087616521539,
+    "cov_picks_worst": 0.6893697637202295,
+    "nonres_worst": 1.863781417678623,
+    "nonres_mean": 1.6445216925661235,
+    "all6_worst": 0.11795495153773047,
+    "all6_mean": 0.15679989745746434,
+    "worst_layer": 0.586463334274687
+   },
+   "b": {
+    "run": "2026-09-14 01:54",
+    "keep": 0.36,
+    "rank": "maxmin",
+    "source": "saliency",
+    "topics": [
+     "english",
+     "french",
+     "german",
+     "italian",
+     "portuguese",
+     "reasoning",
+     "reasoning_code",
+     "reasoning_lang",
+     "spanish",
+     "translation"
+    ],
+    "runs": 10,
+    "strict": 3,
+    "finished": 4,
+    "strict_rate": 0.3,
+    "cov_sal_worst": 0.9435988987469748,
+    "cov_sal_mean": 0.9536905523089982,
+    "cov_picks_worst": 0.6115362891838463,
+    "nonres_worst": 2.3307822648969223,
+    "nonres_mean": 1.9730226846725754,
+    "all6_worst": 0.06704468617982892,
+    "all6_mean": 0.10412010748097937,
+    "worst_layer": 0.443283441589005
+   },
+   "delta": {
+    "cov_sal_worst": -0.017448065517499778,
+    "cov_sal_mean": -0.01121820934315565,
+    "cov_picks_worst": -0.07783347453638323,
+    "nonres_worst": 0.4670008472182994,
+    "nonres_mean": 0.3285009921064519,
+    "all6_worst": -0.05091026535790155,
+    "all6_mean": -0.05267978997648497,
+    "worst_layer": -0.143179892685682,
+    "strict_rate": -0.3
+   }
+  },
+  {
+   "profile": "World languages",
+   "record": "world_languages",
+   "cite": "RESULTS.md, 2026-09-14 03:40 addendum to \u00a75",
+   "a": {
+    "run": "2026-09-13 22:33",
+    "keep": 0.4,
+    "rank": "maxmin",
+    "source": "saliency",
+    "topics": [
+     "arabic",
+     "chinese",
+     "english",
+     "japanese",
+     "reasoning",
+     "reasoning_code",
+     "russian",
+     "translation",
+     "turkish"
+    ],
+    "runs": 10,
+    "strict": 3,
+    "finished": null,
+    "strict_rate": 0.3,
+    "cov_sal_worst": 0.9514723665217351,
+    "cov_sal_mean": 0.9550084676942618,
+    "cov_picks_worst": 0.6375164736891651,
+    "nonres_worst": 2.1749011578650093,
+    "nonres_mean": 1.87419416127356,
+    "all6_worst": 0.08319986458997948,
+    "all6_mean": 0.11929114704231567,
+    "worst_layer": 0.47561894003577143
+   },
+   "b": {
+    "run": "2026-09-14 02:29",
+    "keep": 0.36,
+    "rank": "maxmin",
+    "source": "saliency",
+    "topics": [
+     "arabic",
+     "chinese",
+     "english",
+     "japanese",
+     "reasoning",
+     "reasoning_code",
+     "reasoning_lang",
+     "russian",
+     "translation",
+     "turkish"
+    ],
+    "runs": 10,
+    "strict": 6,
+    "finished": 7,
+    "strict_rate": 0.6,
+    "cov_sal_worst": 0.9360170844097249,
+    "cov_sal_mean": 0.9445389335121961,
+    "cov_picks_worst": 0.5783712228184129,
+    "nonres_worst": 2.5297726630895223,
+    "nonres_mean": 2.1385924914050425,
+    "all6_worst": 0.052707221285905624,
+    "all6_mean": 0.08490256929227835,
+    "worst_layer": 0.3860123281175913
+   },
+   "delta": {
+    "cov_sal_worst": -0.015455282112010194,
+    "cov_sal_mean": -0.010469534182065754,
+    "cov_picks_worst": -0.059145250870752175,
+    "nonres_worst": 0.35487150522451305,
+    "nonres_mean": 0.2643983301314825,
+    "all6_worst": -0.030492643304073856,
+    "all6_mean": -0.034388577750037314,
+    "worst_layer": -0.08960661191818015,
+    "strict_rate": 0.3
+   }
+  },
+  {
+   "profile": "Backend",
+   "record": "backend",
+   "cite": "RESULTS.md, 2026-09-14 06:20 addendum to \u00a75",
+   "a": {
+    "run": "2026-09-13 18:42",
+    "keep": 0.4,
+    "rank": "maxmin",
+    "source": "saliency",
+    "topics": [
+     "config",
+     "english",
+     "go",
+     "java",
+     "python",
+     "reasoning",
+     "reasoning_code",
+     "sql",
+     "technical"
+    ],
+    "runs": 10,
+    "strict": 5,
+    "finished": null,
+    "strict_rate": 0.5,
+    "cov_sal_worst": 0.9545200586918087,
+    "cov_sal_mean": 0.9605556528402204,
+    "cov_picks_worst": 0.6479866798456182,
+    "nonres_worst": 2.112079920926291,
+    "nonres_mean": 1.705254192570227,
+    "all6_worst": 0.08351619278401859,
+    "all6_mean": 0.14669541930114882,
+    "worst_layer": 0.517756908462867
+   },
+   "b": {
+    "run": "2026-09-14 03:36",
+    "keep": 0.36,
+    "rank": "maxmin",
+    "source": "saliency",
+    "topics": [
+     "config",
+     "english",
+     "go",
+     "java",
+     "python",
+     "reasoning",
+     "reasoning_code",
+     "sql",
+     "technical"
+    ],
+    "runs": 10,
+    "strict": 3,
+    "finished": 10,
+    "strict_rate": 0.3,
+    "cov_sal_worst": 0.9460245310501196,
+    "cov_sal_mean": 0.953498100270505,
+    "cov_picks_worst": 0.5990021651134332,
+    "nonres_worst": 2.405987009319401,
+    "nonres_mean": 1.9479487344525142,
+    "all6_worst": 0.05441329939762549,
+    "all6_mean": 0.10637946159128414,
+    "worst_layer": 0.46785277228654804
+   },
+   "delta": {
+    "cov_sal_worst": -0.008495527641689038,
+    "cov_sal_mean": -0.0070575525697154085,
+    "cov_picks_worst": -0.048984514732185014,
+    "nonres_worst": 0.2939070883931101,
+    "nonres_mean": 0.24269454188228723,
+    "all6_worst": -0.029102893386393096,
+    "all6_mean": -0.04031595770986468,
+    "worst_layer": -0.049904136176319,
+    "strict_rate": -0.2
+   }
+  },
+  {
+   "profile": "Data and research",
+   "record": "data_and_research",
+   "cite": "RESULTS.md, 2026-09-14 06:20 addendum to \u00a75",
+   "a": {
+    "run": "2026-09-13 20:26",
+    "keep": 0.4,
+    "rank": "maxmin",
+    "source": "saliency",
+    "topics": [
+     "academic",
+     "config",
+     "english",
+     "latex",
+     "python",
+     "reasoning",
+     "reasoning_code",
+     "rlang",
+     "sql",
+     "technical"
+    ],
+    "runs": 11,
+    "strict": 5,
+    "finished": null,
+    "strict_rate": 0.45454545454545453,
+    "cov_sal_worst": 0.9528315717453325,
+    "cov_sal_mean": 0.9575823158100898,
+    "cov_picks_worst": 0.6455662242304434,
+    "nonres_worst": 2.1266026546173395,
+    "nonres_mean": 1.714753275527427,
+    "all6_worst": 0.08221402161609173,
+    "all6_mean": 0.14379929693686053,
+    "worst_layer": 0.5253150803998262
+   },
+   "b": {
+    "run": "2026-09-14 03:56",
+    "keep": 0.36,
+    "rank": "maxmin",
+    "source": "saliency",
+    "topics": [
+     "academic",
+     "config",
+     "english",
+     "latex",
+     "python",
+     "reasoning",
+     "reasoning_code",
+     "rlang",
+     "sql",
+     "technical"
+    ],
+    "runs": 11,
+    "strict": 8,
+    "finished": 10,
+    "strict_rate": 0.7272727272727273,
+    "cov_sal_worst": 0.9448578885583938,
+    "cov_sal_mean": 0.9499656126888837,
+    "cov_picks_worst": 0.5946731149392828,
+    "nonres_worst": 2.4319613103643034,
+    "nonres_mean": 1.9563589173906695,
+    "all6_worst": 0.05258498750386685,
+    "all6_mean": 0.1041823468703091,
+    "worst_layer": 0.4630048009036995
+   },
+   "delta": {
+    "cov_sal_worst": -0.007973683186938696,
+    "cov_sal_mean": -0.007616703121206103,
+    "cov_picks_worst": -0.05089310929116064,
+    "nonres_worst": 0.30535865574696386,
+    "nonres_mean": 0.2416056418632424,
+    "all6_worst": -0.02962903411222488,
+    "all6_mean": -0.03961695006655143,
+    "worst_layer": -0.06231027949612672,
+    "strict_rate": 0.27272727272727276
+   }
+  }
+ ],
+ "spearman": {
+  "cov_sal_worst": {
+   "strict_rate": {
+    "rho": 0.35258521533443743,
+    "p": 0.3193340332983351
+   },
+   "finished_rate": {
+    "rho": 0.9999999999999998,
+    "p": 0.08149592520373981
+   },
+   "hard_misses": {
+    "rho": -0.9486832980505138,
+    "p": 0.16449177541122945
+   }
+  },
+  "cov_sal_mean": {
+   "strict_rate": {
+    "rho": 0.36474332620803873,
+    "p": 0.30408479576021197
+   },
+   "finished_rate": {
+    "rho": 0.3999999999999999,
+    "p": 0.7475626218689065
+   },
+   "hard_misses": {
+    "rho": -0.6324555320336759,
+    "p": 0.495775211239438
+   }
+  },
+  "cov_picks_worst": {
+   "strict_rate": {
+    "rho": 0.3039527718400323,
+    "p": 0.3974801259937003
+   },
+   "finished_rate": {
+    "rho": 0.7999999999999998,
+    "p": 0.32573371331433426
+   },
+   "hard_misses": {
+    "rho": -0.9486832980505138,
+    "p": 0.16449177541122945
+   }
+  },
+  "nonres_worst": {
+   "strict_rate": {
+    "rho": -0.3039527718400323,
+    "p": 0.3974801259937003
+   },
+   "finished_rate": {
+    "rho": -0.7999999999999998,
+    "p": 0.32573371331433426
+   },
+   "hard_misses": {
+    "rho": 0.9486832980505138,
+    "p": 0.16449177541122945
+   }
+  },
+  "nonres_mean": {
+   "strict_rate": {
+    "rho": -0.3282689935872349,
+    "p": 0.3566821658917054
+   },
+   "finished_rate": {
+    "rho": -0.9999999999999998,
+    "p": 0.08149592520373981
+   },
+   "hard_misses": {
+    "rho": 0.9486832980505138,
+    "p": 0.16449177541122945
+   }
+  },
+  "all6_worst": {
+   "strict_rate": {
+    "rho": 0.3100318272768329,
+    "p": 0.3865306734663267
+   },
+   "finished_rate": {
+    "rho": 0.0,
+    "p": 1.0
+   },
+   "hard_misses": {
+    "rho": -0.31622776601683794,
+    "p": 1.0
+   }
+  },
+  "all6_mean": {
+   "strict_rate": {
+    "rho": 0.3282689935872349,
+    "p": 0.3566821658917054
+   },
+   "finished_rate": {
+    "rho": 0.9999999999999998,
+    "p": 0.08149592520373981
+   },
+   "hard_misses": {
+    "rho": -0.9486832980505138,
+    "p": 0.16449177541122945
+   }
+  },
+  "worst_layer": {
+   "strict_rate": {
+    "rho": 0.4376919914496465,
+    "p": 0.20983950802459878
+   },
+   "finished_rate": {
+    "rho": 0.9999999999999998,
+    "p": 0.08149592520373981
+   },
+   "hard_misses": {
+    "rho": -0.9486832980505138,
+    "p": 0.16449177541122945
+   }
+  },
+  "_spread": {
+   "cov_sal_worst": 1.0308321985430473,
+   "cov_sal_mean": 1.024329057163853,
+   "cov_picks_worst": 1.223110617407527,
+   "nonres_worst": 1.4410322819350654,
+   "nonres_mean": 1.4130087041897597,
+   "all6_worst": 2.5798425959601072,
+   "all6_mean": 2.184749238833546,
+   "worst_layer": 1.5696449137884354
+  },
+  "_n": {
+   "strict_rate": 10,
+   "finished_rate": 4,
+   "hard_misses": 4
+  }
+ }
+}

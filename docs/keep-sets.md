@@ -325,3 +325,144 @@ coverage screen; only a gate says. The topic ships in World and not in European.
 Correction, later the same day: "most of them in layers 36–39" overstates it. Recomputed from the
 shipped file, those four layers hold 98 of the 513 swapped experts — the most per layer, not a
 majority. The 513 and the 3-to-28-a-layer range stand.
+
+## What predicts the gate (2026-09-14)
+
+The section above ends on "only a gate says", and that is an uncomfortable place to leave a tool
+whose whole job is to answer the question without running one. So the coverage bar was measured
+against the gate records, and so were four alternatives to it. `tools/tail_metric.py` is the
+runner; `results/keepsets/tail_metric.json` is its output, with the `GATE.md` record each row came
+from; `TopicIndex.tail_curves` in `tools/budget.py` computes the new numbers.
+
+### The candidates
+
+Coverage asks how much of a topic's *measured routing mass* stayed resident. What
+`DSV41_PRUNE_MODE=substitute` actually does to a generation is narrower: it masks the router to
+the resident experts and takes the top-6 of what is left, so a token whose six picks **in one
+layer** are not all resident is computed with experts it did not ask for, at full renormalised
+weight. That is a property of a token's tail, not of a corpus's mean, and four numbers get closer
+to it:
+
+| number | what it is | exact? |
+|---|---|---|
+| `cov (pick)` | the same keep-set measured on `counts_<topic>` instead of the family that ranked it | exact |
+| `nonres` | expected non-resident picks per token per layer, 0 to 6 | exact |
+| `all6` | the rate at which all six picks of a token-layer are resident | estimated |
+| `worst layer` | the worst single layer's resident pick fraction | exact |
+
+`nonres` is exact and needs no assumption at all, because `counts_<topic>` **is** the histogram of
+picks and every token contributes exactly six of them per layer: the mean of a per-token count is
+the missed mass times six. It follows that `nonres = 6 x (1 - cov(pick))` identically — the mean is
+not new information, it is coverage in the units a token pays. The new information is `all6`, and
+that one cannot be read off a histogram, because it needs the joint distribution of the six picks.
+It is estimated as `mean_L r_L^6`, i.e. as though the six were independent draws. They are not —
+experts co-fire — so the estimate is always **low**. Measured against the per-token `indices`
+arrays of `results/trace-full-20260910` over twelve (topic, selection, keep) points from 0.20 to
+0.40: 6 % to 75 % low, worst on a topic the keep-set was not spent on, rank correlation with the
+truth 0.96. Read it as a ranking statistic, not as a rate. `tools/test_tail_metric.py` holds both
+of those numbers.
+
+One reading that sounds right and is not: *the fraction of tokens whose routing is clean*. Over
+forty layers that is a product of forty terms, and on the real trace it is zero to five decimal
+places at every keep fraction this repository has ever served at — 0.20, 0.36 and 0.40 alike.
+Essentially every token is substituted somewhere. The quantity with any resolution is the
+token-**layer**, which is what `all6` counts.
+
+**What is shipped and what is not.** Only the histograms ship. `results/keepsets/topics/
+coverage.json` carries `counts_<topic>` and `saliency_<topic>` for 39 topics and no per-token
+arrays; the trace they were made from is not in the checkout. The one per-token trace that is —
+`results/trace-full-20260910`, 40 layers, 10,760 tokens, two categories, taken before the saliency
+tracer — is what calibrates the estimate above and nothing else.
+
+### The ten shipped profiles, each at the keep its gate was run at
+
+| profile | keep | strict | finished | hard | cov (rank) | cov (pick) | nonres | all6 | worst layer |
+|---|---|---|---|---|---|---|---|---|---|
+| Frontend | 0.36 | 7/10 | 9/10 | 1 | 0.9402 | 0.5976 | 2.414 | 0.0565 | 0.4551 |
+| Backend | 0.36 | 3/10 | 10/10 | 0 | 0.9460 | 0.5990 | 2.406 | 0.0544 | 0.4679 |
+| Systems programming | 0.40 | 6/11 | — | — | 0.9485 | 0.6398 | 2.161 | 0.0788 | 0.5023 |
+| Chat and explanation | 0.40 | 6/8 | — | — | 0.9645 | 0.7058 | 1.765 | 0.1342 | 0.6059 |
+| Medicine | 0.40 | 6/7 | — | — | 0.9641 | 0.7014 | 1.792 | 0.1289 | 0.6018 |
+| Law and finance | 0.40 | 5/7 | — | — | 0.9649 | 0.7061 | 1.763 | 0.1342 | 0.6016 |
+| Data and research | 0.36 | 8/11 | 10/11 | 1 | 0.9449 | 0.5947 | 2.432 | 0.0526 | 0.4630 |
+| European languages | 0.40 | 6/10 | — | — | 0.9610 | 0.6894 | 1.864 | 0.1180 | 0.5865 |
+| World languages | 0.36 | 6/10 | 7/10 | 3 | 0.9360 | 0.5784 | 2.530 | 0.0527 | 0.3860 |
+| Writing | 0.40 | 5/8 | — | — | 0.9648 | 0.7074 | 1.756 | 0.1357 | 0.6040 |
+
+Every column is the profile's **worst** topic: a request spans the whole bundle and comes apart at
+whichever topic the keep-set serves least. `hard` is runs − finished, the misses that are not a
+redraft; only the four cards written on 2026-09-14 carry the second verdict sentence, so the other
+six have no such count.
+
+### Against the gate
+
+Spearman, with a p from a seeded permutation test — not a table, because n is ten and the
+asymptotic approximation is poor there. `max/min` is the ratio of the largest to the smallest value
+across the ten keep-sets: what the number can show a reader at all, before the question of whether
+it predicts anything.
+
+| predictor | want | max/min | vs strict (n=10) | vs finished (n=4) | vs hard misses (n=4) |
+|---|---|---|---|---|---|
+| coverage, ranking family, worst topic | + | 1.03x | 0.353 (p=0.32) | 1.000 (p=0.08) | −0.949 (p=0.16) |
+| coverage, ranking family, mean | + | 1.02x | 0.365 (p=0.30) | 0.400 (p=0.75) | −0.632 (p=0.50) |
+| coverage in picks, worst topic | + | 1.22x | 0.304 (p=0.40) | 0.800 (p=0.33) | −0.949 (p=0.16) |
+| non-resident picks, worst topic | − | 1.44x | −0.304 (p=0.40) | −0.800 (p=0.33) | 0.949 (p=0.16) |
+| non-resident picks, mean | − | 1.41x | −0.328 (p=0.36) | −1.000 (p=0.08) | 0.949 (p=0.16) |
+| all-six-resident rate, worst topic | + | 2.58x | 0.310 (p=0.39) | 0.000 (p=1.00) | −0.316 (p=1.00) |
+| all-six-resident rate, mean | + | 2.18x | 0.328 (p=0.36) | 1.000 (p=0.08) | −0.949 (p=0.16) |
+| **worst layer's resident pick fraction** | + | 1.57x | **0.438 (p=0.21)** | 1.000 (p=0.08) | −0.949 (p=0.16) |
+
+### The verdict
+
+**Nothing computable from a `coverage.json` predicts the gate at significance, the shipped bar
+included.** Worst-layer resident pick fraction is the best of the eight against strict passes
+(rho 0.438) and the shipped coverage bar the third (0.353), but at n = 10 the 0.05 threshold is
+around |rho| = 0.65 and no candidate is close. The last two columns look decisive and are not:
+they are four points, where a perfect rank correlation still only reaches p = 0.08.
+
+Two things make the cross-profile comparison weaker than its n suggests, and both are worth stating
+rather than correcting away:
+
+* **Every profile is a different exam.** Medicine's 6 of 7 and Backend's 3 of 10 are different
+  prompts, checked by different structural rules. Ranking ten profiles by pass rate ranks the
+  suites as much as the keep-sets.
+* **The gate is ten Bernoulli trials.** At 10 runs and a pass rate near 0.6 the standard error is
+  about 1.5 runs, so a three-run swing is barely two sigma. The gate cannot resolve what these
+  predictors differ by.
+
+The measurement that removes the first confound is the same profile gated twice on the same prompts
+with only the keep-set changed. Four exist, and they are the runs that discredited the coverage bar
+in the first place:
+
+| profile | keep | strict | Δ cov (rank) | Δ cov (pick) | Δ nonres | Δ all6 | Δ worst layer |
+|---|---|---|---|---|---|---|---|
+| European languages | 0.40 → 0.36, +`reasoning_lang` | 6/10 → 3/10 | −0.0174 | −0.0778 | +0.467 | −0.0509 | −0.1432 |
+| World languages | 0.40 → 0.36, +`reasoning_lang` | 3/10 → 6/10 | −0.0155 | −0.0591 | +0.355 | −0.0305 | −0.0896 |
+| Backend | 0.40 → 0.36 | 5/10 → 3/10 | −0.0085 | −0.0490 | +0.294 | −0.0291 | −0.0499 |
+| Data and research | 0.40 → 0.36 | 5/11 → 8/11 | −0.0080 | −0.0509 | +0.305 | −0.0296 | −0.0623 |
+
+Every predictor says "worse" in all four, because every swap is a drop in the keep fraction and
+every one of these numbers is monotone in it. The gate went two ways. **2 of 4 for all eight
+candidates, the tail metric included** — and the same holds one level down, per prompt: in the two
+language swaps, every topic's tail number falls, while `en-explain`, `ru-essay` and `zh-essay` flip
+to PASS and `en-explain`, `pt-essay` and `xl-en-fr` flip to FAIL. No scalar on this file separates
+the two directions.
+
+So: **the tail metric is a better instrument and not yet a better predictor.** What it demonstrably
+buys is resolution. The coverage bar puts the ten shipped keep-sets inside 1.03x of each other —
+0.936 to 0.965, a band narrower than the 0.005 a 513-expert swap moves it by, which is why that
+swap was invisible. `all6` puts the same ten across 2.58x, and moves by 0.03 to 0.05 on the swaps
+above, six to ten times the bar's own movement. A number that can show a change happened is worth
+having even before it can say which way the change will go.
+
+What it does not buy is permission to skip the gate. Read the tail alongside the bar, and keep
+reading `GATE.md`.
+
+Reproduce, or re-run after a fresh gate:
+
+```bash
+python3 tools/tail_metric.py                                       # the tables above
+python3 tools/tail_metric.py --profile frontend                    # one profile
+python3 tools/tail_metric.py --json results/keepsets/tail_metric.json
+python3 tools/test_tail_metric.py                                  # incl. the exact-vs-estimate check
+```

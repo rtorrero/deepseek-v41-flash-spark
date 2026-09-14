@@ -62,6 +62,28 @@ bundle became Frontend plus Systems programming, the languages bundle became Eur
 plus World languages, and Everything is no longer offered — the topic screen still lets you select
 all 37 by hand and shows what that costs. Those three records are kept as the reason.
 
+## What is in this directory besides the keep-sets
+
+| file | what it is |
+|---|---|
+| `<profile>/coverage.json` | the per-layer expert histograms a keep-set is ranked from (`tools/expert_stats.py`) |
+| `<profile>/GATE.md` | every generation-gate run on that profile, newest last (`tools/gate_profile.py`) |
+| `gates.json` | which run is each profile's current record, and the keep fraction and ranking pair it was measured at — the one thing a card written before 2026-09-14 does not carry |
+| `tail_metric.json` | the coverage bar and four tail alternatives to it, scored against those records (`tools/tail_metric.py`) |
+
+`tail_metric.json` exists because the coverage bar stopped resolving anything once the box was
+served on `saliency`: the ten shipped profiles read 0.936 to 0.965 while their gates run from 3 of
+10 to 8 of 11, and a keep-set swap of 513 resident experts moved every bar by 0.005 and flipped a
+gate. The file records, per profile and citing the `GATE.md` record each number came from, what the
+same keep-set costs a **token** — how many of its six picks in a layer are not resident, and how
+often all six are. Those span 2.6x across the same ten profiles where the bar spans 1.03x.
+
+It is an instrument, not an oracle: on the evidence in this directory no number computable from a
+`coverage.json` predicts the gate at significance, the bar included. The workings and the verdict
+are in [`docs/keep-sets.md`](../../docs/keep-sets.md#what-predicts-the-gate-2026-09-14). Regenerate
+with `python3 tools/tail_metric.py --json results/keepsets/tail_metric.json` after any fresh gate
+run.
+
 ## The keep-set files
 
 | keep-set | trace corpus | gated | topics inside it | intended for |
