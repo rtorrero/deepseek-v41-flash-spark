@@ -569,3 +569,52 @@ python3 tools/tail_metric.py --profile frontend                    # one profile
 python3 tools/tail_metric.py --json results/keepsets/tail_metric.json
 python3 tools/test_tail_metric.py                                  # incl. the exact-vs-estimate check
 ```
+
+## Top-1 and co-routing (2026-09-14)
+
+Two more summaries come out of the same trace, and neither costs a re-trace of the model.
+`tools/expert_trace.py` has always stored, per token per layer, the six experts the router took
+(`indices`) and the gate weights it took them with (`weights`); `tools/expert_stats.py` folded
+those into `counts_<topic>` and `saliency_<topic>` and threw the rest away. It now also writes:
+
+* **`top1_<topic>`** — a 384-wide histogram of the expert that carried the **largest gate weight**
+  on each token. `counts` asks how often an expert was taken; this asks how often it *led*. Its
+  row sums to the topic's tokens, where a `counts` row sums to tokens × 6.
+
+  First pick means the largest weight, not the first column of `indices`. The router selects on
+  `softplus(scores).sqrt() + gate_bias` and weights on the same scores *without* the bias
+  (`tools/v41_ref.py router`), so the six are stored in selection order and are not sorted by
+  weight: on the reference trace only **44 %** of tokens have their six weights descending, and
+  the selection's first pick is the largest weight on **95.2 %** of them. The two definitions
+  disagree on one token in twenty, and the weight is the one that says how much of the token
+  actually went through that expert.
+
+* **`pairs_<topic>`** — the co-routing table: of the C(6, 2) = 15 unordered pairs each token
+  forms, which pairs recur. Per layer per topic it keeps `[a, b, count, lift]` for the top 32
+  pairs by count and the top 32 by lift, where
+
+      lift(a, b) = count(a, b) / (count(a) · count(b) / tokens)
+
+  is the observed pair count against the count two independently routed experts of the same
+  marginal frequencies would produce. A pair seen fewer than `--pair-min-count` (5) times is not
+  eligible for the lift half: a pair seen twice can carry an enormous lift and says nothing.
+
+Where they go: `top1_<topic>` sits in `coverage.json` beside the other two families (+1.3 MB on
+13 MB at 39 topics). The pair tables do not — nothing in the engine reads them, and `coverage.json`
+is parsed on every start — so `--pairs sibling` (the default) writes them to `pairs.json` next to
+it, ~2 MB. `--pairs inline` puts them in `coverage.json` anyway, `--pairs off` computes neither.
+
+How they reach the atlas: `tools/atlas_export.py` sums `top1_<topic>` over the tagged topics and
+normalises each layer to 1, which is the page's `top1_share` matrix — a fourth colour view on the
+expert grid beside REAP, route share and contribution — and takes the layer's Gini of it as
+`dynamics.all[].top1_gini`. It merges the per-topic pair tables into `coroute`, the per-layer
+`{count: [[a, b, n, frac] × 16], lift: [[a, b, n, lift] × 16], min_count}` the co-routing ring and
+the expert dossier read, recomputing every lift from the summed pair counts and the exact global
+routing counts. Both fields are optional: a `coverage.json` from a trace reduced before this
+existed gets neither written, which is what the export did until now.
+
+```bash
+python3 tools/expert_stats.py --trace results/trace-X --out results/keepsets/X   # both, by default
+python3 tools/test_trace_extras.py    # the histograms, the pair counts and the lift, brute-forced
+tools/trace_extras.sh                 # re-reduce every trace on the box and re-take the export
+```

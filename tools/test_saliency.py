@@ -173,6 +173,17 @@ check("  the per-topic histogram is the aggregation above",
 check("  and the mixed one is the topics added up",
       np.allclose(np.asarray(L0["saliency"]),
                   sum(np.asarray(L0[f"saliency_{t}"]) for t in TOPIC_SPEC), rtol=1e-6, atol=1e-9))
+# The top-1 and co-routing summaries were added to the same tool later (2026-09-14) and are
+# checked in full by tools/test_trace_extras.py. What belongs here is that they arrived
+# BESIDE these histograms rather than instead of them, and that they are the same trace:
+# every family has to divide back to the same tokens or they are not one measurement.
+check("  the top1_<topic> histograms sit beside them, on the same tokens",
+      all(sum(L0[f"top1_{t}"]) == TOPIC_SPEC[t][1] for t in TOPIC_SPEC)
+      and all(sum(L0[f"counts_{t}"]) == TOPIC_SPEC[t][1] * TOPK for t in TOPIC_SPEC),
+      ", ".join(f"{t}:{sum(L0[f'top1_{t}'])}/{TOPIC_SPEC[t][1]}" for t in TOPIC_SPEC))
+check("  and the co-routing tables go beside the file, not into it",
+      os.path.exists(os.path.join(TMP, "stats", "pairs.json"))
+      and not any(k.startswith("pairs") for k in L0))
 
 # --- an old trace still processes -------------------------------------------
 old = subprocess.run([sys.executable, os.path.join(HERE, "expert_stats.py"),

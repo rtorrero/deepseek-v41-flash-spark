@@ -6,6 +6,12 @@ that decide the expert strategy (Phase 1):
   * per-layer expert usage histogram (share of routed slots per expert)
   * per-layer expert SALIENCY histogram: how much magnitude each expert contributed, not how
     often it was picked (`saliency_<topic>` next to `counts_<topic>`; see `saliency_hist`)
+  * per-layer TOP-1 histogram: of the six experts a token takes, which one carried the largest
+    gate weight (`top1_<topic>`; see `top1_hist`). `counts` asks how often an expert was taken,
+    `top1` how often it led -- the Weight Atlas draws the second as `top1_share`
+  * per-layer CO-ROUTING table: which two experts a token tends to take together, the top pairs
+    by count and by lift among the C(topk, 2) pairs of each token (`pairs_<topic>`; see
+    `pair_table`). Written to a sibling `pairs.json` by default -- see `--pairs`
   * per-layer and global cumulative coverage curves: fraction of routed slots covered by
     the top-N% (or top-K) experts; global = best allocation across layers, i.e. experts
     ranked by frequency over all layers
@@ -16,7 +22,8 @@ that decide the expert strategy (Phase 1):
     (FP4, 18.8 MB each), hit rate per token and per 6-token block, split by category
   * memory projection for strategies A (hot cache + stream) and C (hot FP4 + cold low-bit)
 
-Writes results/<name>/{coverage.md, coverage.json, coverage.png, layer_hist.png}.
+Writes results/<name>/{coverage.md, coverage.json, coverage.png, layer_hist.png}, and
+results/<name>/pairs.json unless `--pairs` says otherwise.
 """
 
 from __future__ import annotations
@@ -84,6 +91,69 @@ def saliency_hist(idx: np.ndarray, sal: np.ndarray) -> np.ndarray:
     return np.bincount(idx.reshape(-1), weights=sal.reshape(-1), minlength=N_EXP)
 
 
+def top1_hist(idx: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """How often each expert was the token's FIRST pick, as a 384-wide histogram.
+
+    The tracer stores `indices` in the router's own selection order -- `(scores +
+    gate_bias).topk(k)` in tools/v41_ref.py -- and `weights` as the renormalised gate weights of
+    those same picks, gathered in that order. The two orders are NOT the same: the selection bias
+    steers which six experts are taken without entering the weight that multiplies their output,
+    so on the reference trace only 44 % of tokens have their six weights in descending order,
+    and column 0 is the largest weight on 95.2 % of them. First pick therefore means
+    `weights.argmax(1)` -- the expert that carried the most of this token through the layer --
+    and not column 0, which is first only in the selection.
+
+    Ties break to the lower column, i.e. to the router's own order, which is the sensible
+    tiebreak: the weights are stored as fp16 and equal neighbours do happen.
+
+    Rows of this histogram sum to the number of tokens, where `counts` sums to tokens x topk.
+    """
+    n = idx.shape[0]
+    if n == 0:
+        return np.zeros(N_EXP, dtype=np.int64)
+    return np.bincount(idx[np.arange(n), w.argmax(1)], minlength=N_EXP)
+
+
+def pair_table(idx: np.ndarray, top: int = 32, min_count: int = 5) -> list:
+    """Which experts this layer takes TOGETHER: `[[a, b, count, lift], ...]`, a < b.
+
+    Every token contributes the C(topk, 2) = 15 unordered pairs of its picks. `count` is how
+    many tokens took both; `lift` is that count against the count two independently routed
+    experts of the same marginal frequencies would produce:
+
+        lift(a, b) = count(a, b) / (count(a) * count(b) / tokens)
+
+    which is exactly the definition the Weight Atlas prints under its co-routing ring. An expert
+    is picked at most once per token, so `count(a)` is its routing count and needs no separate
+    pass.
+
+    The table is the union of the `top` pairs by count and the `top` pairs by lift, so both of
+    the page's two views are served from one list; pairs seen fewer than `min_count` times are
+    not eligible for the lift half, because a pair seen twice can carry an enormous lift and
+    says nothing. Entries are ordered by count, descending.
+
+    Truncation is the point: the full table is C(384, 2) = 73,536 rows per layer per topic and
+    almost all of it is noise at a few thousand tokens a topic. What is kept is ~64 rows.
+    """
+    n, k = idx.shape
+    if n == 0 or k < 2:
+        return []
+    ii, jj = np.triu_indices(k, 1)
+    a, b = idx[:, ii], idx[:, jj]
+    key = (np.minimum(a, b) * N_EXP + np.maximum(a, b)).reshape(-1)
+    uk, cnt = np.unique(key, return_counts=True)
+    ea, eb = uk // N_EXP, uk % N_EXP
+    marg = np.bincount(idx.reshape(-1), minlength=N_EXP).astype(np.float64)
+    expected = marg[ea] * marg[eb] / n
+    lift = np.where(expected > 0, cnt / np.maximum(expected, 1e-12), 0.0)
+    keep = set(np.argsort(-cnt)[:top].tolist())
+    eligible = np.nonzero(cnt >= min_count)[0]
+    if eligible.size:
+        keep |= set(eligible[np.argsort(-lift[eligible])[:top]].tolist())
+    order = sorted(keep, key=lambda i: (-int(cnt[i]), int(ea[i]), int(eb[i])))
+    return [[int(ea[i]), int(eb[i]), int(cnt[i]), float(f"{lift[i]:.4g}")] for i in order]
+
+
 def coverage_curve(counts: np.ndarray):
     c = np.sort(counts)[::-1]
     return np.cumsum(c) / max(c.sum(), 1)
@@ -128,6 +198,18 @@ def main():
                     help="also write the per-category coverage curves; they are derived from the "
                          "histograms, nothing reads them back, and at 35 topics they are 7.7 MB "
                          "of a 9.8 MB file")
+    ap.add_argument("--pairs", choices=("sibling", "inline", "off"), default="sibling",
+                    help="where the co-routing tables go. `sibling` (default) writes them to "
+                         "pairs.json next to coverage.json -- at 39 topics they are ~2 MB and "
+                         "only tools/atlas_export.py reads them, where coverage.json is opened "
+                         "by the engine on every start. `inline` puts them in coverage.json "
+                         "under the same `pairs_<topic>` keys; `off` computes none")
+    ap.add_argument("--pairs-top", type=int, default=32, metavar="N",
+                    help="pairs kept per layer per topic: the top N by count and the top N by "
+                         "lift, unioned (default %(default)s)")
+    ap.add_argument("--pair-min-count", type=int, default=5, metavar="N",
+                    help="a pair needs this many co-occurrences before its lift is ranked "
+                         "(default %(default)s)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     layers, meta = load(a.trace)
@@ -138,6 +220,8 @@ def main():
     curves = a.cov_curves
 
     per_layer = {}
+    pairs_layer: dict = {}
+    pairs_on = a.pairs != "off"
     glob_counts = {}
     no_norms = [L for L in Ls if "sal" not in layers[L]]
     if no_norms:
@@ -163,9 +247,18 @@ def main():
         if nrm is not None:
             # The mixed histogram, next to `counts`: what the whole corpus's routing contributed.
             per_layer[L]["saliency"] = saliency_hist(idx, nrm)
+        # Who LED, next to who was taken. Needs nothing the tracer did not already store: the
+        # gate weights are in the trace, and the largest of a token's six names its first pick.
+        wgt = layers[L]["w"]
+        per_layer[L]["top1"] = top1_hist(idx, wgt)
+        if pairs_on:
+            pairs_layer[L] = {"pairs": pair_table(idx, a.pairs_top, a.pair_min_count)}
         for c in cats:
             m = layers[L]["cat"] == c
             cat_counts = np.bincount(idx[m].reshape(-1), minlength=N_EXP)
+            per_layer[L][f"top1_{c}"] = top1_hist(idx[m], wgt[m])
+            if pairs_on:
+                pairs_layer[L][f"pairs_{c}"] = pair_table(idx[m], a.pairs_top, a.pair_min_count)
             if nrm is not None:
                 # One per topic, next to counts_<topic> and read the same way: the engine's
                 # DSV41_PRUNE_SOURCE picks which of the two families ranks the keep-set.
@@ -196,6 +289,11 @@ def main():
                 "only -- this trace carries no `out_norms`, so there is no saliency histogram and "
                 "`DSV41_PRUNE_SOURCE=saliency` will refuse this file")
     lines.append(f"Histograms per layer: `counts_<topic>` (routing frequency) {sal_note}.\n")
+    lines.append("Also per layer: `top1_<topic>`, how often each expert carried a token's largest gate "
+                 "weight (rows sum to tokens, where `counts` sums to tokens x top-k)"
+                 + (", and a co-routing table `pairs_<topic>` of `[a, b, count, lift]`"
+                    + (" in `pairs.json` beside this file" if a.pairs == "sibling" else " in `coverage.json`")
+                    if pairs_on else "") + ".\n")
     lines.append("## Per layer\n")
     lines.append("| layer | experts used | top-10% covers | top-25% covers | top-50% covers | entropy (bits, max 8.58) | unique experts / 6-token block (max 36) |")
     lines.append("|---|---|---|---|---|---|---|")
@@ -235,7 +333,21 @@ def main():
         res["per_layer"][L] = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in per_layer[L].items()
                                if k not in ("counts",)}
         res["per_layer"][L]["counts"] = per_layer[L]["counts"].tolist()
+
+    # The co-routing tables. They are the only thing written here that nothing in the engine
+    # reads -- tools/atlas_export.py draws them and that is all -- and at 39 topics they are
+    # ~2 MB against coverage.json's 13 MB, which the engine parses on every start. So they go
+    # beside it by default rather than into it, and the exporter looks in both places.
+    pairs_meta = {"schema": 1, "min_count": a.pair_min_count, "top": a.pairs_top,
+                  "topk": int(layers[Ls[0]]["idx"].shape[1]) if Ls else 0}
+    if pairs_on and a.pairs == "inline":
+        for L in Ls:
+            res["per_layer"][L].update(pairs_layer[L])
+        res["pairs_meta"] = pairs_meta
     json.dump(res, open(os.path.join(a.out, "coverage.json"), "w"))
+    if pairs_on and a.pairs == "sibling":
+        json.dump({**pairs_meta, "per_layer": {str(L): pairs_layer[L] for L in Ls}},
+                  open(os.path.join(a.out, "pairs.json"), "w"))
     open(os.path.join(a.out, "coverage.md"), "w").write("\n".join(lines))
     print("\n".join(lines))
 

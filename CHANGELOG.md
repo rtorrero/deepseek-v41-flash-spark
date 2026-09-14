@@ -183,6 +183,25 @@ derived where they are decided, instead of being copied out of a results file by
   `RESULTS.md`). The profile screen says `thinking off by default` on the gate line, and a profile
   from a file may carry `"thinking": "on"|"off"` too. It is a default for requests that say
   nothing — any request can still ask for the other.
+- **Top-1 and co-routing, out of the trace that was already taken.** The expert atlas had two
+  empty fields — `top1_share` (which expert *led* a token, not merely which six it took) and
+  `coroute` (which experts a token takes together) — because the reduction never wrote them, not
+  because the trace never saw them. `tools/expert_stats.py` now folds both out of arrays
+  `tools/expert_trace.py` has stored since the first run: `top1_<topic>`, a histogram of the
+  expert carrying the largest **gate weight** per token, and `pairs_<topic>`, the top pairs per
+  layer by count and by lift (`count / (count_a × count_b / tokens)`). The tracer is unchanged.
+  First pick is the largest weight and not column 0 of `indices`: the router selects with the
+  aux-loss-free bias and weights without it, so on the reference trace only 44 % of tokens have
+  their six weights in descending order and the two definitions disagree on one token in twenty.
+  `top1_<topic>` goes in `coverage.json` (+1.3 MB on 13 MB at 39 topics); the pair tables go in a
+  sibling `pairs.json` (~2 MB) because the engine parses `coverage.json` on every start and reads
+  neither. `tools/atlas_export.py` maps them to `top1_share`, `dynamics.all[].top1_gini` and
+  `coroute`, and omits all three on a stats file that predates them, as it did before.
+  `tools/trace_extras.sh` re-reduces every trace on the box and re-takes the export, replacing the
+  shipped `coverage.json` only when the new one carries every histogram key the old one had.
+  Checked by `tools/test_trace_extras.py` (brute-forced pair counts and lift, both `--pairs`
+  layouts, and the exporter with and without the two fields) — see
+  [`docs/keep-sets.md`](docs/keep-sets.md) "Top-1 and co-routing".
 
 ### Changed
 - `env.example` ships `PRUNE_KEEP=auto` with `ARENA_GB` **empty**. When the keep fraction is

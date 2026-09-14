@@ -10,8 +10,13 @@ loads. `a` in `./tune.sh` runs it and serves the result on loopback.
 
 Reads, out of the checkout and nothing else:
 
-  results/keepsets/topics/coverage.json   per-layer counts_<topic> / saliency_<topic>
-                                          histograms, 40 layers x 384 routed experts
+  results/keepsets/topics/coverage.json   per-layer counts_<topic> / saliency_<topic> /
+                                          top1_<topic> histograms, 40 layers x 384 routed
+                                          experts
+  results/keepsets/topics/pairs.json      the co-routing tables beside it, when the trace kept
+                                          them (tools/expert_stats.py --pairs); optional, and
+                                          the two fields they fill are simply left out when it
+                                          is not there
   results/keepsets/gates.json             the generation-gate record per shipped profile:
                                           which keep fraction, ranking rule and histogram
                                           family it was actually measured at
@@ -55,6 +60,7 @@ ATLAS_DIR = os.path.join(TOOLS, "atlas")
 OUT_DEFAULT = os.path.join(ATLAS_DIR, "models")
 STATS_DEFAULT = os.path.join(ROOT, "results", "keepsets", "topics", "coverage.json")
 GATES_DEFAULT = os.path.join(ROOT, "results", "keepsets", "gates.json")
+PAIRS_SIBLING = "pairs.json"   # tools/expert_stats.py --pairs sibling, beside the stats file
 TUNE_PY = os.path.join(TOOLS, "tune.py")
 
 SLUG = "deepseek-v4.1-flash"
@@ -77,7 +83,15 @@ def inputs(stats: str = None, gates: str = None) -> list:
     """Everything the export is derived from: the trace, the gate index, and the profile
     list -- `tools/tune.py` is in here because PROFILES is what decides which ten keep-sets
     are drawn at all."""
+    # The co-routing sibling is deliberately NOT in here: tools/expert_stats.py writes
+    # pairs.json and coverage.json in the same run, so the stats file's own mtime already
+    # moves whenever the tables do, and a second entry would only make the check noisier.
     return [stats or STATS_DEFAULT, gates or GATES_DEFAULT, TUNE_PY]
+
+
+def pairs_path(stats: str) -> str:
+    """Where the co-routing tables live when they are not inside the stats file itself."""
+    return os.path.join(os.path.dirname(os.path.abspath(stats)), PAIRS_SIBLING)
 
 
 def is_stale(out: str = None, stats: str = None, gates: str = None, slug: str = SLUG) -> bool:
@@ -137,6 +151,108 @@ def shannon_bits(v) -> float:
             p = x / tot
             h -= p * math.log2(p)
     return h
+
+
+# --- the two summaries the router trace did not used to keep --------------------
+
+def _by_topic(per_layer: dict, prefix: str) -> dict:
+    """`{topic: {layer: row}}` for every `<prefix><topic>` key present in ALL 40 layers.
+
+    A topic that is only there for some layers is dropped rather than half-drawn: the grid is
+    one matrix and a hole in it is not something the page can show."""
+    out: dict = {}
+    for L in range(B.N_LAYERS):
+        for k, v in (per_layer.get(str(L)) or {}).items():
+            if k.startswith(prefix):
+                out.setdefault(k[len(prefix):], {})[L] = v
+    return {t: rows for t, rows in out.items() if len(rows) == B.N_LAYERS}
+
+
+def read_extras(cov_path: str) -> dict:
+    """The `top1_<topic>` histograms and the co-routing tables, if this trace kept them.
+
+    Both arrived after the first traces were taken (2026-09-14) and both are optional: a
+    coverage.json written before then has neither, and the two fields they fill are then left
+    out of the export entirely, which is what the page's patched cards already handle.
+
+    The tables are looked for inside the stats file first (`--pairs inline`) and then in
+    `pairs.json` beside it (`--pairs sibling`, the default -- they are ~2 MB at 39 topics and
+    the engine parses coverage.json on every start).
+    """
+    d = json.load(open(cov_path, encoding="utf-8"))
+    pl = d.get("per_layer") or {}
+    top1 = _by_topic(pl, "top1_")
+    pairs = _by_topic(pl, "pairs_")
+    meta = d.get("pairs_meta") or {}
+    if not pairs:
+        sib = pairs_path(cov_path)
+        if os.path.exists(sib):
+            side = json.load(open(sib, encoding="utf-8"))
+            pairs = _by_topic(side.get("per_layer") or {}, "pairs_")
+            meta = {k: v for k, v in side.items() if k != "per_layer"}
+    return {"top1": top1, "pairs": pairs, "pairs_meta": meta}
+
+
+def build_top1_share(top1_by_topic: dict, topics) -> list:
+    """`top1_share[L][e]`: the share of tokens whose largest gate weight went to expert e.
+
+    Summed over the same tagged topics every other view here is built from, then normalised
+    per layer -- so each row sums to 1, which is what the page's `top1_share` means and what
+    its "uniform = 1/E" reference is drawn against.
+
+    There is no per-domain variant: `reap_domains` is the only sliced matrix the card reads,
+    and a `top1_domains` would be drawn by nothing."""
+    rows = []
+    for L in range(B.N_LAYERS):
+        acc = [0.0] * B.N_EXPERTS
+        for t in topics:
+            r = top1_by_topic[t][L]
+            for e in range(B.N_EXPERTS):
+                acc[e] += float(r[e])
+        tot = sum(acc) or 1.0
+        rows.append([g4(x / tot) for x in acc])
+    return rows
+
+
+def build_coroute(pairs_by_topic: dict, topics, cnt_all: list, min_count: int, keep: int = 16):
+    """The co-routing pair table per layer, in the shape the page's router ring reads:
+    `{count: [[a, b, n, frac] x 16], lift: [[a, b, n, lift] x 16], min_count}`.
+
+    `n` is how many tokens took both experts, `frac` is `n / tokens`, and
+
+        lift(a, b) = n / (count(a) * count(b) / tokens)
+
+    is recomputed HERE, from the summed pair counts and the global routing counts in
+    `cnt_all`, rather than averaged out of the per-topic lifts -- the marginals are exact, so
+    the lift is exact for any pair that reaches this table.
+
+    The one approximation is which pairs reach it. `tools/expert_stats.py` keeps the top ~64
+    pairs per topic per layer, not all C(384, 2) = 73,536 of them, so a pair that is rank 33 in
+    every single topic and would have been in the global top 16 is not in the candidate pool.
+    Keeping the whole table per topic would be 39 x 40 x 73,536 rows to make that impossible.
+    """
+    out = []
+    for L in range(B.N_LAYERS):
+        agg: dict = {}
+        for t in topics:
+            for a, b, n, _lift in pairs_by_topic[t][L]:
+                key = (int(a), int(b))
+                agg[key] = agg.get(key, 0) + int(n)
+        marg = cnt_all[L]
+        tokens = sum(marg) / B.TOPK
+        rows = []
+        for (a, b), n in agg.items():
+            expected = marg[a] * marg[b] / tokens if tokens > 0 else 0.0
+            rows.append((a, b, n, (n / expected) if expected > 0 else 0.0))
+        by_count = sorted(rows, key=lambda r: (-r[2], r[0], r[1]))[:keep]
+        eligible = [r for r in rows if r[2] >= min_count]
+        by_lift = sorted(eligible, key=lambda r: (-r[3], r[0], r[1]))[:keep]
+        out.append({
+            "count": [[a, b, n, round(n / tokens, 5) if tokens else 0.0] for a, b, n, _ in by_count],
+            "lift": [[a, b, n, round(lf, 2)] for a, b, n, lf in by_lift],
+            "min_count": int(min_count),
+        })
+    return out
 
 
 # --- the routing block ------------------------------------------------------
@@ -235,19 +351,50 @@ def build_routing(cov_path: str, profiles, gates):
                              "topics": list(selection), "prune_set_key": key,
                              "domain_key": dkey, "gate_run": rec["run"]})
 
+    # --- top-1 and co-routing, when the stats file carries them -------------
+    # Both are all-or-nothing across the tagged topics: a matrix built from 30 of 39 topic
+    # slices would be normalised against a different token population than `route_share` beside
+    # it, and the page puts the two in adjacent tiles as though they were one measurement.
+    extras = read_extras(cov_path)
+    has_top1 = [t for t in topics if t in extras["top1"]]
+    has_pairs = [t for t in topics if t in extras["pairs"]]
+    top1_all = None
+    top1_share = None
+    if len(has_top1) == len(topics) and topics:
+        top1_all = [[sum(float(extras["top1"][t][L][e]) for t in topics) for e in range(E)]
+                    for L in layers]
+        top1_share = build_top1_share(extras["top1"], topics)
+    elif has_top1:
+        print(f"  top1_share left out: {len(has_top1)} of {len(topics)} topics carry a "
+              f"top1_<topic> histogram (re-run tools/expert_stats.py over every topic's trace)")
+    coroute = None
+    if len(has_pairs) == len(topics) and topics:
+        coroute = build_coroute(extras["pairs"], topics, cnt_all,
+                                int(extras["pairs_meta"].get("min_count", 5)))
+    elif has_pairs:
+        print(f"  coroute left out: {len(has_pairs)} of {len(topics)} topics carry a "
+              f"pairs_<topic> table")
+
     dynamics_all = []
     for L in layers:
         toks = sum(cnt_all[L]) / B.TOPK
         bits = shannon_bits(cnt_all[L])
-        dynamics_all.append({
+        row = {
             "layer": L,
             "tokens": int(round(toks)),
             "effective": g4(2 ** bits),                  # perplexity of the selection histogram
             "entropy": g4(bits / math.log2(E)),          # normalised 0..1
             "selected_gini": g4(gini(cnt_all[L])),
             "saliency_gini": g4(gini(sal_all[L])),
-            # margin / top1 / top1_gini need per-token top-1 data; the trace does not keep it
-        })
+            # margin and mean top-1 weight still need per-token gate weights, which the
+            # histograms in coverage.json do not carry; nothing on the expert-atlas card
+            # reads either of them.
+        }
+        if top1_all is not None:
+            # how unevenly the FIRST picks are spread, against `selected_gini`'s all-six
+            # spread -- the card prints it in the layer-margin tooltip
+            row["top1_gini"] = g4(gini(top1_all[L]))
+        dynamics_all.append(row)
 
     routing = {
         "layers": layers,
@@ -259,9 +406,12 @@ def build_routing(cov_path: str, profiles, gates):
         "contribution": contribution,
         "dynamics": {"all": dynamics_all},
         "prune_sets": prune_sets,
-        # no top1_share, no coroute: the router trace keeps the top-6 pick set and the gate
-        # weights, not which of the six was first, and no pair table was ever written.
     }
+    # Optional, and omitted rather than faked when the trace behind this file predates them.
+    if top1_share is not None:
+        routing["top1_share"] = top1_share
+    if coroute is not None:
+        routing["coroute"] = coroute
     tokens_per_layer = {str(L): dynamics_all[L]["tokens"] for L in layers}
     return routing, profile_meta, topics, tokens_per_layer
 
@@ -301,6 +451,15 @@ def build_insights(cov_path: str, gates_path: str, profiles):
         },
         "profiles": profile_meta,
     }
+    if "top1_share" in routing:
+        meta["source"]["top1"] = ("share of tokens whose largest gate weight went to the expert, "
+                                  "summed over the topic slices and normalised per layer; "
+                                  "tools/expert_stats.py top1_hist")
+    if "coroute" in routing:
+        meta["source"]["coroute"] = ("tokens that took both experts, out of the top pairs "
+                                     "tools/expert_stats.py pair_table keeps per topic; lift = "
+                                     "count / (count_a x count_b / tokens), recomputed here "
+                                     "against the global routing counts")
     return {"schema": 1, "meta": meta, "routing": routing}
 
 
@@ -442,6 +601,9 @@ def main(argv=None) -> int:
     print(f"  domains: {r['topics']} topic slices + {r['prune_sets']} profile fields")
     for k, v in r["payload"]["routing"]["prune_sets"].items():
         print(f"    {k:38s} {len(v[0])} experts/layer")
+    extra = [k for k in ("top1_share", "coroute") if k in r["payload"]["routing"]]
+    print("  top-1 / co-routing: " + (", ".join(extra) if extra else
+          "neither -- this trace kept no top1_<topic> or pairs_<topic>, both fields omitted"))
     print(f"  wrote {os.path.relpath(r['insights'], ROOT)} ({r['bytes'] / 1e6:.1f} MB)")
     print(f"  wrote {os.path.relpath(r['atlas'], ROOT)}")
     print(f"  wrote {os.path.relpath(r['manifest'], ROOT)}")

@@ -60,8 +60,39 @@ try:
     check("no negative route share",
           not any(v < 0 for row in R["route_share"] for v in row))
 
-    # --- every topic in the trace is a slice on the page ---------------------
+    # --- top-1 and co-routing: present in the right shape, or not at all -----
+    # Both are optional. A coverage.json written before tools/expert_stats.py kept them has
+    # neither, and the export must then look exactly as it did -- the page's patched cards
+    # read `R.top1_share` and `R.coroute` behind an optional chain, and a half-filled matrix
+    # would be drawn as though it were measured. The shipped stats file may be either.
     idx = B.TopicIndex(stats, source="saliency")
+    extras = AX.read_extras(stats)
+    want_top1 = len([t for t in idx.topics if t in extras["top1"]]) == len(idx.topics)
+    want_co = len([t for t in idx.topics if t in extras["pairs"]]) == len(idx.topics)
+    check(f"top1_share is {'written' if want_top1 else 'left out'}, matching the trace",
+          ("top1_share" in R) == want_top1)
+    check(f"coroute is {'written' if want_co else 'left out'}, matching the trace",
+          ("coroute" in R) == want_co)
+    if "top1_share" in R:
+        bad = [L for L, row in enumerate(R["top1_share"])
+               if len(row) != E or abs(sum(row) - 1.0) > 2e-3 or any(v < 0 for v in row)]
+        check("  every top1_share row is E wide, non-negative and sums to 1", not bad, str(bad[:3]))
+        check("  and the layer dynamics carry top1_gini",
+              all("top1_gini" in d for d in R["dynamics"]["all"]))
+    else:
+        check("  and nothing claims a top-1 Gini it did not measure",
+              not any("top1_gini" in d for d in R["dynamics"]["all"]))
+    if "coroute" in R:
+        co = R["coroute"]
+        check("  coroute is one entry per layer", len(co) == N, str(len(co)))
+        check("  with at most 16 pairs each way, four numbers a row, and a < b",
+              all(len(c["count"]) <= 16 and len(c["lift"]) <= 16
+                  and all(len(q) == 4 and q[0] < q[1] for q in c["count"] + c["lift"])
+                  for c in co))
+        check("  and no pair below min_count in the lift half",
+              all(q[2] >= c["min_count"] for c in co for q in c["lift"]))
+
+    # --- every topic in the trace is a slice on the page ---------------------
     slices = [d for d in R["domains"] if not d.startswith("profile/")]
     missing = [t for t in idx.topics if t not in R["reap_domains"]]
     check(f"every one of the {len(idx.topics)} topic slices is there", not missing,
