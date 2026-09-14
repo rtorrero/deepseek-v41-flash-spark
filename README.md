@@ -1,5 +1,7 @@
 # DeepSeek-V4.1-Flash on a single NVIDIA DGX Spark
 
+[![tests](https://github.com/0xBakeer/deepseek-v41-flash-spark/actions/workflows/tests.yml/badge.svg)](https://github.com/0xBakeer/deepseek-v41-flash-spark/actions/workflows/tests.yml)
+
 > **Status: v0.5.0 (2026-09-14).** Measured, with the limits stated. Ten profiles have a
 > generation gate with thinking on; at the keep fraction that holds a filled 256k context the
 > code-bearing profiles finish 9 to 10 of 10 prompts, and every number is dated in

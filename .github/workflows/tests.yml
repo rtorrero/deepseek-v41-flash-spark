@@ -1,0 +1,102 @@
+# Run the tests that need nothing but a CPU, on every push and pull request.
+#
+# The suite in this repo is split by what it needs to run. Most of it is plain
+# scripts -- `python3 tools/test_x.py`, exit code is the result, no pytest -- and
+# those check the cost model, the routing maths, the tune screens and the server's
+# request handling. They run anywhere. The rest needs a GB10 with the 510 GB
+# checkpoint on it, and no hosted runner has either, so this workflow runs the
+# first group and says plainly which of the second it left alone.
+#
+# What is excluded, and why:
+#   tools/test_cb3_moe.py, tools/test_fp4_linear.py, tools/test_fp4_moe.py
+#       import torch and dispatch CUDA kernels. Named below so that a new
+#       tools/test_*.py is picked up without anyone editing a list.
+#   engine/test_*.py
+#       all five import torch, most of them load real expert weights.
+#   server/test_server.py
+#       torch-free -- it drives server/app.py against the mock engine -- but it
+#       needs tokenizer.json and encoding/encoding.py out of the checkpoint, and
+#       models/ is gitignored. It is run below when a checkpoint is actually
+#       present (V41_MODEL_DIR), which on a hosted runner it is not.
+#
+# numpy is the one dependency. The tune and budget tools use it when it is there
+# and fall back to plain Python when it is not, but five of the tests import it
+# at module scope, so it is installed rather than left to chance.
+
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install numpy
+        run: python3 -m pip install --disable-pip-version-check --quiet numpy
+
+      # Every script runs even after one fails -- a single red test should not
+      # hide the state of the other sixteen -- and the step exits non-zero at the
+      # end if any of them failed.
+      - name: Run the torch-free tests
+        run: |
+          set -uo pipefail
+
+          NEEDS_TORCH="test_cb3_moe.py test_fp4_linear.py test_fp4_moe.py"
+
+          tests=""
+          for f in tools/test_*.py; do
+            case " $NEEDS_TORCH " in *" $(basename "$f") "*) continue ;; esac
+            tests="$tests $f"
+          done
+          # test_tool_grammar.py self-skips its matcher half when xgrammar is absent.
+          tests="$tests server/test_tool_grammar.py server/test_tool_repair.py"
+
+          skipped=""
+          if [ -f "${V41_MODEL_DIR:-}/tokenizer.json" ]; then
+            tests="$tests server/test_server.py"
+          else
+            skipped="server/test_server.py"
+          fi
+
+          passed=""
+          failed=""
+          for t in $tests; do
+            echo "::group::$t"
+            if python3 "$t"; then
+              passed="$passed $t"
+            else
+              failed="$failed $t"
+              echo "::error file=$t::$t failed"
+            fi
+            echo "::endgroup::"
+          done
+
+          {
+            echo "### Tests"
+            echo
+            for t in $passed;  do echo "- ok &nbsp;&nbsp; \`$t\`"; done
+            for t in $failed;  do echo "- **FAIL** \`$t\`"; done
+            for t in $skipped; do echo "- skipped \`$t\` (no checkpoint on this runner)"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo
+          echo "passed:  $(echo $passed | wc -w)"
+          echo "failed:  $(echo $failed | wc -w)"
+          [ -n "$skipped" ] && echo "skipped: $skipped"
+
+          if [ -n "$failed" ]; then
+            echo "failing:$failed"
+            exit 1
+          fi

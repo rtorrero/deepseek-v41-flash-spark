@@ -102,6 +102,11 @@ so there is no measured long generation and no thinking-mode figure in this repo
 The earlier bring-up figures in `NOTES.md` taken on a 20 GB debug arena (6.9 % of the
 routed experts) are a measurement of that arena, not of the recipe — do not quote them.
 
+## 0.6.0-wip — 2026-09-14
+
+### Added
+- **CI runs the torch-free tests.** `.github/workflows/tests.yml` runs the sixteen `tools/test_*.py` and `server/test_*.py` scripts that need only a CPU on every push and pull request (Python 3.12, numpy); the torch/CUDA tests and `server/test_server.py`, which needs the checkpoint tokenizer, are skipped by name and reported as such.
+
 ## 0.5.0 — 2026-09-14
 
 **Choosing what the box is good at becomes a thing you can see.** About 40 % of the routed experts
