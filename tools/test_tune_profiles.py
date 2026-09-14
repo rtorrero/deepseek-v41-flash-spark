@@ -244,6 +244,7 @@ check("  marked as the user's", "(yours)" in r.stdout, True)
 # here: the record exists, it is the newest full run on exactly those topics,
 # and the numbers parse to what the file says in words.
 import gate_profile as G  # noqa: E402
+import gate_records as GR  # noqa: E402
 
 KEEPSETS = os.path.join(ROOT, "results", "keepsets")
 gates_index = T.read_gates_index()
@@ -264,11 +265,29 @@ for name, _blurb, topics, record, _rank, *_think in T.PROFILES:
     check(f"{name}: and the pair it was ranked with", (g["rank"], g["source"]),
           ("maxmin", "saliency"))
     check(f"{name}: strict is within the run count", 0 <= g["strict"] <= g["runs"], True)
-    # nothing newer in the same file describes the same bundle: a later full run
-    # on these topics would be the record, and this one would be history
+    # nothing newer in the same file could stand in its place: a later run on
+    # these topics that is ALLOWED to be a record would be the record, and this
+    # one would be history. Allowed to be -- gate_records.may_be_record, the one
+    # place both disqualifiers are named -- because a run beside the record is
+    # not history: frontend/ and backend/ each carry the reasoning-span A/B
+    # after their baseline, newer and on exactly these topics.
     later = [x for x in T.read_gate(where)
-             if not x["filtered"] and sorted(x["topics"]) == sorted(topics)]
+             if GR.may_be_record(x) and sorted(x["topics"]) == sorted(topics)]
     check(f"{name}: nothing newer supersedes it", later[-1]["run"], g["run"])
+
+# The rule above has something in the checkout to bite on, and must keep having
+# it: results/keepsets/{frontend,backend}/GATE.md each carry the reasoning-span
+# A/B (tools/verify_think_controls.sh) AFTER the baseline that is the record, on
+# exactly the profile's topics. Newest-run-wins would report the experiment.
+for name, record in (("Frontend", "frontend"), ("Backend", "backend")):
+    topics = dict((p[0], p[2]) for p in T.PROFILES)[name]
+    sections = [x for x in T.read_gate(os.path.join(KEEPSETS, record, T.GATE_BASENAME))
+                if sorted(x["topics"]) == sorted(topics)]
+    check(f"{name}: the newest run on its topics is a control run",
+          bool(sections[-1]["controls"]), True)
+    check(f"{name}:   so it may not be the record", GR.may_be_record(sections[-1]), False)
+    check(f"{name}:   and the record is older than it",
+          T.gate_for(record, topics, gates_index)["run"] < sections[-1]["run"], True)
 
 # the numbers, against what the file says in words
 backend = T.gate_for("backend", dict(zip([p[0] for p in T.PROFILES],

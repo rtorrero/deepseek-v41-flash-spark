@@ -5,8 +5,13 @@ record is the newest FULL run on exactly its topics. Two things disqualify a
 run from being that record:
 
   * `| only |` -- a filtered re-run says the prompts it ran pass and nothing
-    about the ones it did not. That rule lives in the two readers.
-  * a non-default DECODE CONTROL -- this file.
+    about the ones it did not. The readers spot that row; `may_be_record` below
+    weighs it.
+  * a non-default DECODE CONTROL -- this file, `decode_controls`.
+
+`may_be_record` is the whole rule, and every selector asks it rather than
+spelling the disqualifiers out again: a caller holding only half of them agrees
+with the others until the day a GATE.md first carries the half it does not know.
 
 The second one arrived with tools/verify_think_controls.sh (2026-09-14), which
 appends four runs to results/keepsets/{frontend,backend}/GATE.md taken with
@@ -119,3 +124,24 @@ def decode_controls(lines) -> list:
 def default_decode(lines) -> bool:
     """True when this gate section was taken with default decode controls."""
     return not decode_controls(lines)
+
+
+def may_be_record(section: dict) -> bool:
+    """True when a parsed gate section may stand as a profile's record.
+
+    `section` is what the two readers build -- tools/tune.py `read_gate` and
+    tools/tail_metric.py `read_gate` -- carrying `filtered` for the `| only |`
+    re-runs and `controls` for `decode_controls` above. BOTH disqualifiers are
+    named here, in one place, so that a caller cannot hold half the rule.
+
+    It could: the second disqualifier arrived (2026-09-14) while
+    results/keepsets/{frontend,backend}/GATE.md still had no control card in
+    them, so every copy of `not filtered` that had not been taught the new half
+    went on agreeing with the selector by accident. The day
+    tools/verify_think_controls.sh's four runs were committed, the stale copies
+    started calling an experiment the newest record while `gate_for` -- rightly
+    -- did not, and the disagreement surfaced as a test failure rather than as
+    a wrong number on a screen only because a test happened to hold one of
+    them. Adding a third disqualifier later must not need that luck.
+    """
+    return not section.get("filtered") and not section.get("controls")

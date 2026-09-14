@@ -421,7 +421,7 @@ def gate_for(record: str | None, topics, index: dict = None, root: str = None) -
     path = os.path.join(root or ROOT, "results", "keepsets", record, GATE_BASENAME)
     want = sorted(topics)
     runs = [g for g in read_gate(path)
-            if not g["filtered"] and not g["controls"] and sorted(g["topics"]) == want]
+            if GR.may_be_record(g) and sorted(g["topics"]) == want]
     if not runs:
         return None
     g = dict(runs[-1])
