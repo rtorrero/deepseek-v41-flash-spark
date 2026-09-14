@@ -197,11 +197,22 @@ derived where they are decided, instead of being copied out of a results file by
   sibling `pairs.json` (~2 MB) because the engine parses `coverage.json` on every start and reads
   neither. `tools/atlas_export.py` maps them to `top1_share`, `dynamics.all[].top1_gini` and
   `coroute`, and omits all three on a stats file that predates them, as it did before.
-  `tools/trace_extras.sh` re-reduces every trace on the box and re-takes the export, replacing the
-  shipped `coverage.json` only when the new one carries every histogram key the old one had.
+  `tools/expert_stats.py --merge SHIPPED --runs DIR ...` rebuilds a shipped stats file out of
+  fresh reductions, and `tools/trace_extras.sh` drives it over every per-layer trace on the box
+  before re-taking the export. Two things that file makes easy to get wrong are handled where
+  they belong. A shipped topic can be the **union of several traces** — `reasoning_code`'s corpus
+  was collected in two passes, and its shipped histogram is 118,272 routed slots a layer against
+  21,258 for the smaller pass alone — so the trace set per topic is *derived*, by subset-summing
+  the candidate reductions until one reproduces the shipped histogram, never guessed from a
+  directory name. And the rebuilt file replaces nothing unless every `counts_<topic>` and
+  `saliency_<topic>` comes back **element for element identical** to the shipped one; on any
+  mismatch the shipped file is left byte-for-byte alone and the rebuild goes beside it as
+  `coverage.new.json` (exit 5). Key presence was not enough: a merge that dropped a trace carries
+  every key and the wrong numbers in one of them.
   Checked by `tools/test_trace_extras.py` (brute-forced pair counts and lift, both `--pairs`
-  layouts, and the exporter with and without the two fields) — see
-  [`docs/keep-sets.md`](docs/keep-sets.md) "Top-1 and co-routing".
+  layouts, the exporter with and without the two fields, and a two-trace union rebuilt from both
+  shards and refused when given one) — see [`docs/keep-sets.md`](docs/keep-sets.md)
+  "Top-1 and co-routing".
 
 ### Changed
 - `env.example` ships `PRUNE_KEEP=auto` with `ARENA_GB` **empty**. When the keep fraction is

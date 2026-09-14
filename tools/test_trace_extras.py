@@ -144,10 +144,10 @@ try:
           S.pair_table(idx0i[:, :1]) == [] and S.pair_table(idx0i[:0]) == [])
 
     # --- 3. expert_stats writes both, per topic ------------------------------
-    def run_stats(out, *extra):
+    def run_stats(out, *extra, trace=None):
         r = subprocess.run([sys.executable, os.path.join(HERE, "expert_stats.py"),
-                            "--trace", TRACE, "--out", os.path.join(TMP, out), "--budgets", "8",
-                            *extra], capture_output=True, text=True)
+                            "--trace", trace or TRACE, "--out", os.path.join(TMP, out),
+                            "--budgets", "8", *extra], capture_output=True, text=True)
         assert r.returncode == 0, (r.stdout + r.stderr)[-800:]
         return os.path.join(TMP, out)
 
@@ -290,6 +290,101 @@ try:
                                 "dynamics", "prune_sets", "layers", "experts", "domains")))
     # The sibling is not a freshness input of its own: expert_stats writes it in the same run
     # as coverage.json, so the stats file's mtime already moves with it.
+    # --- 7. the merge: a topic can be the SUM of two traces ------------------
+    # The corpus behind one shipped topic was collected in two passes, each traced and reduced
+    # on its own, and the shipped histogram is the two added together. A merge that copies one
+    # of them across instead of summing ships a topic measured on a fraction of its corpus and
+    # looks perfectly well-formed while doing it -- every key present, every array the right
+    # shape. This is that shape in miniature: two trace directories for one topic, one shipped
+    # histogram that is their sum.
+    def shard(root: str, topic: str, seed: int, n_tok: int):
+        """A trace directory whose every token is tagged `topic`."""
+        os.makedirs(os.path.join(root, "trace"), exist_ok=True)
+        rng = np.random.default_rng(seed)
+        for L in range(N_LAYERS):
+            idx = np.stack([rng.permutation(N_USED)[:TOPK] for _ in range(n_tok)]).astype(np.int16)
+            w = rng.uniform(0.05, 0.6, size=(n_tok, TOPK))
+            np.savez_compressed(os.path.join(root, "trace", f"layer{L}.npz"),
+                                indices=idx, weights=w.astype(np.float16),
+                                contrib_norms=(w * rng.uniform(0.5, 3.0, size=w.shape)).astype(np.float32),
+                                category=np.array([topic] * n_tok),
+                                token=np.arange(n_tok, dtype=np.int32),
+                                scores=np.zeros(0, np.float16))
+        json.dump({"n_tokens": n_tok * N_LAYERS, "n_seqs": 1},
+                  open(os.path.join(root, "meta.json"), "w"))
+        return root
+
+    MERGE = os.path.join(TMP, "merge")
+    runs = []
+    for name, seed, n in (("pass_one", 11, 14), ("pass_two", 12, 40)):
+        shard(os.path.join(MERGE, "trace", name), "gamma", seed, n)
+        runs.append(run_stats(os.path.join("merge", "red", name),
+                              trace=os.path.join(MERGE, "trace", name)))
+    red = [json.load(open(os.path.join(r, "coverage.json"))) for r in runs]
+    ship_pl = {}
+    for L in red[0]["per_layer"]:
+        ship_pl[L] = dict(red[0]["per_layer"][L])
+        for fam in ("counts_gamma", "saliency_gamma", "top1_gamma"):
+            ship_pl[L][fam] = [a + b for a, b in zip(red[0]["per_layer"][L][fam],
+                                                     red[1]["per_layer"][L][fam])]
+    SHIPDIR = os.path.join(MERGE, "shipped")
+    os.makedirs(SHIPDIR, exist_ok=True)
+    SHIP = os.path.join(SHIPDIR, "coverage.json")
+    json.dump({"per_layer": ship_pl, "global": []}, open(SHIP, "w"))
+    one, two = (sum(red[i]["per_layer"]["0"]["counts_gamma"]) for i in (0, 1))
+    check("the toy shipped topic really is the sum of two traces, not either of them",
+          sum(ship_pl["0"]["counts_gamma"]) == one + two and one != two,
+          f"{one} + {two}")
+
+    # both shards on hand: the merge must find them and sum them
+    ok_merge = S.merge_reductions(SHIP, runs, log=lambda *_: None)
+    check("merge_reductions rebuilds the union from both traces",
+          not ok_merge["mismatch"] and sorted(ok_merge["chosen"]["gamma"]) ==
+          sorted(os.path.basename(r) for r in runs),
+          f"mismatch={ok_merge['mismatch']} chosen={ok_merge['chosen']}")
+    check("  and the rebuilt counts_gamma is the shipped array, element for element",
+          ok_merge["cov"]["per_layer"]["0"]["counts_gamma"] == ship_pl["0"]["counts_gamma"])
+    check("  saliency too",
+          S.rows_equal({"0": ok_merge["cov"]["per_layer"]["0"]["saliency_gamma"]},
+                       {"0": ship_pl["0"]["saliency_gamma"]}))
+    check("  and top1_gamma, which is summed the same way",
+          ok_merge["cov"]["per_layer"]["0"]["top1_gamma"] == ship_pl["0"]["top1_gamma"])
+    check("  the merged pair table is one table, with the union's own lift",
+          all(len(q) == 4 and q[0] < q[1]
+              for q in ok_merge["pairs"]["per_layer"]["0"]["pairs_gamma"]))
+
+    # one shard only: the guard must catch it, which key presence alone would not
+    half = S.merge_reductions(SHIP, runs[:1], log=lambda *_: None)
+    check("one trace of a two-trace topic is REFUSED, not shipped",
+          "counts_gamma" in half["mismatch"] and "saliency_gamma" in half["mismatch"],
+          str(half["mismatch"]))
+    check("  even though every key is present and the right shape -- which is why the guard "
+          "compares arrays and not key names",
+          all(len(half["cov"]["per_layer"]["0"][f"{f}_gamma"]) == S.N_EXP
+              for f in ("counts", "saliency", "top1")))
+    check("  and the numbers are the giveaway",
+          sum(half["cov"]["per_layer"]["0"]["counts_gamma"]) == one)
+
+    # the whole tool, through its CLI: refusal writes coverage.new.json and touches nothing
+    before = open(SHIP, "rb").read()
+    rc = subprocess.run([sys.executable, os.path.join(HERE, "expert_stats.py"),
+                         "--merge", SHIP, "--runs", runs[0]], capture_output=True, text=True)
+    check("--merge exits 5 on a refusal", rc.returncode == 5, rc.stdout[-300:])
+    check("  leaves the shipped file byte-for-byte alone", open(SHIP, "rb").read() == before)
+    check("  and writes coverage.new.json beside it",
+          os.path.exists(os.path.join(SHIPDIR, "coverage.new.json"))
+          and not os.path.exists(SHIP + ".before-extras"))
+    rc = subprocess.run([sys.executable, os.path.join(HERE, "expert_stats.py"),
+                         "--merge", SHIP, "--runs", *runs], capture_output=True, text=True)
+    check("--merge exits 0 when both traces are there", rc.returncode == 0, rc.stdout[-300:])
+    check("  replaces the file and keeps the old one as .before-extras",
+          os.path.exists(SHIP + ".before-extras")
+          and open(SHIP + ".before-extras", "rb").read() == before)
+    now = json.load(open(SHIP))["per_layer"]["0"]
+    check("  the installed file carries the union and the new summaries",
+          now["counts_gamma"] == ship_pl["0"]["counts_gamma"] and "top1_gamma" in now)
+    check("  and a pairs.json beside it", os.path.exists(os.path.join(SHIPDIR, "pairs.json")))
+
     check("  and the freshness inputs are the three they always were",
           [os.path.basename(x) for x in AX.inputs(os.path.join(TOY, "coverage.json"),
                                                   os.path.join(TOY, "gates.json"))]

@@ -24,6 +24,12 @@ that decide the expert strategy (Phase 1):
 
 Writes results/<name>/{coverage.md, coverage.json, coverage.png, layer_hist.png}, and
 results/<name>/pairs.json unless `--pairs` says otherwise.
+
+`--merge SHIPPED --runs DIR ...` is the other half: it rebuilds an existing stats file out of
+fresh reductions and replaces it only if every `counts_<topic>` and `saliency_<topic>` comes
+back element-for-element identical. A shipped file is a merge of several traces -- and at least
+one topic is the SUM of two of them -- so which traces make up a topic is derived by matching
+the histograms, never assumed from a directory name. See `merge_reductions`.
 """
 
 from __future__ import annotations
@@ -189,10 +195,256 @@ def lru_sim(layers: dict, budget: int, block: int = 6, order: list[int] | None =
     return run(1), run(block)
 
 
+# --- merging several reductions into one stats file -------------------------
+# A shipped coverage.json is not the output of one trace. Topics were traced separately and
+# their histograms copied in, and at least one topic is the UNION of two traces: the
+# `reasoning_code` corpus was collected in two passes (14 records, then 40 more), each traced
+# and reduced on its own, and the shipped `counts_reasoning_code` is the two ADDED TOGETHER --
+# 118,272 routed slots a layer against 21,258 for the smaller pass alone. Any merge that copies
+# one trace's histogram across instead of summing the set silently ships a topic measured on a
+# third of its corpus, and a keep-set ranked on it is wrong without ever looking wrong.
+#
+# So the trace set is not guessed from directory names: for each topic it is DERIVED, by
+# finding which subset of the reductions on hand adds up to the shipped histogram exactly.
+
+TOPIC_FAMILIES = ("counts_", "saliency_", "top1_")
+PAIR_FAMILY = "pairs_"
+
+
+def load_reduction(d: str) -> dict:
+    """One `--out` directory of this tool: coverage.json, and pairs.json beside it if written."""
+    d = os.path.normpath(d)
+    if not os.path.exists(os.path.join(d, "coverage.json")):
+        raise SystemExit(f"not a reduction directory (no coverage.json): {d}")
+    cov = json.load(open(os.path.join(d, "coverage.json")))
+    side = os.path.join(d, "pairs.json")
+    return {"dir": d, "cov": cov,
+            "pairs": json.load(open(side)) if os.path.exists(side) else None}
+
+
+def topic_rows(cov: dict, key: str):
+    """`{layer: row}` for one histogram key, or None unless every layer carries it. A histogram
+    that stops half way down the model is not a histogram this file can use."""
+    pl = cov.get("per_layer") or {}
+    rows = {L: pl[L][key] for L in pl if key in pl[L]}
+    return rows if rows and len(rows) == len(pl) else None
+
+
+def sum_rows(rows_list: list) -> dict:
+    out = {}
+    for rows in rows_list:
+        for L, row in rows.items():
+            if L not in out:
+                out[L] = list(row)
+            else:
+                out[L] = [a + b for a, b in zip(out[L], row)]
+    return out
+
+
+def rows_equal(a: dict, b: dict, rtol: float = 1e-12) -> bool:
+    """Element-by-element equality.
+
+    `counts_*` and `top1_*` are integers and compare exactly. `saliency_*` is a sum of floats,
+    and a sum re-taken in a different association is allowed to differ in its last bits -- but
+    only there: `rtol` is 1e-12, twelve orders of magnitude tighter than the ~5x a missing
+    trace moves a histogram by, so this cannot pass a merge that dropped one."""
+    if set(a) != set(b):
+        return False
+    for L in a:
+        x, y = a[L], b[L]
+        if len(x) != len(y):
+            return False
+        for u, v in zip(x, y):
+            if u != v and abs(u - v) > rtol * max(abs(u), abs(v)):
+                return False
+    return True
+
+
+def choose_traces(target: dict, cands: list, max_cands: int = 14):
+    """Which of `cands` (each a `{layer: row}`) add up to `target`; None when no subset does.
+
+    Totals first -- one number a candidate, so the search over subsets is arithmetic on scalars
+    -- and only the subsets whose total lands on the target are then compared element by
+    element. The smallest such subset wins, so a reduction that happens to be all zeros for a
+    topic does not get counted in.
+    """
+    n = len(cands)
+    if n == 0 or n > max_cands:
+        return None
+    want = sum(sum(r) for r in target.values())
+    totals = [sum(sum(r) for r in rows.values()) for rows in cands]
+    best = None
+    for mask in range(1, 1 << n):
+        picked = [i for i in range(n) if mask >> i & 1]
+        if best is not None and len(picked) >= len(best):
+            continue
+        got = sum(totals[i] for i in picked)
+        if got != want and abs(got - want) > 1e-9 * max(1.0, abs(want)):
+            continue
+        if rows_equal(sum_rows([cands[i] for i in picked]), target):
+            best = picked
+    return best
+
+
+def merge_pair_tables(tables: list, counts_row: list, topk: int = 6,
+                      top: int = 32, min_count: int = 5) -> list:
+    """The co-routing tables of several traces of one topic, added into one.
+
+    Pair counts add the way routing counts do. The lift does not: it is recomputed here from
+    the SUMMED counts and the union's own marginals -- `counts_row` is the merged
+    `counts_<topic>` of this layer, whose total divides back to the union's tokens -- so the
+    lift a merged table reports is the union's lift and not an average of two.
+
+    The truncation each input carries is inherited: a pair that was outside one trace's kept
+    rows contributes nothing from that trace, so a merged count can be low for a pair that is
+    frequent in one pass and marginal in the other. Same class of approximation as the
+    truncation itself, and the alternative is keeping all C(384, 2) = 73,536 rows per topic
+    per layer.
+    """
+    agg: dict = {}
+    for tb in tables:
+        for a, b, n, _lift in tb or []:
+            agg[(int(a), int(b))] = agg.get((int(a), int(b)), 0) + int(n)
+    if not agg:
+        return []
+    tokens = sum(counts_row) / topk
+    rows = []
+    for (a, b), n in agg.items():
+        expected = counts_row[a] * counts_row[b] / tokens if tokens > 0 else 0.0
+        rows.append((a, b, n, (n / expected) if expected > 0 else 0.0))
+    keep = {(a, b) for a, b, _, _ in sorted(rows, key=lambda r: (-r[2], r[0], r[1]))[:top]}
+    eligible = [r for r in rows if r[2] >= min_count]
+    keep |= {(a, b) for a, b, _, _ in sorted(eligible, key=lambda r: (-r[3], r[0], r[1]))[:top]}
+    out = [r for r in rows if (r[0], r[1]) in keep]
+    out.sort(key=lambda r: (-r[2], r[0], r[1]))
+    return [[a, b, n, float(f"{lf:.4g}")] for a, b, n, lf in out]
+
+
+def merge_reductions(shipped_path: str, run_dirs: list, log=print) -> dict:
+    """Rebuild a shipped stats file out of fresh reductions, and say whether it came out the same.
+
+    Returns `{"cov", "pairs", "mismatch", "topics", "chosen"}`. `mismatch` is the list of
+    histogram keys that did NOT come back identical; the caller must refuse to install the
+    result when it is non-empty."""
+    shipped = json.load(open(shipped_path))
+    ship_pl = shipped["per_layer"]
+    topics = sorted({k.split("_", 1)[1] for row in ship_pl.values() for k in row
+                     if k.startswith("counts_")})
+    runs = [load_reduction(d) for d in run_dirs]
+    log(f"  shipped file: {len(topics)} topics, {len(ship_pl)} layers")
+
+    covered = {r["dir"]: len([t for t in topics if topic_rows(r["cov"], "counts_" + t)])
+               for r in runs}
+    for r in runs:
+        log(f"  {os.path.basename(r['dir'])}: carries {covered[r['dir']]} of the shipped topics")
+    runs.sort(key=lambda r: -covered[r["dir"]])
+
+    # The base supplies everything that is not per-topic: the per-layer scalars (`used`, `cov`,
+    # `entropy_bits`, `block6_unique_mean`), the mixed histograms and the `global` budget
+    # ladder. They describe one trace, as they always did -- the largest one.
+    merged = json.loads(json.dumps(runs[0]["cov"]))
+    for row in merged["per_layer"].values():
+        for key in [k for k in row if k.startswith(TOPIC_FAMILIES)]:
+            del row[key]
+    meta = next((r["pairs"] for r in runs if r["pairs"]), None) or {}
+    topk = int(meta.get("topk", 6) or 6)
+    ptop, pmin = int(meta.get("top", 32) or 32), int(meta.get("min_count", 5) or 5)
+    merged_pairs = {"schema": 1, "min_count": pmin, "top": ptop, "topk": topk,
+                    "per_layer": {L: {} for L in merged["per_layer"]}}
+
+    mismatch, chosen = [], {}
+    for t in topics:
+        target = topic_rows(shipped, "counts_" + t)
+        cands = [r for r in runs if topic_rows(r["cov"], "counts_" + t)]
+        pick = choose_traces(target, [topic_rows(r["cov"], "counts_" + t) for r in cands])
+        if pick is None:
+            # Best effort, so the refused .new file still shows what this box does have; the
+            # verification below is what records the failure, once, with the numbers.
+            pick = list(range(len(cands)))
+            chosen[t] = ["<no subset reproduces the shipped histogram>"]
+        else:
+            chosen[t] = [os.path.basename(cands[i]["dir"]) for i in pick]
+        used = [cands[i] for i in pick]
+        if len(used) > 1:
+            log(f"  {t}: the union of {len(used)} traces -- {', '.join(chosen[t])}")
+        for fam in TOPIC_FAMILIES:
+            rows = [topic_rows(r["cov"], fam + t) for r in used]
+            if not rows or any(x is None for x in rows):
+                continue
+            for L, row in sum_rows(rows).items():
+                merged["per_layer"][L][fam + t] = row
+        tables = [(r["pairs"] or {}).get("per_layer", {}) for r in used]
+        for L in merged["per_layer"]:
+            got = [tb.get(L, {}).get(PAIR_FAMILY + t) for tb in tables]
+            got = [g for g in got if g]
+            if got:
+                merged_pairs["per_layer"][L][PAIR_FAMILY + t] = merge_pair_tables(
+                    got, merged["per_layer"][L].get("counts_" + t, []), topk, ptop, pmin)
+
+    # --- the assertion that decides whether this may replace anything -------
+    # Key presence is not enough: a merge that dropped a trace carries every key and the wrong
+    # numbers in one of them. Every counts_<topic> and saliency_<topic> array in the rebuilt
+    # file has to come back element-for-element identical to the shipped one.
+    for t in topics:
+        for fam in ("counts_", "saliency_"):
+            want = topic_rows(shipped, fam + t)
+            if want is None:
+                continue
+            got = topic_rows(merged, fam + t)
+            if got is None:
+                mismatch.append(fam + t + " (absent)")
+            elif not rows_equal(got, want) and fam + t not in mismatch:
+                mismatch.append(fam + t)
+    for fam in ("counts", "saliency"):
+        want, got = topic_rows(shipped, fam), topic_rows(merged, fam)
+        if want and got and not rows_equal(got, want):
+            # scoped to the base trace and read by nothing -- worth saying, not worth refusing
+            log(f"  note: the mixed `{fam}` histogram differs from the shipped one "
+                f"(it describes whichever single trace is the base, and always did)")
+    have_top1 = {k.split("_", 1)[1] for row in merged["per_layer"].values() for k in row
+                 if k.startswith("top1_")}
+    log(f"  rebuilt: {len(have_top1 & set(topics))} of {len(topics)} topics carry top1_<topic>")
+    return {"cov": merged, "pairs": merged_pairs, "mismatch": sorted(set(mismatch)),
+            "topics": topics, "chosen": chosen}
+
+
+def merge_main(a) -> int:
+    """`--merge SHIPPED --runs DIR ...`: rebuild SHIPPED from fresh reductions and install it
+    only if every histogram came back identical."""
+    r = merge_reductions(a.merge, a.runs)
+    stats_dir = os.path.dirname(os.path.abspath(a.merge))
+    if r["mismatch"]:
+        new = os.path.join(stats_dir, "coverage.new.json")
+        json.dump(r["cov"], open(new, "w"))
+        json.dump(r["pairs"], open(os.path.join(stats_dir, "pairs.new.json"), "w"))
+        print(f"  REFUSED: {len(r['mismatch'])} histograms did not come back identical")
+        print("  " + ", ".join(r["mismatch"][:10]) + (" ..." if len(r["mismatch"]) > 10 else ""))
+        print(f"  kept {a.merge} untouched and wrote {new} instead")
+        print("  the usual cause is a trace this box no longer has: a topic whose shipped "
+              "histogram is the sum of two traces needs both of them on --runs")
+        return 5
+    import shutil
+    shutil.copy2(a.merge, a.merge + ".before-extras")
+    json.dump(r["cov"], open(a.merge, "w"))
+    json.dump(r["pairs"], open(os.path.join(stats_dir, "pairs.json"), "w"))
+    print(f"  every counts_<topic> and saliency_<topic> came back identical; replaced {a.merge} "
+          f"({os.path.getsize(a.merge) / 1e6:.1f} MB, previous kept as .before-extras)")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--trace", required=True)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--trace", help="a directory of per-layer traces to reduce "
+                                    "(required unless --merge)")
+    ap.add_argument("--out", help="where the reduction goes (required unless --merge)")
+    ap.add_argument("--merge", metavar="SHIPPED",
+                    help="merge mode: rebuild the stats file SHIPPED out of the reductions "
+                         "named by --runs and replace it ONLY if every counts_<topic> and "
+                         "saliency_<topic> comes back element-for-element identical. A topic "
+                         "whose shipped histogram is the sum of several traces is summed the "
+                         "same way; which traces those are is derived, not assumed")
+    ap.add_argument("--runs", nargs="*", default=[], metavar="DIR",
+                    help="reduction directories (each holding coverage.json) for --merge")
     ap.add_argument("--budgets", default="1000,1500,2000,3000,4000,5000,6000,8000")
     ap.add_argument("--cov-curves", action="store_true",
                     help="also write the per-category coverage curves; they are derived from the "
@@ -211,6 +463,12 @@ def main():
                     help="a pair needs this many co-occurrences before its lift is ranked "
                          "(default %(default)s)")
     a = ap.parse_args()
+    if a.merge:
+        if not a.runs:
+            ap.error("--merge needs --runs DIR [DIR ...]")
+        return merge_main(a)
+    if not (a.trace and a.out):
+        ap.error("--trace and --out are required (or --merge SHIPPED --runs DIR ...)")
     os.makedirs(a.out, exist_ok=True)
     layers, meta = load(a.trace)
     Ls = sorted(layers)
@@ -379,4 +637,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main() or 0)

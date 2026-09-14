@@ -117,144 +117,44 @@ say "reducing: $TRACE_DIRS"
 
 # --- 3. one reduction per trace ---------------------------------------------
 rm -rf "$STAGE"
-mkdir -p "$STAGE"
+mkdir -p "$STAGE/runs"
 for d in $TRACE_DIRS; do
     name=$(basename "$d")
     say "expert_stats over $d"
     # Defaults everywhere: the budget ladder is what the shipped file's `global` block was
     # measured on, and --pairs sibling keeps the co-routing tables out of the file the engine
     # parses on every start.
-    "$PYTHON" tools/expert_stats.py --trace "$d" --out "$STAGE/$name" >"$STAGE/$name.log" 2>&1 \
+    "$PYTHON" tools/expert_stats.py --trace "$d" --out "$STAGE/runs/$name" \
+        >"$STAGE/$name.log" 2>&1 \
         || { say "  FAILED -- tail of $STAGE/$name.log:"; tail -20 "$STAGE/$name.log"; exit 4; }
-    say "  wrote $STAGE/$name/coverage.json"
+    say "  wrote $STAGE/runs/$name/coverage.json"
 done
 
 # --- 4. merge, then decide whether it may replace the shipped file -----------
-STAGE="$STAGE" STATS_DIR="$STATS_DIR" "$PYTHON" - <<'PY'
-"""Merge the per-trace reductions into one stats file and install it only if it loses nothing.
-
-The shipped coverage.json is a merge of several traces (see the comment in trace_extras.sh),
-so a run over fewer traces than went into it would silently drop topics -- and a dropped topic
-is a keep-set that quietly stops covering a workload. The rule here is the conservative one:
-the merged file replaces the shipped one ONLY when it carries every `counts_<topic>` and
-`saliency_<topic>` key the shipped one has. Otherwise the shipped file stays exactly where it
-is and the merge is written beside it as coverage.new.json for someone to look at.
-
-Topics the shipped file does not name are dropped from the merge, so a stray trace lying about
-under results/ (an old two-category run, say) cannot add slices to the atlas.
-"""
-import glob
-import json
-import os
-import shutil
-
-STAGE = os.environ["STAGE"]
-STATS_DIR = os.environ["STATS_DIR"]
-OLD = os.path.join(STATS_DIR, "coverage.json")
-
-FAMILIES = ("counts_", "saliency_", "top1_")
-PAIRS = "pairs_"
-
-
-def topic_keys(per_layer, prefixes):
-    return {k for row in per_layer.values() for k in row if k.startswith(tuple(prefixes))}
-
-
-old = json.load(open(OLD, encoding="utf-8"))
-old_pl = old["per_layer"]
-old_keys = topic_keys(old_pl, ("counts_", "saliency_"))
-topics = sorted({k.split("_", 1)[1] for k in old_keys})
-print(f"  shipped file: {len(old_keys)} histogram keys over {len(topics)} topics")
-
-runs = sorted(glob.glob(os.path.join(STAGE, "*", "coverage.json")))
-if not runs:
-    raise SystemExit("  no reduction to merge")
-
-
-def run_topics(path):
-    pl = json.load(open(path, encoding="utf-8"))["per_layer"]
-    return {k.split("_", 1)[1] for k in topic_keys(pl, ("counts_",))} & set(topics)
-
-
-# The run that covers the most of the shipped topics is the base: its per-layer scalars
-# (`used`, `cov`, `entropy_bits`, `block6_unique_mean`) and its `global` budget ladder describe
-# the largest trace, which is the same thing they described before.
-covered = {p: run_topics(p) for p in runs}
-runs.sort(key=lambda p: -len(covered[p]))
-for p in runs:
-    print(f"  {os.path.relpath(p, STAGE)}: {len(covered[p])} of the shipped topics")
-
-merged = json.load(open(runs[0], encoding="utf-8"))
-m_pl = merged["per_layer"]
-pairs_path = os.path.join(os.path.dirname(runs[0]), "pairs.json")
-m_pairs = json.load(open(pairs_path, encoding="utf-8")) if os.path.exists(pairs_path) else None
-
-for p in runs[1:]:
-    add = json.load(open(p, encoding="utf-8"))["per_layer"]
-    taken = set()
-    for layer, rows in add.items():
-        if layer not in m_pl:
-            continue
-        for key, v in rows.items():
-            if not key.startswith(FAMILIES) or key.split("_", 1)[1] not in topics:
-                continue
-            if key in m_pl[layer]:        # first run to carry a topic keeps it
-                continue
-            m_pl[layer][key] = v
-            taken.add(key)
-    print(f"  merged {len(taken)} keys from {os.path.relpath(p, STAGE)}")
-    side = os.path.join(os.path.dirname(p), "pairs.json")
-    if m_pairs is not None and os.path.exists(side):
-        other = json.load(open(side, encoding="utf-8"))["per_layer"]
-        for layer, rows in other.items():
-            if layer not in m_pairs["per_layer"]:
-                continue
-            for key, v in rows.items():
-                if key.startswith(PAIRS) and key.split("_", 1)[1] in topics:
-                    m_pairs["per_layer"][layer].setdefault(key, v)
-
-# nothing the shipped file did not name
-dropped = set()
-for rows in m_pl.values():
-    for key in list(rows):
-        if key.startswith(FAMILIES) and key.split("_", 1)[1] not in topics:
-            del rows[key]
-            dropped.add(key)
-if m_pairs is not None:
-    for rows in m_pairs["per_layer"].values():
-        for key in list(rows):
-            if key.startswith(PAIRS) and key.split("_", 1)[1] not in topics:
-                del rows[key]
-if dropped:
-    print(f"  dropped {len(dropped)} keys for topics the shipped file does not name: "
-          + ", ".join(sorted(dropped)[:6]))
-
-missing = sorted(old_keys - topic_keys(m_pl, ("counts_", "saliency_")))
-have_top1 = {k.split("_", 1)[1] for k in topic_keys(m_pl, ("top1_",))}
-print(f"  merged file: {len(have_top1 & set(topics))} of {len(topics)} topics "
-      f"carry top1_<topic>")
-
-if missing:
-    dest = os.path.join(STATS_DIR, "coverage.new.json")
-    json.dump(merged, open(dest, "w", encoding="utf-8"))
-    if m_pairs is not None:
-        json.dump(m_pairs, open(os.path.join(STATS_DIR, "pairs.new.json"), "w", encoding="utf-8"))
-    print(f"  KEPT the shipped coverage.json: the merge is missing {len(missing)} of its keys")
-    print("  missing: " + ", ".join(missing[:10]) + (" ..." if len(missing) > 10 else ""))
-    print(f"  wrote {dest} instead -- trace the missing topics and re-run with TRACE_DIRS set")
-else:
-    shutil.copy2(OLD, OLD + ".before-extras")
-    json.dump(merged, open(OLD, "w", encoding="utf-8"))
-    if m_pairs is not None:
-        json.dump(m_pairs, open(os.path.join(STATS_DIR, "pairs.json"), "w", encoding="utf-8"))
-    print(f"  replaced {OLD} (previous kept as coverage.json.before-extras), "
-          f"{os.path.getsize(OLD) / 1e6:.1f} MB")
-PY
+# The merge is `tools/expert_stats.py --merge`, not a script of its own: a topic whose shipped
+# histogram is the SUM of two traces has to be summed the same way (`reasoning_code` is one --
+# its corpus was collected in two passes and each was traced separately), and which traces make
+# up a topic is derived there by matching histograms rather than guessed from directory names.
+# It replaces the shipped file only if every counts_<topic> and saliency_<topic> comes back
+# element-for-element identical, and otherwise leaves it alone and writes coverage.new.json.
+say "merging into $STATS_DIR/coverage.json"
+set +e
+"$PYTHON" tools/expert_stats.py --merge "$STATS_DIR/coverage.json" --runs "$STAGE"/runs/*
+rc=$?
+set -e
+if [ "$rc" = "5" ]; then
+    say "the merge was refused -- the shipped coverage.json is untouched, see above"
+elif [ "$rc" != "0" ]; then
+    say "the merge failed with exit $rc"
+    exit "$rc"
+fi
 
 # --- 5. re-take the atlas export --------------------------------------------
+# tools/atlas_export.py, not `tune.py --atlas-export`: --force is this tool's flag and tune.py
+# has no such option, so routing it through the TUI made argparse reject the whole command.
 # --force because the export is only stale against file times, and a coverage.json that was
 # kept rather than replaced has not moved.
 say "re-taking the Weight Atlas export"
-"$PYTHON" tools/tune.py --atlas-export --force
+"$PYTHON" tools/atlas_export.py --force
 
 say "=== done ==="

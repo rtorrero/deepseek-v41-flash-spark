@@ -613,8 +613,32 @@ the expert dossier read, recomputing every lift from the summed pair counts and 
 routing counts. Both fields are optional: a `coverage.json` from a trace reduced before this
 existed gets neither written, which is what the export did until now.
 
+### Re-reducing a shipped stats file
+
+A shipped `coverage.json` is not the output of one trace, and this is the part that bites. Topics
+were traced separately and copied in — and at least one topic is the **union of two traces**:
+`reasoning_code`'s corpus was collected in two passes (14 records, then 40 more), each traced and
+reduced on its own, and the shipped `counts_reasoning_code` is the two **added together**, 118,272
+routed slots a layer against 21,258 for the smaller pass alone. A merge that copies one trace's
+histogram across instead of summing the set ships a topic measured on a fifth of its corpus, and
+nothing about the file looks wrong: every key is present, every array is 384 wide.
+
+So `tools/expert_stats.py --merge SHIPPED --runs DIR ...` does not guess the trace set from
+directory names. For each topic it **derives** it: subset-sum over the candidate reductions'
+totals, then an element-by-element comparison of the subset's sum against the shipped histogram,
+smallest subset first. Pair tables are summed the same way and their lift recomputed against the
+union's own marginals; `top1_<topic>` is summed as the counts are.
+
+And it does not install anything on key presence. Every `counts_<topic>` and `saliency_<topic>` in
+the rebuilt file has to come back **element for element identical** to the shipped one — integers
+exactly, the saliency sums to within 1e-12 relative, which is twelve orders of magnitude tighter
+than the factor a missing trace moves a histogram by. On any mismatch the shipped file is left
+byte-for-byte alone and the rebuild is written beside it as `coverage.new.json` (exit 5).
+
 ```bash
 python3 tools/expert_stats.py --trace results/trace-X --out results/keepsets/X   # both, by default
+python3 tools/expert_stats.py --merge results/keepsets/topics/coverage.json \
+    --runs results/keepsets/.stage/*                # rebuild it, install only if identical
 python3 tools/test_trace_extras.py    # the histograms, the pair counts and the lift, brute-forced
 tools/trace_extras.sh                 # re-reduce every trace on the box and re-take the export
 ```
