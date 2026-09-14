@@ -231,6 +231,40 @@ check("  and the longer ring lands in the KV row", round(big.kv - small.kv, 3), 
 check("the plan records what it priced", (big.chunk, big.kv_fp8), (4096, True))
 check("and the default records the shipped pair", (small.chunk, small.kv_fp8), (2048, False))
 
+# --- the prefill unpack cache ------------------------------------------------
+# DSV41_PREFILL_UNPACK_CACHE_GB buys FP4 expert slots that survive between the
+# chunks of one prompt. It is a persistent allocation, so a configuration that
+# fitted without it does not automatically fit with it, and the tool has to say
+# so before the box does.
+check("cache slot is one FP4 expert", B.UNPACK_SLOT_BYTES, 18_800_640)
+check("a 6 GB budget is whole experts only",
+      B.unpack_cache_bytes(6.0), (6e9 // 18_800_640) * 18_800_640)
+check("  which is 319 of them", int(B.unpack_cache_bytes(6.0) // 18_800_640), 319)
+# one layer at keep 0.36 is ceil(.36*384) = 139 experts = 2.61 GB
+check("a layer at keep 0.36 costs", round(B.keep_n(0.36) * B.UNPACK_SLOT_BYTES / B.GB, 2), 2.61, 0.01)
+check("a layer unpruned costs", round(384 * B.UNPACK_SLOT_BYTES / B.GB, 2), 7.22, 0.01)
+check("6 GB holds 2.3 layers at keep 0.36", round(B.unpack_cache_layers(6.0, 0.36), 1), 2.3, 0.05)
+check("prefill_bytes grows by the cache",
+      round((B.prefill_bytes(32768, 2048, 6.0) - B.prefill_bytes(32768, 2048)) / B.GB, 2),
+      round(B.unpack_cache_bytes(6.0) / B.GB, 2), 0.01)
+# the engine clamps rather than refuses, but the PLAN has to be honest: a keep
+# that only just fitted must go tight or over once a cache is asked for
+_no = B.plan(box, None, (), 0.39, 32768, cache_gb=0.0)
+_yes = B.plan(box, None, (), 0.39, 32768, cache_gb=6.0)
+check("the cache is charged to the prefill reserve",
+      round(_yes.need_free - _no.need_free, 2), round(B.unpack_cache_bytes(6.0) / B.GB, 2), 0.01)
+check("and to the launch gate too",
+      round(_yes.launch_need - _no.launch_need, 2), round(B.unpack_cache_bytes(6.0) / B.GB, 2), 0.01)
+check("keep 0.39 + a 6 GB cache no longer fits this box", _yes.verdict, "over")
+check("  and the ceiling drops", _yes.max_keep() < _no.max_keep(), True)
+check("an fp4 arena is never charged for a cache",
+      B.plan(box, None, (), 0.30, 32768, fmt="fp4", cache_gb=6.0).unpack_cache, 0.0)
+# and the engine must actually add it where this model says it does
+_mc = _re.search(r"need = arena_gb \* 1e9 \+ pack_scratch \+ self\.unpack_cache_gb \* 1e9 \+ floor", _src)
+check("the engine adds the cache to its own pre-flight", bool(_mc), True)
+check("and clamps it to what is left rather than refusing",
+      "clamped to" in _src and "UNPACK_SLOT_BYTES" in _src, True)
+
 print()
 print(f"{len(fails)} failed" if fails else "all checks passed")
 sys.exit(1 if fails else 0)

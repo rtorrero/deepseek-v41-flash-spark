@@ -114,7 +114,10 @@ landed in 0.2.0, and the 7.2 GB the budget model reserves for it was a fit to a 
 itemisation behind it. This entry writes down what is in it and adds an opt-in way to make it
 smaller.
 
+
+
 ### Added
+
 
 - **`DSV41_ESCAPE_K` / `DSV41_ESCAPE_MARGIN` — the escape hatch.** The keep-set is a hard mask, and
   a pick it takes away stays taken away for the whole request; the two ends of that trade are the
@@ -248,8 +251,33 @@ smaller.
   between the tiled fp8 gather and the bf16 gather it replaces at every chunk length and tile size,
   the effect on an attention output, and that an out-of-range value saturates rather than becoming
   a NaN that takes a whole query's softmax with it. Self-skips without CUDA.
+- **`DSV41_PREFILL_UNPACK_CACHE_GB`** — keep unpacked FP4 experts across the chunks of one prompt.
+  With `EXPERT_FORMAT=cb3` a prefill-sized MoE call cannot read a 3-bit expert: it unpacks what it
+  needs back into packed FP4 (bit-exact), runs the FP4 kernel, and throws the unpack away — so
+  chunk 1 of a prompt unpacks exactly the experts chunk 0 already unpacked, and at keep 0.36 a
+  four-chunk prompt pays 4 × 21 × 139 unpacks where 21 × 139 would do. This buys a region of the
+  same FP4 scratch arena that survives between chunks. **The policy is a fixed layer window, not an
+  LRU**: prefill is a sequential scan over layers 0..20, so an LRU smaller than the 54.9 GB working
+  set evicts layer 0 exactly before chunk 1 asks for it again and scores zero hits at every budget
+  (`tools/test_unpack_cache.py` checks that against a real LRU). Admitting on first touch and never
+  evicting inside a request gives a hit rate of `cached layers / layers per chunk` instead. Cleared
+  at the end of every request and whenever an arena slot is rewritten, so it can never serve a stale
+  expert; with the cache off the prefill path is the previous code, launch for launch.
+  `unpack_hits` / `unpack_misses` / `unpack_bytes_saved` / `unpack_ms_saved` appear in
+  `x_engine_stats`. **Default 0 = off**: at a 6 GB budget the arithmetic predicts ~8 % of a
+  four-chunk prompt's expert lookups, which is under a percent of prefill wall time, and whether
+  that is worth a step of the keep slider is a measurement nobody has taken on a box yet.
+  [`docs/memory-budget.md`](docs/memory-budget.md#the-prefill-unpack-cache).
+- **`tools/verify_prefill_cache.sh`** — the A/B that settles it: one engine load with the cache off
+  and one with it on, the same prompt both times, then the generation gate against the cache-on load
+  (a cache that changes what the model writes is a bug, not a speedup). Records go under
+  `results/prefill/`, never into a profile's `GATE.md`.
+- **`tools/longprefill.py`** — one long, deterministic prompt built from the checkout's own corpus
+  in a fixed file order, sent streaming, reporting client time-to-first-token beside the server's
+  `prefill_s` / `prefill_tok_s` and the unpack counters. Stdlib only.
 
 ### Changed
+
 
 - `env.example` ships `PRUNE_KEEP=auto` with `ARENA_GB` **empty**. When the keep fraction is
   resolved and no arena is pinned, `./start.sh` sizes the arena for the kept set: the engine's own
@@ -260,8 +288,13 @@ smaller.
   so a `.env` written at 32k is still the right configuration at 256k.
 - `DEFAULT_THINKING` joins the keys `./tune.sh` manages in `.env` (eleven now). It is written only
   when a profile named one or the environment already carried one, never invented.
+- `tools/budget.py` charges the unpack cache to `prefill_bytes`, so it lands in both memory gates
+  and in `./tune.sh`'s verdict; `engine/v41_engine.py` adds it to its own pre-flight and **clamps**
+  it to what is left rather than refusing to start. On a 118.6 GB box a 6 GB cache still fits keep
+  0.36 and does not fit keep 0.39 — the trade is explicit rather than discovered by the watchdog.
 
 ### Fixed
+
 
 - `./start.sh` no longer exits silently, before printing anything, on a checkout with no
   `results/trace-*/stats/coverage.json`: the fallback lookup ends in a failed test, and under
@@ -296,6 +329,7 @@ smaller.
 
 ### Documentation
 
+
 - [`docs/tune.md`](docs/tune.md) — "The keep fraction can choose itself", and why thinking is part
   of a gate result rather than a preference.
 - [`docs/memory-budget.md`](docs/memory-budget.md) — "Asking the ladder instead of reading it",
@@ -311,6 +345,7 @@ smaller.
   nobody has run.
 
 ### Checks
+
 
 - `tools/test_keep_for_context.py` — the resolution at every context length against a fake host,
   monotonicity in the context, `ARENA_GB` capping, the gate-floor warning, numeric passthrough,

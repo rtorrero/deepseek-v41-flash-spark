@@ -260,18 +260,64 @@ VALIDATED_MAX_SEQ = 131072   # prefilled and measured at this length, 2026-09-12
 GB = 1e9
 
 
-def prefill_bytes(max_seq: int = 32768, chunk: int = PREFILL_CHUNK_DEFAULT,
-                  kv_fp8: bool = False) -> float:
-    """Peak transient memory of one prefill chunk -- the reserve a configuration
-    must leave free, or the watchdog kills the server on the first request.
+# The prefill unpack cache (DSV41_PREFILL_UNPACK_CACHE_GB, default 0 = off).
+# A CB3 expert has to be unpacked to packed FP4 before a prefill-sized kernel
+# can read it, and the unpack is thrown away at the end of the call -- so chunk
+# 1 of a prompt unpacks exactly the experts chunk 0 already unpacked. The cache
+# is a region of the FP4 scratch arena that is NOT overwritten between chunks;
+# it is persistent for the process, so it is a straight subtraction from what a
+# prefill has to fit in.
+#
+# What a layer costs, at 18,800,640 B per FP4 expert:
+#
+#     experts kept per layer   a full layer of cache
+#              384 (unpruned)          7.22 GB
+#              154 (keep 0.40)         2.90 GB
+#              139 (keep 0.36)         2.61 GB
+#              123 (keep 0.32)         2.31 GB
+#
+# and a chunk visits layers 0..20 under `DSV41_SWA_REPLAY=1`, so holding every
+# layer a chunk touches would be 21x that -- 55 GB at keep 0.36, which no
+# configuration on this box has. The cache is therefore a fixed window of the
+# first `budget / layer` layers (tools/unpack_cache.py::PrefillUnpackCache), and its
+# hit rate is that ratio.
+UNPACK_SLOT_BYTES = EXPERT_BYTES["fp4"]
 
-    Both terms are proportional to the chunk: the first by definition, the
-    second because the indexer's score tile is [chunk x compressed positions].
+
+def unpack_cache_gb_from_env() -> float:
+    v = _env_gb("DSV41_PREFILL_UNPACK_CACHE_GB")
+    return (v / GB) if v else 0.0
+
+
+def unpack_cache_bytes(cache_gb: float = 0.0) -> float:
+    """What the engine will actually take for the cache: whole experts only."""
+    return (max(0.0, cache_gb) * GB // UNPACK_SLOT_BYTES) * UNPACK_SLOT_BYTES
+
+
+def unpack_cache_layers(cache_gb: float, keep: float) -> float:
+    """How many layers of one prompt's working set that budget holds."""
+    per_layer = keep_n(keep) * UNPACK_SLOT_BYTES
+    return unpack_cache_bytes(cache_gb) / per_layer if per_layer else 0.0
+
+
+def prefill_bytes(max_seq: int = 32768, chunk: int = PREFILL_CHUNK_DEFAULT,
+                  cache_gb: float = 0.0, kv_fp8: bool = False) -> float:
+    """Peak transient memory of one prefill chunk -- the reserve a configuration
+    must leave free, or the watchdog kills the server on the first request --
+    plus the prefill unpack cache, which is not transient but is allocated on
+    top of everything the resident total already names.
+
+    Both of the transient terms are proportional to the chunk: the first by
+    definition, the second because the indexer's score tile is
+    [chunk x compressed positions]. `kv_fp8` (DSV41_PREFILL_KV_FP8) takes the
+    fp8 gather's saving off the per-token term; `cache_gb`
+    (DSV41_PREFILL_UNPACK_CACHE_GB) adds the persistent unpack cache on top.
     Kept identical to engine/v41_engine.py `prefill_reserve_bytes`;
     tools/test_budget.py fails if the two drift."""
     per_token = PREFILL_BYTES_PER_TOKEN - (PREFILL_KV_FP8_SAVED_PER_TOKEN if kv_fp8 else 0.0)
     return (chunk * per_token
-            + max_seq * PREFILL_BYTES_PER_CONTEXT_TOKEN * (chunk / PREFILL_CHUNK_DEFAULT))
+            + max_seq * PREFILL_BYTES_PER_CONTEXT_TOKEN * (chunk / PREFILL_CHUNK_DEFAULT)
+            + unpack_cache_bytes(cache_gb))
 
 
 def kv_bytes(max_seq: int, ring: int | None = None) -> float:
@@ -849,6 +895,7 @@ class Plan:
     kv: float
     prefill: float
     scratch: float
+    unpack_cache: float
     floor: float
     available: float
     chunk: int = PREFILL_CHUNK_DEFAULT
@@ -876,7 +923,11 @@ class Plan:
         # engine/v41_engine.py: floor = max(keep_free_gb, MAX_CHUNK * 5 MB).
         # Mirroring it exactly matters -- reading `keep_free_gb` alone made this
         # 4.2 GB more generous than the launcher's real margin at the default.
-        return self.arena + self.scratch + self.dense + max(self.floor, self.need_free)
+        # The prefill unpack cache is a persistent allocation the engine adds on
+        # top of that max(), so `need_free` has it taken back out before the
+        # comparison and it is added once, where the engine adds it.
+        return (self.arena + self.scratch + self.unpack_cache + self.dense
+                + max(self.floor, self.need_free - self.unpack_cache))
 
     @property
     def launch_slack(self) -> float:
@@ -889,7 +940,9 @@ class Plan:
 
     @property
     def need_free(self) -> float:
-        """A prefill chunk, plus the floor the watchdog kills below."""
+        """A prefill chunk and its unpack cache, plus the floor the watchdog
+        kills below. The cache is not transient, but it is allocated on top of
+        everything `resident` names, so this is where it is paid for."""
         return self.prefill + WATCHDOG_FLOOR_GB
 
     @property
@@ -917,7 +970,7 @@ class Plan:
 
     def max_arena(self) -> float:
         """Largest arena that both starts AND survives a prefill chunk."""
-        launch = self.available - self.scratch - self.dense - self.floor
+        launch = self.available - self.scratch - self.unpack_cache - self.dense - self.floor
         serve = (self.available - self.dense - self.dspark - self.kv
                  - UNMODELLED_RESIDENT_GB - self.need_free)
         return max(0.0, min(launch, serve))
@@ -938,15 +991,18 @@ def plan(host: Host, index: TopicIndex | None, selection, keep: float, max_seq: 
          keep_free_gb: float = KEEP_FREE_GB_DEFAULT, dense_key=None,
          chunk: int | None = None, kv_fp8: bool | None = None,
          transient_slots: int = TRANSIENT_SLOTS_DEFAULT,
-         rank: str = RANK_DEFAULT) -> Plan:
+         rank: str = RANK_DEFAULT, cache_gb: float | None = None) -> Plan:
     # the engine's own rounding: ceil(keep * 384) experts in every layer
     dense_key = dense_key or dense_key_from_env()
-    # The chunk and the fp8 switch are ordinary .env keys the engine reads, like
-    # DSV41_DENSE_FP4 above: a panel that prices a 2,048-token chunk on a box
-    # whose .env says 4,096 understates the reserve by 7 GB and its verdict
-    # cannot be trusted.
+    # The chunk, the fp8 switch and the unpack cache are ordinary .env keys the
+    # engine reads, like DSV41_DENSE_FP4 above: a panel that prices a
+    # 2,048-token chunk on a box whose .env says 4,096 understates the reserve
+    # by 7 GB and its verdict cannot be trusted.
     chunk = chunk_from_env() if chunk is None else chunk
     kv_fp8 = kv_fp8_from_env() if kv_fp8 is None else kv_fp8
+    cache_gb = unpack_cache_gb_from_env() if cache_gb is None else cache_gb
+    if fmt != "cb3":
+        cache_gb = 0.0   # an fp4 arena is already in the kernel's format; nothing is unpacked
     kept = keep_n(keep) * N_LAYERS
     slots = kept + transient_slots
     arena = (arena_gb * GB) if arena_gb else slots * EXPERT_BYTES[fmt]
@@ -962,9 +1018,10 @@ def plan(host: Host, index: TopicIndex | None, selection, keep: float, max_seq: 
         dense=DENSE_BYTES.get(dense_key, DENSE_DEFAULT) / GB,
         dspark=DSPARK_BYTES / GB,
         kv=kv / GB,
-        prefill=prefill_bytes(max_seq, chunk, kv_fp8) / GB,
+        prefill=prefill_bytes(max_seq, chunk, cache_gb, kv_fp8) / GB,
         chunk=chunk, kv_fp8=kv_fp8,
         scratch=PACK_SCRATCH_BYTES[fmt] / GB,
+        unpack_cache=unpack_cache_bytes(cache_gb) / GB,
         floor=keep_free_gb,
         available=host.available_gb,
         coverage=cov, selection=tuple(selection),

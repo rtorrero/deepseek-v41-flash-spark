@@ -73,6 +73,11 @@ STEP_TIMING = os.environ.get("DSV41_STEP_TIMING", "0") == "1"
 # draw, and the greedy path computes argmax of the same logits in the same order.
 LEAN_STEP = os.environ.get("DSV41_LEAN_STEP", "1") == "1"
 
+# One packed-FP4 expert, the unit the prefill unpack cache (DSV41_PREFILL_UNPACK_CACHE_GB) is
+# budgeted in: 18,800,640 B = 18.80 MB. A whole layer of them is ceil(keep * 384) slots -- 139 at
+# keep 0.36 (2.61 GB), 384 (7.22 GB) if nothing is pruned.
+UNPACK_SLOT_BYTES = EX.EXPERT_BYTES
+
 
 class StepPhases:
     """Accumulating per-phase timer, printed as a table over a whole run."""
@@ -556,6 +561,22 @@ class V41Engine:
         assert self.expert_format in ("fp4", "cb3"), self.expert_format
         self.sim_cb2_frac = float(sim_cb2_frac or 0.0)
         assert 0.0 <= self.sim_cb2_frac <= 1.0, self.sim_cb2_frac
+        # --- the prefill unpack cache (DSV41_PREFILL_UNPACK_CACHE_GB, default 0 = off).
+        # A CB3 expert has to be unpacked to packed FP4 before a prefill-sized kernel can read it,
+        # and that unpack is thrown away at the end of the call -- so chunk 1 of a prompt unpacks
+        # exactly the experts chunk 0 already unpacked. This budget buys a region of the FP4
+        # scratch arena that is NOT overwritten between chunks. One layer's worth is
+        # ceil(keep * 384) x 18.80 MB: 2.61 GB at keep 0.36, 7.22 GB if nothing is pruned.
+        # See tools/unpack_cache.py::PrefillUnpackCache for the policy and docs/memory-budget.md for
+        # where the budget sits in the two gates.
+        try:
+            self.unpack_cache_gb = max(0.0, float(os.environ.get("DSV41_PREFILL_UNPACK_CACHE_GB", "0") or 0))
+        except ValueError:
+            self.unpack_cache_gb = 0.0
+        if self.unpack_cache_gb and self.expert_format != "cb3":
+            log(f"DSV41_PREFILL_UNPACK_CACHE_GB={self.unpack_cache_gb} ignored: an fp4 arena is "
+                f"already in the kernel's format and nothing is unpacked at prefill")
+            self.unpack_cache_gb = 0.0
         try:
             import fp4_moe as K
             fp4_moe_fn, fp4_arena_cls = K.moe_forward, K.ExpertArena
@@ -666,11 +687,26 @@ class V41Engine:
             prefill_reserve = (prefill_reserve_bytes(max_seq)
                                + float(os.environ.get("DSV41_MEM_FLOOR_GB", "2.5")) * 1e9)
             floor = max(keep_free_gb * 1e9, prefill_reserve)
-            need = arena_gb * 1e9 + pack_scratch + floor
+            # The unpack cache is a persistent allocation on top of all of that, so it is CLAMPED
+            # to what is left rather than allowed to push the configuration over: an arena that
+            # serves must not stop serving because a cache budget was set too high. Refusing is
+            # still what happens if there is no room even with the cache at zero.
+            if self.unpack_cache_gb:
+                room = host_avail - (arena_gb * 1e9 + pack_scratch + floor)
+                fit = max(0.0, min(self.unpack_cache_gb * 1e9, room))
+                fit = (fit // UNPACK_SLOT_BYTES) * UNPACK_SLOT_BYTES   # whole experts only
+                if fit < self.unpack_cache_gb * 1e9:
+                    log(f"prefill unpack cache {self.unpack_cache_gb:.1f} GB clamped to "
+                        f"{fit / 1e9:.1f} GB (MemAvailable {host_avail / 1e9:.1f} GB, arena "
+                        f"{arena_gb:.1f} + scratch {pack_scratch / 1e9:.1f} + floor "
+                        f"{floor / 1e9:.1f} GB leave {max(0.0, room) / 1e9:.1f} GB)")
+                self.unpack_cache_gb = fit / 1e9
+            need = arena_gb * 1e9 + pack_scratch + self.unpack_cache_gb * 1e9 + floor
             if need > host_avail:
                 raise RuntimeError(
                     f"refusing to start: arena {arena_gb:.1f} GB + {pack_scratch / 1e9:.1f} GB "
-                    f"warm-start scratch + {floor / 1e9:.1f} GB floor "
+                    f"warm-start scratch + {self.unpack_cache_gb:.1f} GB prefill unpack cache + "
+                    f"{floor / 1e9:.1f} GB floor "
                     f"({'a prefill chunk' if prefill_reserve > keep_free_gb * 1e9 else 'keep_free'}) "
                     f"= {need / 1e9:.1f} GB, but MemAvailable is {host_avail / 1e9:.1f} GB. "
                     f"Lower --arena-gb by at least {(need - host_avail) / 1e9:.1f} GB (./tune.sh "
@@ -690,6 +726,31 @@ class V41Engine:
         self.mem_watchdog = MemoryWatchdog(floor_gb=float(os.environ.get("DSV41_MEM_FLOOR_GB", "2.5")),
                                            log=log).start()
         self.arena = make_expert_arena(slots)
+        # The prefill unpack cache lives in the same FP4 arena the prefill path already unpacks
+        # into, as a region below the rotating scratch. Allocated NOW rather than on the first
+        # request, so a budget that does not fit fails while the box is still idle.
+        self.unpack_cache = None
+        # A prefill chunk may route to every expert the keep-set left in a layer, so that is what
+        # one layer of cache costs -- and under SWA replay a chunk only runs the encoder half, so
+        # what it can reuse is those layers and not all 40.
+        _layer_slots = (max(6, int(np.ceil((prune_keep or 1.0) * self.args.n_routed_experts)))
+                        if (prune_keep and prune_keep < 1.0) else self.args.n_routed_experts)
+        _chunk_layers = (self.args.candidate_source_layer + 1) if self.swa_replay else self.args.n_layers
+        if self.unpack_cache_gb > 0:
+            import cb3_moe as _C3
+            self.unpack_cache = _C3.attach_unpack_cache(self.arena, self.unpack_cache_gb * 1e9)
+            if self.unpack_cache is None:
+                log(f"prefill unpack cache {self.unpack_cache_gb:.2f} GB is under one expert "
+                    f"({UNPACK_SLOT_BYTES / 1e6:.2f} MB); disabled")
+                self.unpack_cache_gb = 0.0
+            else:
+                n = self.unpack_cache.slots
+                log(f"prefill unpack cache: {n} FP4 expert slots = "
+                    f"{n * UNPACK_SLOT_BYTES / 1e9:.2f} GB, kept across the chunks of one prompt "
+                    f"(a whole layer is {_layer_slots} slots = "
+                    f"{_layer_slots * UNPACK_SLOT_BYTES / 1e9:.2f} GB, so {n / _layer_slots:.1f} "
+                    f"of the {_chunk_layers} layers a chunk visits -- expect a hit rate near "
+                    f"{n / _layer_slots / _chunk_layers * 100:.0f}%)")
         self.store = EX.ExpertStore(model_dir, index, self.arena, self.args.n_layers, transient_slots=transient_slots,
                                     io_threads=io_threads)
         # load the DSpark experts (all 3 x 128 resident in their own arena)
@@ -1020,6 +1081,20 @@ class V41Engine:
                 # escapes per token, bytes read and ms spent -- the three numbers that say whether
                 # the hatch paid for itself on this request
                 self.last_stats.update(self.escape.report(n_out))
+            # The prefill unpack cache: what it saved on THIS prompt, then dropped. `ms_saved` is
+            # an estimate -- hits times the cost of one unpack, measured with CUDA events on the
+            # first few unpacks of the request (tools/unpack_cache.py::PrefillUnpackCache).
+            if self.unpack_cache is not None:
+                u = self.unpack_cache.summary()
+                self.last_stats.update({
+                    "unpack_hits": u["unpack_hits"], "unpack_misses": u["unpack_misses"],
+                    "unpack_bytes_saved": u["unpack_bytes_saved"],
+                    "unpack_gb_saved": round(u["unpack_bytes_saved"] / 1e9, 2),
+                    "unpack_ms_saved": u["unpack_ms_saved"],
+                    "unpack_cache_slots": u["unpack_cache_slots"],
+                    "unpack_cache_used": u["unpack_cache_used"],
+                })
+                self.unpack_cache.end_request()
 
     def _decode_loop(self, ids, P, max_tokens, temperature, top_p, stop_ids, out_st, grammar=None, penalties=None,
                      think=None):
@@ -1029,12 +1104,22 @@ class V41Engine:
         # prefill in chunks
         logits = None
         m.begin_prompt()
+        # The prefill unpack cache is told how many chunks this prompt has, because the last chunk
+        # (and the decoder replay after it) can only READ the cache -- anything admitted there
+        # would never be looked up again, and an admission costs an 18.8 MB write.
+        uc = self.unpack_cache
+        if uc is not None:
+            uc.begin_request((P + MAX_CHUNK - 1) // MAX_CHUNK)
         if self.swa_replay:
             # CED + Decoder SWA Bounded Replay: the prompt runs through the encoder half only
             # (layers 0..20, which is everything that writes global KV), and the decoder half is
             # replayed once over the last `window_size` prompt tokens.
             for s in range(0, P, MAX_CHUNK):
+                if uc is not None:
+                    uc.begin_chunk()
                 m.forward(ids[s:s + MAX_CHUNK], s, prefill=True, need_logits=False, encoder_only=True)
+            if uc is not None:
+                uc.begin_chunk()   # the replay: read the cache, admit nothing
             logits, mh, s_rep = m.decoder_replay(need_logits=True)
             if self.spec:
                 m.dspark_seed(mh, s_rep)
@@ -1042,6 +1127,8 @@ class V41Engine:
             for s in range(0, P, MAX_CHUNK):
                 chunk = ids[s:s + MAX_CHUNK]
                 last = s + len(chunk) >= P
+                if uc is not None:
+                    uc.begin_chunk()
                 logits, mh = m.forward(chunk, s, prefill=True, need_logits=last)
                 if self.spec:
                     m.dspark_seed(mh, s)
@@ -1292,6 +1379,8 @@ class V41Engine:
             "kernel": self.kernel,
             "expert_format": self.expert_format,
             "expert_mb": round(self.expert_bytes / 1e6, 2),
+            "unpack_cache_gb": round(self.unpack_cache_gb, 2),
+            "unpack_cache_slots": self.unpack_cache.slots if self.unpack_cache is not None else 0,
             "dense_fp4": ",".join(sorted(R.dense_fp4_groups())) or "off",
             "head_fmt": R.head_fmt(),
             "routed_topk": self.args.n_activated_experts,
