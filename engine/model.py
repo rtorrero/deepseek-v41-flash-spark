@@ -506,6 +506,17 @@ class Model:
         # them. Dropping is what the REAP-style pruning literature does; substituting is what this
         # engine did. See docs/keep-sets.md and env.example.
         drop = pruned and getattr(self, "prune_drop", False)
+        # DSV41_ESCAPE_K -- the escape hatch (engine/escape.py). Before the mask goes on, the
+        # router's own scores nominate the best non-resident expert(s) of this layer-step; if one
+        # clears the margin the runtime streams it into a transient slot and sets its bit in
+        # `pm[L]` IN PLACE, so the mask below is already the patched one and nothing else in this
+        # function changes. Decode only: a prefill chunk of 2,048 tokens touches ~370 of a layer's
+        # 384 experts, so the rule would fire on all 40 layers of every chunk, thrash an 8-slot
+        # ring and pay for tokens that are not where the failure shows.
+        # With the hatch off (the default) `escape_rt` does not exist and this is one getattr.
+        esc = getattr(self, "escape_rt", None)
+        if esc is not None and pruned and not drop and not prefill:
+            esc.consider(L, logits, scores, k)
         if pruned and not drop:
             # the router may only pick surviving experts
             logits = logits.masked_fill(~pm[L], float("-inf"))

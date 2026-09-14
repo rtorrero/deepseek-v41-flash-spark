@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 
 from engine import experts as EX  # noqa: E402
+from engine.escape import EscapeHatch  # noqa: E402
 from engine.engram import EngramTable, make_hash_state  # noqa: E402
 from engine.model import MAX_CHUNK, Caches, Model, Weights  # noqa: E402
 import v41_ref as R  # noqa: E402
@@ -403,6 +404,100 @@ def build_prune_fallback(masks: dict, topk: int) -> dict:
     return fb
 
 
+class EscapeRuntime:
+    """The device half of the escape hatch: fetch, patch, withdraw. Policy lives in engine/escape.py.
+
+    What it does with an admitted expert is the whole trick, and it is one line: it sets the
+    expert's bit in `model.prune_mask[L]` **in place**. That tensor is the router's mask in both
+    routing paths and is captured by pointer in the decode graphs, so an expert admitted here
+    becomes routable without re-capturing anything and without either path's mask line changing by
+    a character (`tools/test_route_modes.py` pins both lines; they are untouched). The matching
+    device LUT entry is written at the same time, because a routable expert whose LUT entry is
+    still -1 is a gather off the end of the arena.
+
+    The two are also withdrawn together. An escape lives in the transient ring, the ring recycles,
+    and `ExpertStore.on_transient_evict` calls `on_evict` here the moment the slot underneath an
+    escape is handed to someone else.
+
+    Ordering, which is what makes the fetch safe: layer L's fetch happens on the host after layer
+    L-1's MoE graph was queued, and `ExpertStore._load_into_slot` makes its copy stream wait on the
+    compute stream before it writes the slot. So a slot is never overwritten while a kernel that
+    reads it is still outstanding -- the same argument that makes a prefill miss safe, for the same
+    reason.
+    """
+
+    def __init__(self, hatch: EscapeHatch, masks: dict, store, topk: int):
+        self.h = hatch
+        self.masks = masks          # model.prune_mask -- MUTATED in place, see the docstring
+        self.store = store
+        self.topk = int(topk)
+        self.lut = None             # device (layer, expert) -> slot table; set once it exists
+
+    def attach_lut(self, lut) -> None:
+        self.lut = lut
+
+    def begin_step(self) -> None:
+        self.h.begin_step()
+
+    # ---------------------------------------------------------------- the eager path
+    def consider(self, L: int, logits: torch.Tensor, scores: torch.Tensor, topk: int) -> bool:
+        """Scan the RAW router output of layer L and admit what the rule allows. Row 0 only.
+
+        `logits` and `scores` are the gate's own, before any mask -- that is the point: the
+        decision is about the pick the router would have made if the keep-set were not in the way.
+        This is the un-graphed path (prefill's sibling, and decode with DSV41_GRAPHS=0); the
+        graphed path computes the same three numbers inside the graph and calls `admit` with them.
+        """
+        m = self.masks[L]
+        k = int(topk)
+        n = min(self.h.k, k)
+        cand_v, cand_i = logits[0].masked_fill(m, float("-inf")).topk(n)
+        res_i = logits[0].masked_fill(~m, float("-inf")).topk(k)[1]
+        res_s = scores[0][res_i]
+        den = float(res_s.sum())
+        disp = res_s.flip(0)[:n]     # the j-th weakest resident pick is what candidate j displaces
+        margins = self.h.margins(scores[0][cand_i].tolist(), disp.tolist(), den)
+        # -inf for a candidate the mask did not actually displace (its logit is below the pick it
+        # would have to push out), exactly as the graphed scan does it
+        disp_lg = logits[0][res_i].flip(0)[:n].tolist()
+        cand_lg = cand_v.tolist()
+        margins = [mg if cand_lg[j] > disp_lg[j] else float("-inf") for j, mg in enumerate(margins)]
+        return self.admit(L, [int(e) for e in cand_i.tolist()], margins)
+
+    # ---------------------------------------------------------------- admission
+    def admit(self, L: int, cands, margins) -> bool:
+        """Fetch what `select` allows. Returns True if the layer's routing has to be recomputed."""
+        sel = self.h.select(cands, margins)
+        if not sel:
+            return False
+        m = self.masks[L]
+        for e, mg in sel:
+            slot, nbytes, secs = self.store.escape_fetch(L, e)
+            # mask bit and LUT entry together, never one without the other
+            m[e] = True
+            if self.lut is not None:
+                self.lut[L, e] = slot
+            self.h.admitted((L, e), slot, mg)
+            self.h.record_fetch(nbytes, secs)
+        return True
+
+    def on_evict(self, key) -> None:
+        """`ExpertStore` is recycling this key's transient slot: it stops being routable now."""
+        if self.h.evicted(key):
+            L, e = key
+            self.masks[L][e] = False
+            if self.lut is not None:
+                self.lut[L, e] = -1
+
+    def clear(self) -> None:
+        """Back to the shipped keep-set, exactly. Called between requests."""
+        for (L, e) in list(self.h.live):
+            self.masks[L][e] = False
+            if self.lut is not None:
+                self.lut[L, e] = -1
+        self.h.reset()
+
+
 class V41Engine:
     #: this engine can constrain sampling with a decoding gate (``generate(grammar=...)``)
     supports_grammar = True
@@ -728,6 +823,30 @@ class V41Engine:
         self.model.prune_drop = self.prune_mode == "drop" and self.model_prune_mask is not None
         self.model.prune_fallback = (build_prune_fallback(self.model_prune_mask, self.args.n_activated_experts)
                                      if self.model.prune_drop else None)
+        # DSV41_ESCAPE_K: the escape hatch (engine/escape.py). Off unless asked for, and "off"
+        # means this object is never built, nothing is attached to the model or the store, and
+        # both routing paths run the code they ran before this existed.
+        self.escape = EscapeHatch.from_env(topk=self.args.n_activated_experts)
+        self.escape_rt = None
+        if self.escape is not None:
+            if self.model_prune_mask is None:
+                raise ValueError("DSV41_ESCAPE_K needs a keep-set to escape from: set PRUNE_KEEP "
+                                 "(the unpruned engine already streams every expert the router asks for)")
+            if self.prune_mode != "substitute":
+                # `drop` keeps the router's true top-k and zeroes the displaced picks, so "the
+                # pick the mask took away" means something different there and the two would have
+                # to be designed together. drop is a measured negative result (RESULTS.md 5.3);
+                # combining two experiments is not a thing to do by accident.
+                raise ValueError(f"DSV41_ESCAPE_K does not combine with DSV41_PRUNE_MODE="
+                                 f"{self.prune_mode} (substitute only)")
+            if self.store.transient_slots < max(8, self.escape.k):
+                raise ValueError(f"DSV41_ESCAPE_K={self.escape.k} needs at least "
+                                 f"{max(8, self.escape.k)} TRANSIENT_SLOTS (have "
+                                 f"{self.store.transient_slots})")
+            self.escape_rt = EscapeRuntime(self.escape, self.model_prune_mask, self.store,
+                                           self.args.n_activated_experts)
+            self.store.on_transient_evict = self.escape_rt.on_evict
+            self.model.escape_rt = self.escape_rt
         self.store.warm_start(ranked, log=log)
         self.fast = None
         if spec and os.environ.get("DSV41_FAST", "1") == "1":
@@ -741,6 +860,20 @@ class V41Engine:
                 # prefill routes through Model.moe, which takes the same table when it is there
                 self.model.slot_lut = self.fast.lut
             log("fast decode path enabled (CUDA graphs=%s, device slot LUT=%s)" % (self.fast.use_graphs, self.fast.lut is not None))
+        if self.escape_rt is not None:
+            # The hatch fetches into the TRANSIENT ring and names the slot through the device LUT.
+            # Without the LUT the slot lookup is `ExpertStore.resolve`, which promotes a transient
+            # hit into the LRU -- i.e. it would evict a keep-set expert to make room for one the
+            # keep-set rejected, quietly shrinking the set the operator asked for. Refuse instead
+            # of serving a configuration that does that.
+            if self.fast is None or self.fast.lut is None:
+                raise ValueError("DSV41_ESCAPE_K needs the all-resident device slot LUT "
+                                 "(pruned mode with SPEC=1 and DSV41_LUT=1); this engine has none")
+            self.escape_rt.attach_lut(self.fast.lut)
+            self.fast.arm_escape(self.escape_rt)
+            log(f"escape hatch armed: up to {self.escape.k} non-resident expert(s) per layer-step "
+                f"at margin {self.escape.margin:.3f}, {self.escape.step_budget} per decode step, "
+                f"into {self.store.transient_slots} transient slots")
         # preallocated staging for the lean decode step (see LEAN_STEP): the verify block, the
         # [n_accepted, argmax x 6] readback and its pinned host landing buffer.
         from engine.fastdecode import T_VERIFY as _TV
@@ -763,6 +896,9 @@ class V41Engine:
         for t in self.tables.values():
             t.stats = {"rows": 0, "seconds": 0.0, "calls": 0}
         self.store.stats.update(EX.ZERO_STATS)
+        if self.escape_rt is not None:
+            # every request starts from the shipped keep-set: see EscapeHatch.reset
+            self.escape_rt.clear()
 
     def generate(self, prompt_ids, *, max_tokens=4096, temperature=1.0, top_p=0.95, stop_token_ids=None, seed=None,
                  penalties=None,
@@ -852,6 +988,10 @@ class V41Engine:
                 "nvme_gb_per_token": round(st["bytes_read"] / 1e9 / max(n_out, 1), 3),
                 "promoted": st["promoted"],
             }
+            if self.escape_rt is not None:
+                # escapes per token, bytes read and ms spent -- the three numbers that say whether
+                # the hatch paid for itself on this request
+                self.last_stats.update(self.escape.report(n_out))
 
     def _decode_loop(self, ids, P, max_tokens, temperature, top_p, stop_ids, out_st, grammar=None, penalties=None,
                      think=None):
@@ -905,6 +1045,8 @@ class V41Engine:
         while n_out < max_tokens and tok not in stop_ids:
             if ph is not None:
                 ph.start()
+            if self.escape_rt is not None:
+                self.escape_rt.begin_step()   # the per-step fetch budget is per DECODE step
             if self.spec:
                 # the lean path applies to greedy decoding only; temperature > 0 keeps the original
                 # sequential rejection-sampling loop so its RNG stream is bit-for-bit unchanged
@@ -1131,6 +1273,9 @@ class V41Engine:
             "prune_keep": self.prune_keep,
             "prune_select": getattr(self, "prune_select", None),
             "prune_mode": self.prune_mode,
+            # the escape hatch: 0 = off, which is the shipped configuration
+            "escape_k": self.escape.k if self.escape is not None else 0,
+            "escape_margin": self.escape.margin if self.escape is not None else None,
             # which measurement ranked the keep-set: routing frequency or REAP saliency
             "prune_source": self.prune_source,
             "expert_topics": getattr(self, "expert_topics_used", None),

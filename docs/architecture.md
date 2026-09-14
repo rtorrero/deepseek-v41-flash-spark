@@ -112,6 +112,20 @@ A 64-slot ring wrapped *inside* a layer and the engine silently computed that la
 the wrong experts — an 0.88 relative error in the first smoke test, and no exception
 anywhere. The default is 400.
 
+In the pruned all-resident configuration the ring is idle — nothing routable can miss —
+and that is what the **escape hatch** (`DSV41_ESCAPE_K`, off by default) uses. On a keep-set
+the router's true first choice is regularly outside the resident set, the token is served by
+a substitute, and identifier corruption follows; streaming *every* expert instead passes those
+prompts but costs 1,008–1,549 s each. The hatch is the middle: per layer-step it reads the
+router's raw scores *before* the mask, and if the best non-resident pick would carry at least
+`DSV41_ESCAPE_MARGIN` more of the token's routed weight than the resident pick it displaces, it
+streams that one expert into a transient slot, sets its bit in the router's mask in place — so
+the captured decode graphs see it without being re-captured — and routes to it for the rest of
+the request or until the ring recycles the slot. It costs an 18.80 MB read, the CB3 repack, and
+the merged graph segments (41 replays a step instead of 3), all on the critical path, which is
+why it is opt-in, bounded at `8 × K` fetches a step, and withdrawn between requests. See
+[keep-sets](keep-sets.md#escaping-the-mask); no generation gate has been run on it yet.
+
 ### NVMe streaming
 
 Every miss is a read straight out of the layer's safetensors shard with `O_DIRECT`

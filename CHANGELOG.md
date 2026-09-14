@@ -109,6 +109,23 @@ the context length, and the thinking default is a property of the keep-set — s
 derived where they are decided, instead of being copied out of a results file by hand.
 
 ### Added
+- **`DSV41_ESCAPE_K` / `DSV41_ESCAPE_MARGIN` — the escape hatch.** The keep-set is a hard mask, and
+  a pick it takes away stays taken away for the whole request; the two ends of that trade are the
+  measured ones (no mask at all passes the prompts every keep-set fails, at 1,008–1,549 s each —
+  `results/keepsets/null-unmasked/GATE.md`; the mask is 15–25 tok/s and fails them) and nothing in
+  between had been tried. With `DSV41_ESCAPE_K=1` a layer-step may stream **one** non-resident
+  expert into the transient ring when the router's raw, pre-mask scores say the mask displaced a
+  pick worth at least `DSV41_ESCAPE_MARGIN` of the token's routed weight more than the resident
+  expert standing in for it. The expert's bit is set in the router's mask in place — the captured
+  decode graphs pick it up without re-capture — and withdrawn when the ring recycles its slot or the
+  request ends. Bounded at 8 × K fetches per decode step, decode only, `substitute` only, and it
+  requires the all-resident device slot LUT. **Ungated**: no prompt has been generated with it armed;
+  `tools/verify_escape.sh` is the run that would say. Costs, all on the critical path: an 18.80 MB
+  `O_DIRECT` read, the CB3 repack of three matrices, and the merged graph segments (41 graph replays
+  a step instead of 3, measured at +0.6 ms of a 146.6 ms step). Off by default, and off is
+  byte-for-byte the engine that shipped — `tools/test_escape_rule.py` and `tools/test_route_modes.py`
+  hold both mask lines and every escape site to that. See
+  [`docs/keep-sets.md`](docs/keep-sets.md#escaping-the-mask).
 - **Reasoning-span decode controls**, both **off by default**, so no shipped number moves.
   `DSV41_THINK_BUDGET` / `reasoning_budget` caps the think block: once the completion has
   produced that many tokens without closing it, the decode loop forces `</think>` on the next

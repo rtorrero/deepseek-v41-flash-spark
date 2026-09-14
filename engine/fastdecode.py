@@ -175,6 +175,12 @@ class FastDecoder:
         self._premix0[:, 0] = 1.0
         self.graphs = {}
         self.pool = None
+        # The escape hatch is off unless V41Engine calls `arm_escape` (DSV41_ESCAPE_K>0). `None`
+        # here is what makes every escape branch below a single `is not None` on the host and
+        # nothing at all inside the captured graphs.
+        self.esc = None
+        self.esc_n = 0
+        self.esc_out = self.esc_host = self.esc_scores = self.esc_logits = None
         # resident mode: (layer, expert) -> arena slot as a device table, so the router's expert ids can be
         # turned into slots inside the graph and the whole layer is ONE graph (no host round-trip per layer)
         self.lut = None
@@ -196,6 +202,28 @@ class FastDecoder:
             self.rs_hits = torch.zeros(a.n_routed_experts, dtype=torch.int32, device=dev)
             self.rs_uniq = torch.zeros(self.m.args.n_layers, dtype=torch.float64, device=dev)
             self.rs_steps = 0
+
+    def arm_escape(self, runtime) -> None:
+        """Attach the escape hatch and allocate the buffers its scan writes into.
+
+        Called by V41Engine before the first step, so the buffers exist when `capture()` runs and
+        the scan is captured with the rest of layer A. With the hatch off none of this is
+        allocated and `_layer_a` is the function it was.
+        """
+        a = self.a
+        dev = self.dev
+        self.esc = runtime
+        self.esc_n = min(runtime.h.k, a.n_activated_experts)
+        # [2, n]: row 0 the candidate expert ids, row 1 their margins. One tensor so the host reads
+        # a layer's whole decision in a single 8n-byte transfer. fp32 holds an expert id (< 384)
+        # exactly, and a float row costs one copy where an int row plus a float row cost two.
+        self.esc_out = torch.zeros(2, self.esc_n, dtype=torch.float32, device=dev)
+        self.esc_host = torch.zeros(2, self.esc_n, dtype=torch.float32).pin_memory()
+        # The raw router output of the layer the graph just ran. An admitted escape changes the
+        # mask, and `_reroute` redoes the mask/topk/renormalise tail from these -- attention, the
+        # HC mixes and the gate GEMM are not repeated.
+        self.esc_scores = torch.zeros(T_VERIFY, a.n_routed_experts, dtype=torch.float32, device=dev)
+        self.esc_logits = torch.zeros(T_VERIFY, a.n_routed_experts, dtype=torch.float32, device=dev)
 
     # ------------------------------------------------------------------ helpers
     def _n_cache(self, r):
@@ -347,6 +375,10 @@ class FastDecoder:
         # deeper in, which is what made the graphed path disagree with the reference at all.
         scores = F.softplus(R.mm(y.float(), self.W.layers[L].gate_w)).sqrt()
         logits = scores + w.gate_bias
+        # The router's ranking BEFORE the keep-set mask. `masked_fill` below returns a new tensor,
+        # so this name keeps the unmasked one alive for the escape hatch's scan; it is a binding,
+        # not an op, so the captured graph is identical with the hatch off.
+        raw = logits
         pm = getattr(self.m, "prune_mask", None)
         pruned = pm is not None and L in pm
         # Same two modes as Model.moe, same arithmetic, same order of operations -- the prefill and
@@ -356,6 +388,8 @@ class FastDecoder:
         idx = logits.topk(a.n_activated_experts, dim=-1)[1]
         wts = scores.gather(1, idx)
         slot_idx = idx
+        if self.esc is not None and pruned:
+            self._escape_scan(L, raw, scores, idx, wts, pm[L])
         if pruned and self.drop_mode:
             # Every op here has a fixed shape and reads only tensors that already exist, so the
             # whole branch captures like the rest of the layer: a gather of the layer's bool mask
@@ -382,6 +416,69 @@ class FastDecoder:
             self.rs_hits.index_fill_(0, slot_idx.reshape(-1), 1)
             self.rs_uniq[L] += self.rs_hits.sum()
         self._tap('moe_in', L, y); self._tap('route_idx', L, idx); self._tap('topk', L, self.topk)
+
+    def _escape_scan(self, L, raw, scores, idx, wts, live):
+        """Inside the graph: this layer-step's escape candidates and their margins, for row 0.
+
+        Row 0 and not the whole block on purpose. The verify block is one accepted token followed
+        by five DSpark drafts, so row 0 is the only row whose hidden state contains no drafted
+        content -- and its logits produce the one token of the step that is always accepted.
+        Deciding on any other row would let a draft that is about to be rejected fetch an expert
+        and change the routing of the token that is actually emitted, which is the one thing
+        speculative decoding exists not to do.
+
+        `wts` is `scores.gather(1, idx)` before renormalisation, i.e. the resident top-k scores in
+        logit order, so `wts[0].sum()` is exactly the denominator the routed weights are divided
+        by and `wts[0].flip(0)[:n]` is the j-th weakest resident pick -- the one candidate j would
+        displace. See engine/escape.py for the definition of the margin.
+
+        Every op has a static shape and reads only tensors that already exist: no `.item()`, no
+        host branch on a tensor value, so this captures with the rest of layer A.
+        """
+        n = self.esc_n
+        cand_lg, cand = raw[0].masked_fill(live, float("-inf")).topk(n)
+        disp_lg = raw[0][idx[0]].flip(0)[:n]     # logits of the picks those candidates displace
+        den = wts[0].sum().clamp_min(1e-20)
+        m = (scores[0][cand] - wts[0].flip(0)[:n]) / den
+        # A candidate the mask did not actually take away -- one the router ranked BELOW the
+        # weakest resident pick -- gets -inf, so the host's single "margin >= threshold" test
+        # covers "was it displaced" as well as "is it worth the read".
+        self.esc_out[0].copy_(cand.float())
+        self.esc_out[1].copy_(torch.where(cand_lg > disp_lg, m, torch.full_like(m, float("-inf"))))
+        self.esc_scores.copy_(scores)
+        self.esc_logits.copy_(raw)
+
+    def _escape_between(self, L):
+        """Host, between layer A and layer B: read the decision, fetch, and re-route if it fired.
+
+        The 8n-byte read is this path's only host sync per layer, and it is why arming the hatch
+        gives up the merged graph segments: the decision needs the router's output of layer L and
+        the expert it fetches has to be live before layer L's MoE, which is the next thing queued.
+        The measured cost of going back to per-layer graphs is +0.6 ms on a 146.6 ms step
+        (RESULTS.md 2.11); the fetch itself is the part that is not free.
+        """
+        self.esc_host.copy_(self.esc_out)
+        cands = [int(c) for c in self.esc_host[0].tolist()]
+        if self.esc.admit(L, cands, self.esc_host[1].tolist()):
+            self._reroute(L)
+
+    def _reroute(self, L):
+        """Redo layer L's routing with the patched mask. Same arithmetic as `_layer_a`, eagerly.
+
+        An escape sets the expert's bit in `prune_mask[L]`, so this is simply the routing the
+        graph would have produced had the expert been resident all along: the same masked_fill,
+        the same topk, the same gather, the same renormalisation, on the same two buffers the
+        graph wrote. It runs for every row of the block, not only the row that asked -- the expert
+        is physically in the arena now, and a token that routes to it is a token getting the pick
+        the router actually named.
+        """
+        a = self.a
+        pm = self.m.prune_mask
+        idx = self.esc_logits.masked_fill(~pm[L], float("-inf")).topk(a.n_activated_experts, dim=-1)[1]
+        wts = self.esc_scores.gather(1, idx)
+        wts = wts / (wts.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
+        self.route_idx.copy_(idx)
+        self.route_w.copy_(wts)
 
     def _layer_b(self, L):
         a = self.a
@@ -504,9 +601,11 @@ class FastDecoder:
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
         st = {"parity": S_parity, "ckv": None, "ik": None, "ratio": 0}
-        if self.lut is not None and GRAPH_SEGMENTS:
+        if self.lut is not None and GRAPH_SEGMENTS and self.esc is None:
             # Resident mode: routing is a device LUT lookup, so the ONLY host dependency inside a
-            # step is the Engram rows of layers 1 and 14. Capture the layers between those
+            # step is the Engram rows of layers 1 and 14. (With the escape hatch armed there is a
+            # second one -- the per-layer escape decision -- so that configuration takes the
+            # per-layer A/B graphs below instead.) Capture the layers between those
             # boundaries as single graphs -- 41 replays per step become 3 -- and keep the overlap:
             # a segment is queued asynchronously, so the host blocks on the next boundary's NVMe
             # reads while the GPU is still running the segment before it.
@@ -528,7 +627,7 @@ class FastDecoder:
             torch.cuda.synchronize()
             return
         for L in range(self.a.n_layers):
-            if self.lut is not None:
+            if self.lut is not None and self.esc is None:
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g, pool=self.pool):
                     self._layer_ab(L, st)
@@ -556,6 +655,19 @@ class FastDecoder:
         # host: expert ids -> arena slots (loads misses from NVMe). route_slot, not route_idx: in
         # `drop` a non-resident pick must never be resolved -- that is exactly the NVMe read the
         # weight of 0 is there to avoid paying for.
+        if self.esc is not None:
+            # Armed: decide, maybe fetch, maybe re-route -- before the slots are read, because a
+            # fetched expert has to be in the table this gather reads. Then the LUT gather that
+            # `_layer_ab` does inside its own graph, which the armed engine cannot use because it
+            # needs the host between a layer's router and its MoE. Same table, same result.
+            # The whole branch is inside `esc is not None` so the disarmed path -- including
+            # DSV41_GRAPHS=0, where a LUT and this function coexist -- keeps `store.resolve` and
+            # the hit/LRU bookkeeping that goes with it, unchanged. (The engine refuses to arm
+            # without a LUT: see V41Engine.__init__.)
+            self._escape_between(L)
+            if self.lut is not None:
+                self.slots.copy_(self.lut[L][self.route_slot])
+                return
         idx = self.route_slot
         slots = self.m.store.resolve(L, idx, False)
         self.slots.copy_(slots)

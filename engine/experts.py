@@ -132,6 +132,13 @@ class ExpertStore:
         self.transient_index = {s: i for i, s in enumerate(self.transient_ring)}
         self.transient_pos = 0
         self.transient_map: dict[tuple, int] = {}
+        # Called with the (layer, expert) key whose slot the transient ring is about to recycle.
+        # The escape hatch (engine/escape.py) owns a router mask bit and a device LUT entry for
+        # every expert it fetched into this ring, and both have to be withdrawn the moment the
+        # slot underneath them is handed to someone else -- a mask bit whose LUT entry has gone
+        # back to -1 is how a gather reaches an out-of-range slot. Nothing else sets this, and
+        # with it unset `_transient_slot_for` is unchanged.
+        self.on_transient_evict = None
         io_threads = int(os.environ.get("DSV41_IO_THREADS", io_threads))
         if read_threads is None:
             read_threads = int(os.environ.get("DSV41_READ_THREADS", 24))
@@ -320,6 +327,8 @@ class ExpertStore:
         old = self.slot_key.pop(slot, None)
         if old is not None:
             self.transient_map.pop(old, None)
+            if self.on_transient_evict is not None:
+                self.on_transient_evict(old)
         prev = self.transient_map.get(key)
         if prev is not None and prev != slot:  # stale mapping from an earlier, recycled slot
             self.slot_key.pop(prev, None)
@@ -421,6 +430,29 @@ class ExpertStore:
             self.stats["load_s"] += time.perf_counter() - t0
         self.stats["resolve_s"] += time.perf_counter() - t_res
         return slots
+
+    def escape_fetch(self, layer: int, expert: int):
+        """Stream ONE non-resident expert into the transient ring and return (slot, bytes, seconds).
+
+        This is the escape hatch's fetch (engine/escape.py, `EscapeRuntime` in
+        engine/v41_engine.py). It is deliberately not `resolve()`: a decode miss there takes an
+        LRU slot, and in the pruned all-resident mode the hatch runs in, every LRU slot holds a
+        keep-set expert that the router is still masked to. Evicting one to make room for an
+        expert the keep-set rejected would shrink the shipped keep-set behind the operator's back.
+        The transient ring is the right home for it -- it is otherwise idle in that mode, since
+        nothing routable ever misses.
+
+        Synchronous on purpose. The caller needs the expert live in the arena before the MoE of
+        the layer it is deciding for, and that MoE is the next thing queued. What this costs is
+        the whole question the hatch exists to answer, so it is measured here and reported per
+        escape (`escape_ms_each`) rather than estimated.
+        """
+        key = (int(layer), int(expert))
+        t0 = time.perf_counter()
+        b0 = self.stats["bytes_read"]
+        slot = self._transient_slot_for(key)
+        self._load_into_slot(key, slot)
+        return slot, self.stats["bytes_read"] - b0, time.perf_counter() - t0
 
     def warm_start(self, ranked_keys: list[tuple], log=print):
         """Fill the LRU with `ranked_keys` (most important first) up to capacity."""
