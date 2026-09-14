@@ -196,6 +196,113 @@ verifies them. It is lossless, so a speculative run and a plain run differ in sp
 `SPEC=0` gives the A/B baseline and is the first thing to turn off when chasing a numerics
 problem.
 
+## Fine-tuning the drafter
+
+The verify step costs ~145 ms and does not care what it is verifying, so served tok/s is
+`accept_len_mean / 0.145` and nothing else. That makes the drafter's acceptance the only decode
+lever left, and it is workload-shaped: ~5 accepted tokens a step on markup against ~2.5 on prose
+([`RESULTS.md`](../RESULTS.md) §4.3). Draft trees, an EAGLE-style head and adaptive draft lengths
+were all measured out. What remains is the head itself — trained by its author on its author's
+data, and adaptable to what this target actually emits.
+
+The recipe is **FastMTP** (Red Hat / vLLM, 2026-09): start from the shipped `mtp.*` weights, freeze
+the target, share the full unreduced LM head, run a teacher-forced loop that mirrors serving, and
+weight the draft steps by an exponentially decayed loss (`beta = 0.6`). Three pieces implement it.
+
+### 1. The recorder — `DSV41_RECORD_DRAFT_DATA=<dir>`
+
+Everything the fine-tune needs is computed and discarded on every decode step. With the variable
+set, the decode loop appends it to a per-request shard (`engine/draft_record.py`):
+
+| per settled position | bytes |
+|---|---|
+| the target's last hidden state, bf16 — `main_hidden` [15360], the concatenated attention inputs of layers 37/38/39 | 30,720 |
+| the token the target settled on | 4 |
+| the target's next-token top-32: ids + logit values | 256 |
+| position and flags | 8 |
+| **per record** | **30,988** |
+
+300,000 recorded positions = **9.3 GB**, plus the prompt tail: the drafter's window is 128
+positions, so the last 128 prompt positions of every request are recorded too (hidden states only,
+no distribution — prefill computes logits for the last position alone). Without them only the tail
+of a 175-token generation would have a full window and three quarters of the data would be
+unusable.
+
+Recording `main_hidden` *before* `main_proj` is deliberate: `main_proj` is the drafter's entire
+interface to the target (`Model.dspark_seed`), so keeping the pre-projection state is what makes it
+trainable. It costs 3× the bytes of the projected [5120] state.
+
+With the variable unset the module is never imported and the decode loop runs one `is not None`
+test per verified block. The arithmetic of a step is unchanged either way.
+
+### 2. The data run — `tools/draft_data_gen.py`
+
+Streams passages out of `corpus/` and asks the running server for 150–200 token continuations with
+thinking off, until `--tokens` (300,000 by default) have been settled. The mix is 75 % prose and
+reasoning — the registers where the drafter is weak — and 25 % code and markup, which is not
+balance for its own sake: a head fine-tuned on prose alone is free to forget the register where it
+already accepts five tokens a step, and that register is where most of the tok/s is.
+`corpus/heldout_sources/` is never sampled; it is what the teacher-forced numbers are measured on.
+At the served batch-1 rate of ~17 tok/s, 300,000 tokens is **about five hours**, which the tool
+prints before its first request. It resumes.
+
+### 3. The trainer — `tools/train_mtp.py`
+
+Runs on the box with the engine stopped and the target never loaded: it trains the three MTP blocks
+against recorded hidden states. One DSpark draft is a single forward over the whole block — the ids
+are `[t, noise, noise, noise, noise]`, the attention sees a 128-position window of the target's
+hidden states plus the block's own five positions, and the only serial dependence is the rank-256
+Markov head chained through the drafter's own predictions — so the trained loop is exactly
+`engine/fastdecode.py::_draft` in autograd-friendly torch. Per draft step d:
+
+```
+L_d = 0.6^d * ( KL(target top-32 || draft)  +  CE(draft_d, the token the target settled on) )
+```
+
+The decay is not a taste: acceptance is a leading-prefix quantity, so a draft that is right at step
+4 and wrong at step 1 accepts nothing.
+
+What is trained and what is not is decided by memory. The drafter's own routed experts are
+3 × 128 × 35.4 M = 13.6 G parameters — 7.2 GB packed FP4, 27.2 GB dequantized — and they are frozen:
+their gradient and AdamW state would be another 190 GB. The 636 M dense parameters are trained in
+fp32 masters. The budget, which `--plan` prints from the checkpoint headers before anything is
+allocated:
+
+| | GB |
+|---|---|
+| frozen DSpark routed experts (bf16) | 27.2 |
+| frozen embed + LM head (bf16) | 2.6 |
+| trainable dense parameters (fp32), 636 M | 2.5 |
+| AdamW grad + two moments | 7.6 |
+| casts, activations, logits, workspace | ~3.7 |
+| **total** | **~43** |
+
+which fits the ~120 GB the box has *while the engine is not running*. The two cannot share it.
+
+The output is `mtp_finetuned.safetensors` — only the trained tensors, bf16, under the checkpoint's
+own names — and `DSV41_MTP_WEIGHTS=<path>` loads it instead of the shipped head, re-quantizing each
+tensor into the format the shipped path serves in (fp8, then FP4 for whichever groups
+`DSV41_DENSE_FP4` names), so the draft graph reads the same bytes per step and its speed does not
+move. Tensors the file does not name come from the checkpoint.
+
+### What this can cost
+
+Acceptance is verified, so a worse drafter cannot corrupt the output — it can only be slower. The
+risks are all of that shape, and `tools/verify_mtp.sh` is what measures them: it serves the
+fine-tuned head on the Frontend keep-set at 0.36, reports `accept_len_mean` and tok/s for one prose
+and one markup prompt, and then runs the Frontend and Writing generation gates.
+
+* **Markup drift.** The head has one set of weights for every register. Prose gains can come
+  straight out of the 5.07 markup row, and the net would be a loss.
+* **The quantization round trip.** Training is bf16; serving is fp8/fp4. The trainer reports the
+  acceptance proxy after putting every trained tensor through the same fp8 round trip the engine
+  does on load — a fine-tune that only survives in bf16 does not ship.
+* **Training on the drafter's own output.** The recorded data is what the target settled on *under
+  speculative decoding*, so positions the drafter guessed well are over-represented. `SPEC=0` while
+  recording removes that at a third of the collection rate.
+* **The proxy is greedy.** Top-1 agreement is exactly what greedy verification tests, and exactly
+  what sampled rejection verification does not.
+
 ## Chunk invariance, and what it cost
 
 The engine is **bit-exact under chunking** for sequences ≤ 512 tokens: for every splitting

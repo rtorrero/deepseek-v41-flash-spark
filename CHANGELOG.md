@@ -102,6 +102,70 @@ so there is no measured long generation and no thinking-mode figure in this repo
 The earlier bring-up figures in `NOTES.md` taken on a 20 GB debug arena (6.9 % of the
 routed experts) are a measurement of that arena, not of the recipe — do not quote them.
 
+## 0.6.0-wip — 2026-09-15
+
+**The drafter becomes something you can train.** The verify step is ~145 ms and flat across
+workloads, so served tok/s is `accept_len_mean / 0.145` and nothing else — and acceptance is
+workload-shaped: about 5 accepted tokens a step on markup against 2.5 on prose (RESULTS.md §4.3).
+Draft trees, an EAGLE-style head and adaptive draft lengths were measured and did not pay. What is
+left is the shipped MTP head itself, and this tag adds the whole path to fine-tuning it on the
+target's own outputs. **Nothing measured yet**: the default is the shipped head, unchanged to the
+bit, and no acceptance number in this repository moves until a fine-tuned head passes
+`tools/verify_mtp.sh`.
+
+### Added
+- **`DSV41_RECORD_DRAFT_DATA=<dir>`** — record what a fine-tune needs while the server decodes
+  normally. Per settled position: the target's last hidden state (`main_hidden`, bf16 [15360] — the
+  drafter's entire view of the target, kept *before* `main_proj` so that projection stays
+  trainable), the token the target settled on, and its top-32 next-token logits. 30,988 bytes a
+  position, so 300,000 positions is 9.3 GB; the last 128 prompt positions of every request are
+  recorded too, because the drafter's window is 128 and without them only the tail of a 175-token
+  generation would be usable. One shard per request, with a manifest, in `engine/draft_record.py`.
+  Unset — the default — and the module is never imported and the decode loop runs one `is not None`
+  test per verified block; the arithmetic of a step is byte-identical either way.
+- **`tools/draft_data_gen.py`** — the data run. Streams passages out of `corpus/` against the
+  running server and asks for 150–200 token continuations with thinking off until `--tokens`
+  (300,000) have been settled. 75 % prose and reasoning — the registers where the drafter is weak —
+  and 25 % code and markup so the head does not forget the register where it already accepts five
+  tokens a step. `corpus/heldout_sources/` is never sampled: it is what every teacher-forced number
+  in RESULTS.md is measured on. Prints the wall clock before the first request (~5 h for 300k
+  tokens at the served 17 tok/s), logs every request, and resumes.
+- **`tools/train_mtp.py`** — FastMTP (Red Hat / vLLM, 2026-09) on one GPU with the target never
+  loaded. Starts from the shipped `mtp.*`, shares the full unreduced LM head, and trains the loop
+  serving actually runs — the block forward over a window of recorded target hidden states, with
+  the rank-256 Markov chain — under an exponentially decayed per-step loss (`beta = 0.6`) of
+  forward KL against the target's top-32 plus cross-entropy on the token it settled on. The decay
+  is not a taste: acceptance is a leading-prefix quantity. The drafter's own 13.6 G routed-expert
+  parameters are frozen (27.2 GB resident as bf16; their gradient and AdamW state would be another
+  190 GB) and the 636 M dense ones are trained. `--plan` prints the whole ~43 GB budget from the
+  checkpoint's headers before anything is allocated, and the run refuses to start if the box has
+  less free — this and the engine cannot share the box. Reports the acceptance proxy (top-1
+  agreement per draft step, held out by shard) before, after, and after the fp8 round trip the
+  engine does on load.
+- **`DSV41_MTP_WEIGHTS=<path>`** — serve a fine-tuned head instead of the checkpoint's. Per tensor:
+  what the file does not name comes from the checkpoint. Each tensor is re-quantized on load into
+  the format the shipped path serves in (fp8, then FP4 for the `DSV41_DENSE_FP4` groups), so a
+  fine-tuned head reads exactly as many bytes per draft as the shipped one and the speed of the
+  draft graph does not move. Unset = the shipped head.
+- **`tools/verify_mtp.sh`** — the number that decides anything. Serves the head on the Frontend
+  keep-set at `PRUNE_KEEP=0.36`, reports `accept_len_mean` and tok/s for one prose and one markup
+  prompt (the second is the one that must not regress), then runs the Frontend and Writing
+  generation gates with thinking on. Records everything under `results/mtp/<stamp>/`,
+  log in `/tmp/mtp.log`.
+- **Three more checks.** `tools/test_draft_data_gen.py` needs no torch: the corpus mix and its
+  determinism, the held-out exclusion, the 30,988-byte record layout and the manifest, and which
+  recorded positions can be trained on at all. `engine/test_draft_record.py` and
+  `tools/test_train_mtp.py` need torch and skip themselves without it: the shard's bfloat16 round
+  trip and the rows a verified block may record, and the FastMTP loop on a 32-dimensional toy head
+  — every trainable tensor gets a gradient, twenty steps overfit one batch, and the acceptance
+  proxy counts a leading prefix rather than a per-step mean.
+
+### Documentation
+- [`docs/architecture.md`](docs/architecture.md) gains "Fine-tuning the drafter": the data format
+  and its size, the training loop as implemented, the memory budget, and what a fine-tune can cost
+  — markup drift, the bf16→fp8 round trip, data shaped by the drafter that produced it, and a
+  greedy proxy for a sampled path.
+
 ## 0.5.0 — 2026-09-14
 
 **Choosing what the box is good at becomes a thing you can see.** About 40 % of the routed experts
