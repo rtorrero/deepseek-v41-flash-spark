@@ -1109,6 +1109,15 @@ def report(rows, name, topics, silent, args, card) -> str:
     out.append(f"| keep-set | {cfg} |" if cfg else
                "| keep-set | not recorded — PRUNE_KEEP and the ranking pair were not in the "
                "environment of this run |")
+    # The reasoning-span controls change what a think block is ALLOWED to do, so a run with them
+    # on and one without are not the same measurement either. Read from the same environment as
+    # the keep-set; a per-request override is invisible here and has to be named in the row.
+    guards = ", ".join(f"{k}={os.environ[k]}" for k in
+                       ("DSV41_THINK_BUDGET", "DSV41_THINK_REPEAT_BREAK")
+                       if os.environ.get(k, "").strip() not in ("", "0"))
+    out.append(f"| reasoning-span controls | {guards} |" if guards else
+               "| reasoning-span controls | off (neither DSV41_THINK_BUDGET nor "
+               "DSV41_THINK_REPEAT_BREAK was set) |")
     out += ["",
             "| prompt | thinking | finish | reasoning | answer | s | | why |",
             "|---|---|---|---|---|---|---|---|"]

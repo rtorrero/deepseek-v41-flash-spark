@@ -14,9 +14,9 @@ sees, and how to point a normal OpenAI client at it.
 |---|---|
 | `GET /health` | `{"status","engine","busy","max_context","engine_config"}` — and `engine_config` is the point of it: `arena_gb`, `arena_slots`, `lru_slots`, `transient_slots`, `resident_expert_pct`, `max_seq`, `spec`, `trace_stats`, `kernel`, `act_quant`. A benchmark never has to be *told* how the server was started |
 | `GET /v1/models`, `GET /v1/models/{id}` | one model card, id = `SERVED_MODEL_NAME` (`deepseek-v4.1-flash`) |
-| `POST /v1/chat/completions` | the main one. `messages`, `tools`, `tool_choice`, `response_format`, `stream`, `stream_options.include_usage`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `stop`, `seed`, `ignore_eos`, plus the thinking controls below |
+| `POST /v1/chat/completions` | the main one. `messages`, `tools`, `tool_choice`, `response_format`, `stream`, `stream_options.include_usage`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `stop`, `seed`, `ignore_eos`, `no_repeat_ngram`, plus the thinking and reasoning-span controls below |
 | `POST /v1/completions` | raw `prompt` (string or token ids). No chat template, no thinking parsing — the text comes back verbatim |
-| `POST /v1/debug/prompt` | same body as chat; returns the rendered prompt, its token ids and the resolved thinking/effort **without touching the engine**. On this recipe a prefill is minutes of NVMe streaming, so this is how the benchmark measures prompt lengths |
+| `POST /v1/debug/prompt` | same body as chat; returns the rendered prompt, its token ids and the resolved thinking/effort/reasoning controls **without touching the engine**. On this recipe a prefill is minutes of NVMe streaming, so this is how the benchmark measures prompt lengths |
 
 Rejected with HTTP 400: `n > 1`, images, `logprobs`. Errors are OpenAI-shaped
 (`{"error": {"message","type","param","code"}}`); a failure mid-stream arrives as a
@@ -54,6 +54,43 @@ That mapping exists because clients disagree about how to ask. A UI that sends
 `reasoning_effort: "high"` and nothing else gets thinking; one that sends
 `chat_template_kwargs: {"thinking": false}` gets chat mode whatever else it says.
 
+## Reasoning-span controls
+
+Two guards over the think block, **both off by default**, both ignored by a request with
+thinking off (there is no reasoning span to guard).
+
+| field | also accepted as | env default | what it does |
+|---|---|---|---|
+| `reasoning_budget` | `reasoning.max_tokens`, `chat_template_kwargs.reasoning_budget` | `DSV41_THINK_BUDGET` | tokens of reasoning after which the decode loop forces `</think>` and continues as the answer. `0` = off |
+| `think_repeat_break` | `chat_template_kwargs.think_repeat_break` | `DSV41_THINK_REPEAT_BREAK` | n-gram length. Inside the think block only: when the last n tokens repeat a window already seen twice in this reasoning span, the tokens that continued the earlier copies are masked, so a third copy cannot be extended. `0` = off, `2`-`128` otherwise |
+
+Why they exist: with thinking on, a run that passes this repo's generation gate deliberates
+for about 4,000 reasoning tokens and a run that fails deliberates for about 19,000. The
+Backend keep-set at keep 0.36 answered all ten of its prompts correctly but restated itself
+3-8 times on seven of them, at 18-38k reasoning tokens; a whole-page prompt on the Frontend
+keep-set spent 15,241 reasoning tokens on a "Maybe add X? Skip." loop and returned nothing
+([`RESULTS.md`](../RESULTS.md) §5.4 and the 2026-09-14 addenda). The failure is not that the
+model cannot answer, it is that it will not stop thinking.
+
+The budget is enforced in the decode loop, not by truncating text afterwards: the close token
+is masked into the next step (and on the speculative path the drafts are rejected so the step
+emits it), which is why the answer that follows is a real continuation rather than a cut. It
+is checked once per step, and a speculative step settles up to six tokens, so the span can
+overrun the budget by a few tokens; `reasoning_tokens` reports the real length.
+
+When the budget fires, the response says so — `usage.completion_tokens_details` carries
+`reasoning_budget_hit: true` alongside `reasoning_tokens`, the field is absent otherwise, and
+the server logs one line per request. `x_engine_stats.think_controls` reports what each
+control did (`budget_forced`, `repeat_breaks`, `banned_tokens`, `mask_s`).
+
+The loop breaker is deliberately not the answer-side `no_repeat_ngram`: an n-gram ban over an
+answer was refuted here, because CSS repeats `px`, `0` and `}` legitimately and the ban
+destroys it. Inside a think block there is no such register.
+
+```jsonc
+{"reasoning_effort": "high", "reasoning_budget": 8000, "think_repeat_break": 12}
+```
+
 ## Streaming, and `reasoning_content`
 
 Chat deltas put text generated **before** `</think>` in `reasoning_content` and text after
@@ -66,7 +103,8 @@ Other stream details worth knowing:
 
 * Token bursts are detokenised incrementally and text is released only when the decode is
   stable, so a multi-byte UTF-8 character is never split across two deltas.
-* `usage.completion_tokens_details.reasoning_tokens` counts the tokens before `</think>`.
+* `usage.completion_tokens_details.reasoning_tokens` counts the tokens before `</think>`, and
+  carries `reasoning_budget_hit: true` beside it when a `reasoning_budget` ended the reasoning.
 * `x_engine_stats` rides on non-stream responses and on the final SSE chunk (the one with
   `finish_reason`). It is `Engine.stats()` — hit rate, NVMe GB, engram rows, accepted
   length, the attention/MoE split — plus `server_completion_tok_per_s`. On a recipe that

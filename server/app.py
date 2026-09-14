@@ -37,6 +37,7 @@ for _p in (HERE, REPO_ROOT):
         sys.path.insert(0, _p)
 
 from engine_api import Engine, MockEngine  # noqa: E402
+from think_controls import MAX_NGRAM, MIN_NGRAM, make_controls  # noqa: E402
 from tool_grammar import TOOL_CALLS_MARKER, make_factory  # noqa: E402
 
 log = logging.getLogger("dsv41.server")
@@ -45,6 +46,9 @@ THINK_END = "</think>"
 EFFORT_ALIASES = {"low": 50, "medium": 60, "high": 75, "xhigh": 90, "max": 100}
 NO_THINKING_EFFORTS = {"none", "low"}
 DEFAULT_MAX_TOKENS = 4096
+# The reasoning budget is a token count, so it is bounded by the largest context
+# this engine can be built with rather than by anything of its own.
+MAX_REASONING_BUDGET = 1 << 22
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_TOP_P = 0.95
 
@@ -242,6 +246,75 @@ def resolve_thinking(body: dict, default_thinking: bool, default_effort: int) ->
     if effort is None:
         effort = default_effort
     return thinking, effort
+
+
+def _positive_int(key: str, value, lo: int, hi: int) -> int:
+    """A request field that is 0 (off) or an integer in [lo, hi]."""
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise APIError(400, f"`{key}` must be an integer", param=key)
+    if value and not (lo <= value <= hi):
+        raise APIError(400, f"`{key}` must be 0 (off) or within [{lo}, {hi}]", param=key)
+    return int(value)
+
+
+def resolve_reasoning_controls(body: dict) -> Tuple[int, int]:
+    """Return (reasoning_budget, think_repeat_break) for this request; 0 = off.
+
+    Both are decode-side controls over the reasoning span only (see
+    ``server/think_controls.py`` for what they do and the measurements that
+    motivate them), and both default from the environment so an operator can
+    turn them on for a whole deployment without touching any client:
+    ``DSV41_THINK_BUDGET`` and ``DSV41_THINK_REPEAT_BREAK``.
+
+    Precedence, first match wins:
+
+    budget       ``reasoning_budget`` -> ``reasoning.max_tokens``
+                 -> ``chat_template_kwargs.reasoning_budget`` -> the environment
+    repeat break ``think_repeat_break``
+                 -> ``chat_template_kwargs.think_repeat_break`` -> the environment
+    """
+    ctk = body.get("chat_template_kwargs") or {}
+    if not isinstance(ctk, dict):
+        raise APIError(400, "`chat_template_kwargs` must be an object", param="chat_template_kwargs")
+    reasoning = body.get("reasoning")
+    if reasoning is not None and not isinstance(reasoning, dict):
+        raise APIError(400, "`reasoning` must be an object", param="reasoning")
+
+    budget = None
+    for key, src in (("reasoning_budget", body), ("max_tokens", reasoning or {}),
+                     ("reasoning_budget", ctk)):
+        if src.get(key) is not None:
+            budget = _positive_int("reasoning_budget", src[key], 1, MAX_REASONING_BUDGET)
+            break
+    if budget is None:
+        budget = _env_int("DSV41_THINK_BUDGET", "reasoning_budget", 1, MAX_REASONING_BUDGET)
+
+    nrb = None
+    for src in (body, ctk):
+        if src.get("think_repeat_break") is not None:
+            nrb = _positive_int("think_repeat_break", src["think_repeat_break"], MIN_NGRAM, MAX_NGRAM)
+            break
+    if nrb is None:
+        nrb = _env_int("DSV41_THINK_REPEAT_BREAK", "think_repeat_break", MIN_NGRAM, MAX_NGRAM)
+    return budget, nrb
+
+
+def _env_int(var: str, key: str, lo: int, hi: int) -> int:
+    """An operator default out of the environment. A bad value is worth a log
+    line and a 0, not a 500 on every request."""
+    raw = os.environ.get(var, "").strip()
+    if not raw:
+        return 0
+    try:
+        v = int(raw)
+    except ValueError:
+        v = -1
+    if v < 0 or (v and not (lo <= v <= hi)):
+        log.warning("%s=%r is not 0 or an integer in [%d, %d]; %s is off", var, raw, lo, hi, key)
+        return 0
+    return v
 
 
 _IMAGE_BLOCK_TYPES = {"image", "image_url", "input_image"}
@@ -447,6 +520,7 @@ class GenerationResult:
         self.router: Optional[OutputRouter] = None
         self.stats: dict = {}
         self.degenerate = False   # cut off because it had stopped saying anything new
+        self.reasoning_budget_hit = False   # the decode loop was made to close the think block
 
 
 class State:
@@ -482,7 +556,8 @@ class State:
 
     def generate(self, prompt_ids: List[int], sampling: dict, *, thinking: bool,
                  detect_tool_calls: bool, result: GenerationResult,
-                 tools: Optional[List[dict]] = None) -> Iterator[Tuple[str, str]]:
+                 tools: Optional[List[dict]] = None,
+                 reasoning_budget: int = 0, think_repeat_break: int = 0) -> Iterator[Tuple[str, str]]:
         """Drive the engine; yield (kind, text) events; fill ``result`` at the end.
 
         The caller must hold ``self.lock``.
@@ -514,6 +589,15 @@ class State:
                             no_repeat_ngram=sampling["no_repeat_ngram"])
             if pen.active:
                 gen_kwargs["penalties"] = pen
+        # Reasoning-span controls. Only a thinking request has a reasoning span, and only an
+        # engine that can mask its own sampling can be made to close one, so both conditions gate
+        # the object -- with either missing the request decodes exactly as it did before.
+        think = None
+        if thinking and getattr(self.engine, "supports_think_controls", False):
+            think = make_controls(self.think_end_id, budget=reasoning_budget,
+                                  repeat_ngram=think_repeat_break)
+            if think is not None:
+                gen_kwargs["think"] = think
         # The gate constrains nothing until the model opens a tool-calls block, so it costs a
         # dictionary lookup per step on a request that never calls a tool. A request with no
         # tools (or with tool-call detection off) gets the plain-text gate instead: there is no
@@ -622,6 +706,16 @@ class State:
         except Exception as e:  # engine stats must never break a response
             log.warning("engine.stats() failed: %s", e)
             result.stats = {}
+        if think is not None:
+            result.reasoning_budget_hit = think.budget_hit
+            result.stats["think_controls"] = dict(think.stats)
+            if think.budget_hit:
+                # One line per request, because this is a silent intervention: the answer that
+                # comes back was written from a deliberation that was cut, not one that ended.
+                log.info("reasoning budget hit: forced </think> after %d reasoning tokens "
+                         "(budget %d, repeat-break n=%d fired %d times)",
+                         think.reasoning_tokens, think.budget, think.repeat_ngram,
+                         think.stats["repeat_breaks"])
         if gate is not None:
             st = dict(gate.stats)
             st["mask_ms_per_call"] = round(st["mask_s"] / st["mask_calls"] * 1e3, 3) if st["mask_calls"] else None
@@ -799,11 +893,16 @@ class State:
 # ---------------------------------------------------------------------------
 
 def usage_dict(prompt_tokens: int, result: GenerationResult) -> dict:
+    details: Dict[str, Any] = {"reasoning_tokens": result.reasoning_tokens}
+    if result.reasoning_budget_hit:
+        # Only when it fired: a caller reading this field is being told that the reasoning was
+        # ended by the server and not by the model, which is a different answer to explain.
+        details["reasoning_budget_hit"] = True
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": len(result.gen_ids),
         "total_tokens": prompt_tokens + len(result.gen_ids),
-        "completion_tokens_details": {"reasoning_tokens": result.reasoning_tokens},
+        "completion_tokens_details": details,
     }
 
 
@@ -947,9 +1046,11 @@ class Handler(BaseHTTPRequestHandler):
     def _debug_prompt(self, body: dict) -> None:
         st = self.state
         thinking, effort = resolve_thinking(body, st.args.default_thinking, st.args.default_effort)
+        budget, repeat_break = resolve_reasoning_controls(body)
         prompt, ids, tools = build_chat_prompt(body, st.enc, st.tok, thinking, effort)
         body_out = {"thinking": thinking, "reasoning_effort": effort, "prompt": prompt,
-                    "prompt_ids": ids, "prompt_tokens": len(ids)}
+                    "prompt_ids": ids, "prompt_tokens": len(ids),
+                    "reasoning_budget": budget, "think_repeat_break": repeat_break}
         if tools and st.grammars is not None:
             from tool_grammar import build_tool_grammar  # noqa: PLC0415 - debug endpoint only
             body_out["tool_grammar"] = build_tool_grammar(tools)
@@ -959,6 +1060,7 @@ class Handler(BaseHTTPRequestHandler):
         st = self.state
         sampling = parse_sampling(body)
         thinking, effort = resolve_thinking(body, st.args.default_thinking, st.args.default_effort)
+        reasoning_budget, think_repeat_break = resolve_reasoning_controls(body)
         _, prompt_ids, tools = build_chat_prompt(body, st.enc, st.tok, thinking, effort)
         stream = bool(body.get("stream", False))
         include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
@@ -976,7 +1078,8 @@ class Handler(BaseHTTPRequestHandler):
         with st.lock:
             if not stream:
                 for _ in st.generate(prompt_ids, sampling, thinking=thinking, detect_tool_calls=True,
-                                     result=result, tools=tools):
+                                     result=result, tools=tools, reasoning_budget=reasoning_budget,
+                                     think_repeat_break=think_repeat_break):
                     pass
                 router = result.router
                 message: Dict[str, Any] = {"role": "assistant", "content": router.content}
@@ -999,7 +1102,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self._sse(chunk({"role": "assistant", "content": ""}))
                 for kind, text in st.generate(prompt_ids, sampling, thinking=thinking,
-                                              detect_tool_calls=True, result=result, tools=tools):
+                                              detect_tool_calls=True, result=result, tools=tools,
+                                              reasoning_budget=reasoning_budget,
+                                              think_repeat_break=think_repeat_break):
                     self._sse(chunk({"reasoning_content": text} if kind == "reasoning" else {"content": text}))
                 if result.tool_calls:
                     self._sse(chunk({"tool_calls": [dict(tc, index=i) for i, tc in enumerate(result.tool_calls)]}))

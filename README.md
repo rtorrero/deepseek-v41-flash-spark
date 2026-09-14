@@ -314,6 +314,14 @@ Effort* control sends the top-level field, so setting it to `medium` or higher t
 on by itself. Change the default for every request with `DEFAULT_THINKING=on` /
 `DEFAULT_EFFORT=90` in `.env`.
 
+**Two guards over the think block, off by default.** A gate run that passes deliberates for about
+4,000 reasoning tokens and one that fails for about 19,000, so `reasoning_budget` (env
+`DSV41_THINK_BUDGET`) caps the span — the decode loop forces `</think>` when the budget is spent
+and the answer is written from the deliberation so far — and `think_repeat_break` (env
+`DSV41_THINK_REPEAT_BREAK`) refuses the token that would extend a third verbatim copy of an
+n-gram *inside the think block only*. Neither touches the answer. Whether they help is being
+measured; see [`docs/openai-api.md`](docs/openai-api.md#reasoning-span-controls).
+
 Two expectations to set before anyone else points a client at it:
 
 * **The first token can take minutes on a cold prompt.** Prefill misses almost every expert and
@@ -327,15 +335,17 @@ Full API reference: [`docs/openai-api.md`](docs/openai-api.md) (operator's view)
 
 ## Reproduce the checks and the trace
 
-Six checks need nothing at all — no GPU, no checkpoint, no torch — so they run anywhere:
+Eight checks need nothing at all — no GPU, no checkpoint, no torch — so they run anywhere:
 
 ```bash
-python3 tools/test_budget.py        # the memory model against two loads this box actually ran
-python3 tools/test_engine_kwargs.py # every launcher kwarg is a parameter the engine has
-python3 tools/test_tune_draw.py     # the tune screen renders at 7 sizes without colliding
-python3 tools/test_atlas_export.py  # the Weight Atlas outlines are the engine's own keep-sets
-python3 tools/test_tune_atlas.py    # the `a` key: legend, popup, and a real loopback fetch
-python3 server/test_server.py       # the HTTP layer against the mock engine
+python3 tools/test_budget.py          # the memory model against two loads this box actually ran
+python3 tools/test_engine_kwargs.py   # every launcher kwarg is a parameter the engine has
+python3 tools/test_tune_draw.py       # the tune screen renders at 7 sizes without colliding
+python3 tools/test_atlas_export.py    # the Weight Atlas outlines are the engine's own keep-sets
+python3 tools/test_tune_atlas.py      # the `a` key: legend, popup, and a real loopback fetch
+python3 server/test_think_controls.py # the reasoning budget and loop breaker, and how a request asks
+python3 engine/test_think_budget.py   # the decode loop calls them at every site it calls the gate at
+python3 server/test_server.py         # the HTTP layer against the mock engine
 ```
 
 The rest need a server or the checkpoint and an interpreter with torch.
@@ -382,7 +392,8 @@ scripts/              entrypoint.sh (the container's start.sh) · download-model
 env.example           every knob, for both paths
 engine/               the serving engine: v41_engine.py (generation loop, DSpark, arena + NVMe
                       store) · model.py · experts.py · engram.py
-server/               OpenAI-compatible front end (app.py), standard library only + 15 e2e tests
+server/               OpenAI-compatible front end (app.py), standard library only + e2e tests
+                      · think_controls.py (the reasoning budget and loop breaker)
 tools/                v41_ref.py (pure-torch reference port) · expert_trace.py · expert_stats.py
                       · engram_rows.py · make_corpus.py · fp4_moe.py (the Triton FP4 MoE kernel)
                       · tune.py + budget.py (the keep-set screen) · keep_for_context.py

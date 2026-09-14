@@ -766,7 +766,7 @@ class V41Engine:
 
     def generate(self, prompt_ids, *, max_tokens=4096, temperature=1.0, top_p=0.95, stop_token_ids=None, seed=None,
                  penalties=None,
-                 ignore_eos=False, grammar=None):
+                 ignore_eos=False, grammar=None, think=None):
         """Yield bursts of new token ids.
 
         ``ignore_eos``: keep decoding until ``max_tokens`` even if EOS/stop ids come up. The
@@ -777,13 +777,20 @@ class V41Engine:
         this loop settles on (``observe``) and is asked to mask the verify block's logit rows
         (``mask_rows``) before the accept/reject decision. It masks nothing until the model starts
         a tool-calls block, and with ``grammar=None`` not one instruction of this loop changes.
+
+        ``think``: optional reasoning-span controls (server/think_controls.py), the same two-call
+        contract as ``grammar`` -- ``observe`` every settled token, ``mask_rows`` before the
+        accept/reject decision. It masks row 0 only, and only between the ``<think>`` the prompt
+        ended with and the ``</think>`` the model writes: a spent reasoning budget forces that
+        close token, and the loop breaker refuses the token that would extend a third verbatim
+        copy of an n-gram of the deliberation. ``think=None`` changes nothing.
         """
         with self.lock:
             yield from self._generate(list(prompt_ids), max_tokens, temperature, top_p, set(stop_token_ids or ()),
-                                      seed, ignore_eos, grammar, penalties)
+                                      seed, ignore_eos, grammar, penalties, think)
 
     def _generate(self, prompt, max_tokens, temperature, top_p, stop_ids, seed, ignore_eos=False, grammar=None,
-                  penalties=None):
+                  penalties=None, think=None):
         if seed is not None:
             torch.manual_seed(seed)
         stop_ids = set() if ignore_eos else (set(stop_ids) | {self.eos_token_id})
@@ -805,7 +812,7 @@ class V41Engine:
         t_decode0 = t_start
         try:
             yield from self._decode_loop(ids, P, max_tokens, temperature, top_p, stop_ids,
-                                         _st := {}, grammar, penalties)
+                                         _st := {}, grammar, penalties, think)
         finally:
             n_out = _st.get("n_out", n_out)
             steps = _st.get("steps", steps)
@@ -846,7 +853,8 @@ class V41Engine:
                 "promoted": st["promoted"],
             }
 
-    def _decode_loop(self, ids, P, max_tokens, temperature, top_p, stop_ids, out_st, grammar=None, penalties=None):
+    def _decode_loop(self, ids, P, max_tokens, temperature, top_p, stop_ids, out_st, grammar=None, penalties=None,
+                     think=None):
         m = self.model
         t_start = time.perf_counter()
         out_st["t_decode0"] = t_start
@@ -872,6 +880,8 @@ class V41Engine:
         t_prefill = time.perf_counter() - t_start
         out_st["t_prefill"] = t_prefill
         pen = penalties if (penalties is not None and penalties.active) else None
+        # Same shape as `pen`: an inactive object costs nothing per step.
+        th = think if (think is not None and think.active) else None
         p = sample_probs(logits[-1], temperature, top_p)
         tok = int(torch.multinomial(p, 1)) if temperature > 0 else int(p.argmax())
         out = [tok]
@@ -889,6 +899,8 @@ class V41Engine:
         # tokens to write), but it has to see every settled token to stay in step with the stream.
         if grammar is not None:
             grammar.observe([tok])
+        if th is not None:
+            th.observe([tok])
         yield [tok]
         while n_out < max_tokens and tok not in stop_ids:
             if ph is not None:
@@ -945,6 +957,12 @@ class V41Engine:
                         ph.mark("grammar")
                 if pen is not None:
                     pen.apply(logits, out)
+                # Last, and on row 0 only: a forced </think> has to survive the penalties (a
+                # cycle or n-gram ban on that very token would leave the row all -inf), and row 0
+                # is where the first draft is verified -- masking it rejects that draft, so the
+                # block is rolled back to one token and the bonus is the token this asked for.
+                if th is not None:
+                    th.mask_rows(logits, block)
                 # verify drafts[i] (position pos+1+i) against logits[i]
                 if lean:
                     # Greedy verification, entirely on the GPU: argmax of the six logit rows, the
@@ -984,6 +1002,8 @@ class V41Engine:
                         out_st["n_out"] = n_out
                         if grammar is not None:
                             grammar.observe(emitted)
+                        if th is not None:
+                            th.observe(emitted)
                         if ph is not None:
                             ph.mark("emit")
                         yield emitted
@@ -1046,6 +1066,8 @@ class V41Engine:
                     out_st["n_out"] = n_out
                     if grammar is not None:
                         grammar.observe(emitted)
+                    if th is not None:
+                        th.observe(emitted)
                     if ph is not None:
                         ph.mark("emit")
                     yield emitted
@@ -1063,6 +1085,8 @@ class V41Engine:
                     grammar.mask_rows(logits, None)
                 if pen is not None:
                     pen.apply(logits, out)
+                if th is not None:
+                    th.mask_rows(logits, None)
                 pt = sample_probs(logits[0], temperature, top_p)
                 tok = int(torch.multinomial(pt, 1)) if temperature > 0 else int(pt.argmax())
                 pos += 1
@@ -1074,11 +1098,14 @@ class V41Engine:
                 out_st.update(n_out=n_out, steps=steps)
                 if grammar is not None:
                     grammar.observe([tok])
+                if th is not None:
+                    th.observe([tok])
                 yield [tok]
         out_st.update(n_out=n_out, steps=steps)
 
     # ------------------------------------------------------------------ introspection
     supports_penalties = True
+    supports_think_controls = True
 
     def config(self):
         """Static engine configuration -- everything a measured number has to be quoted with."""
