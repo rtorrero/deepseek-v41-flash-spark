@@ -1078,3 +1078,15 @@ never fired: the gate's length columns were characters, and no deliberation on t
 reaches 8,000 tokens (passes ≈1,000, loopers 2,500–6,000). Records in
 `results/keepsets/{frontend,backend}/GATE.md`, each run card naming its controls; a run taken
 with controls is not the profile's record (`tools/gate_records.py`).
+
+### 2026-09-15 00:50 — the escape hatch, first run, refuted as configured
+
+`DSV41_ESCAPE_K=1`, `DSV41_ESCAPE_MARGIN=0.10`, Frontend keep-set at 0.36, thinking on. Decode
+probe: 103 tokens in 12.56 s, 11.5 tok/s of decode against the usual 17 to 37; 160 escapes for 103
+tokens (1.5 per token), 26.4 ms each — 4.2 s of the 12.6 s went to fetching and repacking experts —
+with 152 of the 160 evicted again by the 8-slot ring before they were reused. The Frontend gate with
+the hatch on: 6 of 10 strict, 10 of 10 finished (7 and 9 without it), every row at about half speed,
+`ts-groupby` taking 1,436 s over a 16× loop. Outcomes moved inside noise; time doubled. The Backend
+gate was stopped unrun. The record is `results/escape/GATE-frontend-escape.md`, kept out of the
+profile's own record. What would change the verdict: a much higher margin (fewer, better-chosen
+fetches) and a fetch that skips the CB3 repack; both untested. The hatch stays off by default.

@@ -344,3 +344,9 @@ Update, same day: the truncation through the tool channel is fixed by the close-
 `server/tool_grammar.py` (five consecutive whole-page writes on the same keep-set, none cut).
 The stray marker in plain chat is gone with it. The long-generation faults with thinking on — the
 plan that ends in a decision loop, the agent that rewrites a clean file — remain as described.
+
+## 2026-09-15 — the escape hatch does not pay at margin 0.10
+
+Streaming one non-resident expert per layer-step when the router's margin asks for it fires 1.5 times a
+token on Frontend and costs 26 ms a fetch, halving decode, and the gate outcomes stay inside noise
+(`results/escape/`). Off by default; see RESULTS.md 2026-09-15 00:50.
