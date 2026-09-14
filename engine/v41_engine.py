@@ -21,12 +21,40 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 from engine import experts as EX  # noqa: E402
 from engine.escape import EscapeHatch  # noqa: E402
 from engine.engram import EngramTable, make_hash_state  # noqa: E402
-from engine.model import MAX_CHUNK, Caches, Model, Weights  # noqa: E402
+from engine.model import MAX_CHUNK, PREFILL_KV_FP8, RING, Caches, Model, Weights  # noqa: E402
 import v41_ref as R  # noqa: E402
 
 
 def log(*a):
     print(time.strftime("%H:%M:%S"), "[engine]", *a, flush=True)
+
+
+# --- what one prefill chunk costs ------------------------------------------
+# Measured 2026-09-12 by prefilling 8k to 128k in one load and tracking MemAvailable: 7.2 GB at the
+# default 2,048-token chunk plus 15.1 KB per token of context. Flat to 64k then a step; the linear
+# fit over-states the flat region, which is the safe direction.
+#
+# Both terms scale with the chunk. The obvious one is the chunk itself. The context term is the
+# indexer's, and its tiles are shaped [chunk x compressed positions] -- so a 4,096-token chunk pays
+# 15.1 KB per context token TWICE, which is why the chunk factor is on it as well. Pricing it as a
+# constant is how a 4,096-token chunk would be waved through and then killed at 32k.
+PREFILL_BYTES_PER_TOKEN = 7.2e9 / 2048
+PREFILL_BYTES_PER_CONTEXT_TOKEN = 15.1 * 1024
+# What DSV41_PREFILL_KV_FP8=1 takes off the per-token term. The gathered window (128 KB a token),
+# the gathered compressed rows (512 KB) and their concatenation (640 KB) are all live at once in
+# bf16, 1,280 KB in all; the fp8 path builds one buffer of 320 KB. 960 KB a token is the LIVE-byte
+# saving, counted without the allocator's high-water multiplier that the 7.2 GB fit carries -- i.e.
+# deliberately the smaller of the two possible claims, because being pessimistic here costs expert
+# slots and being optimistic costs the process. tools/verify_prefill_fp8.sh replaces it with a
+# measurement. Kept identical in tools/budget.py; tools/test_budget.py fails if they drift.
+PREFILL_KV_FP8_SAVED_PER_TOKEN = 960 * 1024
+
+
+def prefill_reserve_bytes(max_seq: int, chunk: int = MAX_CHUNK, kv_fp8: bool = PREFILL_KV_FP8) -> float:
+    """Peak transient memory of one prefill chunk -- the largest thing this process ever holds on
+    top of everything resident."""
+    per_token = PREFILL_BYTES_PER_TOKEN - (PREFILL_KV_FP8_SAVED_PER_TOKEN if kv_fp8 else 0.0)
+    return chunk * per_token + max_seq * PREFILL_BYTES_PER_CONTEXT_TOKEN * (chunk / 2048)
 
 
 # Per-phase host wall-clock timing of the decode loop (DSV41_STEP_TIMING=1, off by default: with
@@ -593,7 +621,7 @@ class V41Engine:
         budget = float(max(free, host_avail or 0))
         # A prefill chunk is the largest transient this process ever holds; the indexer's
         # score tiles grow with the compressed cache, hence the max_seq term.
-        reserve = MAX_CHUNK * (7.2e9 / 2048) + max_seq * 15.1 * 1024
+        reserve = prefill_reserve_bytes(max_seq)
         auto = arena_gb is None
         if auto:
             arena_gb = max(10.0, (budget - reserve) / 1e9 * 0.82)
@@ -632,13 +660,10 @@ class V41Engine:
             # dense weights resident: a 98 GB arena left 5.5 GB and died on request one; an
             # 87 GB arena left 16.5 GB and served. Reserve the larger of the two floors.
             pack_scratch = 3e9 if self.expert_format != "fp4" else 1e9
-            # Measured 2026-09-12 by prefilling 8k to 128k in one load and
-            # tracking MemAvailable: 7.2 GB of chunk cost plus 15.1 KB per token
-            # of context. Flat to 64k then a step; the linear fit over-states
-            # the flat region, which is the safe direction.
-            # plus the floor this process is killed below, or the check passes
-            # a configuration whose first request walks straight into it
-            prefill_reserve = (MAX_CHUNK * (7.2e9 / 2048) + max_seq * 15.1 * 1024
+            # `prefill_reserve_bytes` is the measured chunk cost (see the constants at the top of
+            # this file), plus the floor this process is killed below -- or the check passes a
+            # configuration whose first request walks straight into it.
+            prefill_reserve = (prefill_reserve_bytes(max_seq)
                                + float(os.environ.get("DSV41_MEM_FLOOR_GB", "2.5")) * 1e9)
             floor = max(keep_free_gb * 1e9, prefill_reserve)
             need = arena_gb * 1e9 + pack_scratch + floor
@@ -651,6 +676,9 @@ class V41Engine:
                     f"Lower --arena-gb by at least {(need - host_avail) / 1e9:.1f} GB (./tune.sh "
                     f"shows what fits), lower DSV41_PREFILL_CHUNK, or stop whatever else holds "
                     f"memory (on this box a boot-time vLLM container used to take 85 GB).")
+        log(f"prefill chunk {MAX_CHUNK} tokens, ring {RING} slots, gathered KV "
+            f"{'fp8 e4m3' if PREFILL_KV_FP8 else 'bf16'}; reserve "
+            f"{prefill_reserve_bytes(max_seq) / 1e9:.1f} GB at MAX_SEQ {max_seq}")
         slots = int(arena_gb * 1e9 / self.expert_bytes)
         self.arena_gb, self.slots = round(arena_gb, 1), slots
         log(f"CUDA free {free / 1e9:.1f} GB of {total / 1e9:.1f}; host MemAvailable "
@@ -1281,6 +1309,8 @@ class V41Engine:
             "expert_topics": getattr(self, "expert_topics_used", None),
             "hot_profile": self.hot_profile,
             "prefill_chunk": MAX_CHUNK,
+            "prefill_kv_fp8": PREFILL_KV_FP8,
+            "ring": RING,
             "io_threads": self.store.io_threads,
             "read_threads": self.store.read_threads,
             "read_chunk_mb": round(self.store.read_chunk / 1024 / 1024, 2),

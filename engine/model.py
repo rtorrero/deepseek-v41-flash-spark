@@ -6,7 +6,9 @@ Ported from the reference `inference/model.py`; the tilelang kernels are replace
 and the routed experts by `engine.experts.ExpertStore` (+ the Triton FP4 grouped-MoE kernel in
 `tools/fp4_moe.py`). Deviations from the reference, all towards MORE precision:
   * activations are not fake-quantized to fp8 (optional flag),
-  * window KV and compressed KV caches are kept in bf16 instead of fp8 / FP4-E4M3,
+  * window KV and compressed KV caches are kept in bf16 instead of fp8 / FP4-E4M3
+    (DSV41_PREFILL_KV_FP8=1 gives that back for the prefill GATHER only -- the caches themselves
+    stay bf16, so decode reads what it reads today),
   * the indexer's Q/K are not FP4-quantized.
 Position semantics are the reference's: a chunk of T tokens at absolute start position S.
 Any (S, T) with T <= 512 works, which is what chunked prefill and 6-token verify blocks need.
@@ -29,16 +31,51 @@ import v41_ref as R  # noqa: E402
 
 from engine import prefill_topk as PT  # noqa: E402  (torch-free; off unless the env asks)
 
-# Window ring slots. Must exceed window_size + the longest chunk a single forward sees, because
-# `attention` gathers a query's window out of the ring AFTER writing the whole chunk into it
-# (128 + 2048 here). 4096 slots x 512 dims x bf16 x 40 layers = 167 MB.
-RING = int(os.environ.get("DSV41_RING", 4096))
 # Longest prefill chunk. Bigger chunks are strictly cheaper on this recipe: a prefill chunk streams
 # nearly every expert of every layer through the transient ring whatever its length (a 512-token
 # chunk already touches ~370 of 384), so the NVMe traffic of a prompt is ~chunks x layers x 384
-# experts and quadrupling the chunk quarters it. The ceiling is activation memory: at T=2048 the
-# gathered window+compressed KV of one layer is ~2.7 GB.
+# experts and quadrupling the chunk quarters it. The same holds in pruned all-resident mode, where
+# nothing is read from NVMe at all: the grouped MoE still unpacks every resident expert of a layer
+# once per chunk, so halving the number of chunks halves the unpack passes.
+# The ceiling is activation memory: at T=2048 the gathered window+compressed KV of one layer is
+# ~2.7 GB in bf16 (see docs/memory-budget.md, "Where a prefill chunk's memory goes"), which is why
+# 4096 wants DSV41_PREFILL_KV_FP8=1 alongside it.
+# Keep it a multiple of 128: MM_TILE/ATTN_TILE pad the last tile of every GEMM, and a chunk that
+# overruns a tile boundary pays ~30 % more iteration time for the rows that only pad.
 MAX_CHUNK = int(os.environ.get("DSV41_PREFILL_CHUNK", 2048))
+# Window ring slots. Must exceed window_size + the longest chunk a single forward sees, because
+# `attention` gathers a query's window out of the ring AFTER writing the whole chunk into it
+# (128 + 2048 here). 4096 slots x 512 dims x bf16 x (40 layers + 3 MTP) = 180 MB.
+# The default follows MAX_CHUNK, or raising DSV41_PREFILL_CHUNK alone would wrap the ring inside a
+# single chunk and silently give the first queries of it whatever the last ones wrote.
+RING = int(os.environ.get("DSV41_RING", max(4096, MAX_CHUNK + 512)))
+
+# Prefill-only fp8 working copies of the gathered window / compressed KV (DSV41_PREFILL_KV_FP8=1;
+# default 0, and with it off not one byte of the path below changes).
+#
+# What is quantised is ONLY the per-chunk gather that `attention` builds for the softmax. The ring
+# (`Caches.win`) and the compressed/index caches (`Caches.ckv`, `Caches.ik`) stay bf16 exactly as
+# they are, so everything decode later reads is in the format it is in today.
+#
+# e4m3 and not e5m2, for two reasons. (1) Precision: 3 mantissa bits against 2, so the worst-case
+# relative rounding error is 2^-4 = 6.25 % instead of 2^-3 = 12.5 %, and error here lands in an
+# attention score. (2) The extra range e5m2 buys is range these tensors do not use: both are the
+# output of an rmsnorm (plus RoPE on the last 64 dims), i.e. O(1), and e4m3's +-448 is nine binades
+# above that. It is also what the reference implementation uses for these very tensors -- this
+# engine's module docstring lists "window KV and compressed KV caches are kept in bf16 instead of
+# fp8 / FP4-E4M3" as a deviation TOWARDS more precision, and this flag gives that deviation back
+# for the prefill working copy alone.
+PREFILL_KV_FP8 = os.environ.get("DSV41_PREFILL_KV_FP8", "0") == "1"
+# Looked up rather than named, so that a torch without the dtype still imports this module and only
+# refuses the flag -- the default path does not need it.
+FP8_KV_DTYPE = getattr(torch, "float8_e4m3fn", None)
+FP8_KV_MAX = 448.0   # largest finite e4m3; the cast NaNs above it, so clamp first
+if PREFILL_KV_FP8 and FP8_KV_DTYPE is None:
+    raise RuntimeError(f"DSV41_PREFILL_KV_FP8=1 needs torch.float8_e4m3fn; torch is {torch.__version__}")
+# Rows gathered per pass when filling the fp8 buffer. The gather is an index_select, not a GEMM, so
+# no invariance rule applies to the tile size; it only bounds the bf16 scratch, which is
+# tile x (window_size + index_topk) x head_dim x 2 = 84 MB at 128.
+KV_GATHER_TILE = 128
 
 # Chunk invariance requires every GEMM to give the same row whatever the batch length M. cuBLAS
 # picks split-K kernels for small M and, with this flag on, reduces the K-splits in bf16, so
@@ -185,6 +222,16 @@ class Caches:
     def __init__(self, args: R.Args, max_seq: int, device: str):
         self.args, self.max_seq, self.device = args, max_seq, device
         d = args.head_dim
+        # The window gather runs AFTER the whole chunk has been written into the ring, so a ring
+        # that is not longer than window_size + MAX_CHUNK hands the first queries of a chunk the
+        # KV of its last tokens -- wrong output, no exception. The 0.88 relative error the 64-slot
+        # ring produced (docs/architecture.md) is what this refuses to repeat silently.
+        if RING < args.window_size + MAX_CHUNK:
+            raise ValueError(
+                f"DSV41_RING={RING} is too small for DSV41_PREFILL_CHUNK={MAX_CHUNK}: the window "
+                f"gather needs more than window_size + chunk = {args.window_size + MAX_CHUNK} "
+                f"slots. Raise DSV41_RING (it costs {(args.n_layers + 3) * d * 2 / 1e3:.1f} MB per "
+                f"1,000 slots) or lower DSV41_PREFILL_CHUNK.")
         self.win = [torch.zeros(RING, d, dtype=torch.bfloat16, device=device) for _ in range(args.n_layers)]
         self.mtp_win = [torch.zeros(RING, d, dtype=torch.bfloat16, device=device) for _ in range(3)]
         self.ckv = {}
@@ -266,13 +313,16 @@ class Model:
         return torch.where(p >= 0, p, torch.full_like(p, -1))
 
     def attention(self, x: torch.Tensor, w, L: int, S: int, sh: Shared, ring: torch.Tensor,
-                  freqs: torch.Tensor, mtp_extra=None, win_lo: int = 0):
+                  freqs: torch.Tensor, mtp_extra=None, win_lo: int = 0, prefill: bool = False):
         """x: [T, d] normed input. Returns [T, d]. `ring` is this layer's window KV ring.
 
         `win_lo` is the first position whose window KV this ring actually holds. It is 0 everywhere
         except in the decoder replay (SWA Bounded Replay, tech report 3.2.2), where the decoder
         layers have only seen the last 128 prompt tokens and a query near the start of the replay
         would otherwise gather whatever the ring happens to hold below it.
+
+        `prefill` only selects the fp8 gather (DSV41_PREFILL_KV_FP8); the arithmetic is otherwise
+        identical for a chunk and for a decode block.
         """
         a = self.args
         T = x.size(0)
@@ -290,18 +340,31 @@ class Model:
         kv = torch.cat([kv[:, :-rd], R.apply_rotary(kv[:, -rd:], fq)], dim=-1)
         self._tap("kv_new", L, kv)
         if mtp_extra is None:
-            # gather the window BEFORE writing (a chunk may overwrite slots older queries still need)
             wpos = self._window_positions(pos)  # [T, 128]
             ring[pos % RING] = kv
-            wkv = ring[wpos.clamp_min(0) % RING]  # [T, 128, d]
             wmask = wpos >= win_lo if win_lo else wpos >= 0
-            self._tap("win_kv", L, wkv); self._tap("win_mask", L, wmask)
-            kv_all, mask = wkv, wmask
-            if w.ratio:
-                ckv_rows, cmask = self._compressed(x, qr, w, L, S, T, pos, sh)
-                self._tap("ckv_rows", L, ckv_rows); self._tap("c_mask", L, cmask)
-                kv_all = torch.cat([wkv, ckv_rows], dim=1)
-                mask = torch.cat([wmask, cmask], dim=1)
+            # The fp8 working copy is worth building only for a real prefill chunk. The bounded
+            # replay is window_size queries -- 42 MB of gathered KV at 128 rows -- so there is
+            # nothing to save there, and it is the pass that produces the prompt's final logits.
+            if PREFILL_KV_FP8 and prefill and T > a.window_size:
+                cidx, cmask = self._compressed_idx(x, qr, w, L, S, T, pos, sh) if w.ratio else (None, None)
+                kv_all = self._gather_kv_fp8(ring, wpos, sh, cidx, T)
+                self._tap("win_kv", L, kv_all[:, :a.window_size]); self._tap("win_mask", L, wmask)
+                mask = wmask
+                if cmask is not None:
+                    self._tap("ckv_rows", L, kv_all[:, a.window_size:]); self._tap("c_mask", L, cmask)
+                    mask = torch.cat([wmask, cmask], dim=1)
+            else:
+                # gather the window AFTER writing this chunk into the ring: a query's window
+                # reaches into the chunk itself, which is why RING > window_size + MAX_CHUNK
+                wkv = ring[wpos.clamp_min(0) % RING]  # [T, 128, d]
+                self._tap("win_kv", L, wkv); self._tap("win_mask", L, wmask)
+                kv_all, mask = wkv, wmask
+                if w.ratio:
+                    ckv_rows, cmask = self._compressed(x, qr, w, L, S, T, pos, sh)
+                    self._tap("ckv_rows", L, ckv_rows); self._tap("c_mask", L, cmask)
+                    kv_all = torch.cat([wkv, ckv_rows], dim=1)
+                    mask = torch.cat([wmask, cmask], dim=1)
         else:
             # DSpark draft attention: window from the main stream's ring (positions <= S-1) + all draft kvs
             main_last = mtp_extra  # position of the last main token in the ring
@@ -356,9 +419,39 @@ class Model:
             outs.append(tile(qt, kvt, mt)[:n])
         return torch.cat(outs).to(torch.bfloat16)
 
+    def _gather_kv_fp8(self, ring, wpos, sh: Shared, cidx, T: int):
+        """The same [T, window_size (+ index_topk), head_dim] gather the bf16 path builds, written
+        straight into one fp8 buffer instead of two bf16 gathers plus a concatenation of both.
+
+        That is where the memory goes: at T=2048 the bf16 path holds the window gather (128 KB a
+        token), the compressed gather (512 KB) and their concatenation (640 KB) at the same moment,
+        1,280 KB a token; this holds 320 KB a token and a tile of bf16 scratch that does not grow
+        with T. The values are the bf16 ones rounded to e4m3 -- elementwise, so the tiling is
+        invisible in the result -- and `_softmax_attn` widens them back to fp32 per query tile
+        exactly as it widens bf16 today.
+        """
+        a = self.args
+        d = a.head_dim
+        n = a.window_size + (a.index_topk if cidx is not None else 0)
+        kv_all = torch.empty(T, n, d, dtype=FP8_KV_DTYPE, device=self.dev)
+        for i in range(0, T, KV_GATHER_TILE):
+            j = min(i + KV_GATHER_TILE, T)
+            g = ring[wpos[i:j].clamp_min(0) % RING]
+            kv_all[i:j, :a.window_size].copy_(g.clamp_(-FP8_KV_MAX, FP8_KV_MAX))
+            if cidx is not None:
+                g = sh.ckv[cidx[i:j].clamp_min(0)]
+                kv_all[i:j, a.window_size:].copy_(g.clamp_(-FP8_KV_MAX, FP8_KV_MAX))
+        return kv_all
+
     def _compressed(self, x, qr, w, L, S, T, pos, sh: Shared):
         """Produce/read the shared compressed KV for this chunk; run/reuse the indexer; return the
         gathered rows [T, k, d] and their mask [T, k]."""
+        idx, m = self._compressed_idx(x, qr, w, L, S, T, pos, sh)
+        return sh.ckv[idx.clamp_min(0)], m
+
+    def _compressed_idx(self, x, qr, w, L, S, T, pos, sh: Shared):
+        """Everything `_compressed` does except the final gather: returns the [T, index_topk]
+        absolute compressed positions (-1 = none) and their mask."""
         a = self.args
         r = w.ratio
         c = self.c
@@ -411,8 +504,7 @@ class Model:
             sh.topk = self._indexer(x, qr, L, pos, compress_lens, n_c, sh)
         idx = sh.topk  # [T, k] absolute compressed positions, -1 = none
         self._tap("topk", L, idx); self._tap("n_c", L, n_c)
-        rows = sh.ckv[idx.clamp_min(0)]
-        return rows, idx >= 0
+        return idx, idx >= 0
 
     def _indexer(self, x, qr, L, pos, compress_lens, n_c, sh: Shared):
         a = self.args
@@ -574,7 +666,7 @@ class Model:
         y = R.hc_pre(h, pre_mix)
         y = R.rmsnorm(y, w.attn_norm, a.norm_eps)
         t0 = time.perf_counter()
-        y = self.attention(y, w, L, S, sh, ring, freqs, mtp_extra, win_lo=win_lo)
+        y = self.attention(y, w, L, S, sh, ring, freqs, mtp_extra, win_lo=win_lo, prefill=prefill)
         self.stats["attn_s"] += time.perf_counter() - t0
         h = R.hc_post(y, residual, attn_post, attn_comb)
         residual = h

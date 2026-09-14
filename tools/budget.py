@@ -139,7 +139,23 @@ def source_from_env() -> str:
 KV_BYTES_PER_TOKEN = 3200
 # The sliding-window rings do not scale with MAX_SEQ: RING 4096 x head_dim 512
 # x bf16 x (40 layers + 3 MTP).
-WINDOW_BYTES = 43 * 4096 * 512 * 2
+RING_DEFAULT = 4096
+WINDOW_BYTES_PER_SLOT = 43 * 512 * 2      # 44,032 B, i.e. 44.0 MB per 1,000 slots
+WINDOW_BYTES = WINDOW_BYTES_PER_SLOT * RING_DEFAULT
+
+
+def ring_from_env(chunk: int | None = None) -> int:
+    """DSV41_RING, or engine/model.py's default for the chunk in force. The ring
+    has to be longer than window_size + the chunk (the window gather runs after
+    the whole chunk is in the ring), so raising the chunk raises this too."""
+    r = os.environ.get("DSV41_RING")
+    if r:
+        return int(r)
+    return max(RING_DEFAULT, (chunk if chunk is not None else chunk_from_env()) + 512)
+
+
+def window_bytes(ring: int | None = None) -> float:
+    return WINDOW_BYTES_PER_SLOT * (ring_from_env() if ring is None else ring)
 
 # What the warm start needs on top of the arena while it packs experts into it,
 # and the floor the launcher keeps free. Both are the engine's own numbers.
@@ -181,12 +197,41 @@ N_INDEX_LAYERS = 8               # config.json index_source_layers
 # that started all this: that configuration left 5.5 GB against a 7.5 GB need.
 PREFILL_BYTES_PER_TOKEN = 7.2e9 / PREFILL_CHUNK_DEFAULT
 
-# And how much that grows with the CONTEXT, separately from the chunk. The
-# indexer's score tiles are shaped [chunk, compressed positions] and the
-# compressed cache is half the sequence, so a longer context makes every chunk
-# more expensive even though the chunk itself is the same size.
+# And how much that grows with the CONTEXT. The indexer's score tiles are shaped
+# [chunk x compressed positions] and the compressed cache is half the sequence,
+# so a longer context makes every chunk more expensive.
 #
+# This is the rate AT A 2,048-TOKEN CHUNK, and `prefill_bytes` scales it with the
+# chunk, because the tile's first axis IS the chunk: a 4,096-token chunk pays
+# 15.1 KB per context token twice. Pricing it as a constant is exactly how a
+# 4,096-token chunk gets waved through and then killed at 32k.
 PREFILL_BYTES_PER_CONTEXT_TOKEN = 15.1 * 1024
+
+# What DSV41_PREFILL_KV_FP8=1 takes off the per-token term (engine/model.py,
+# `_gather_kv_fp8`). At any T the bf16 attention path holds three buffers at the
+# same moment -- the gathered window (window_size 128 x head_dim 512 x bf16 =
+# 128 KB a token), the gathered compressed rows (index_topk 512 x 512 x bf16 =
+# 512 KB) and the concatenation of both (640 KB) -- 1,280 KB a token. The fp8
+# path gathers straight into one e4m3 buffer of 320 KB a token, so 960 KB a
+# token goes away.
+#
+# That is the LIVE-byte saving. The 7.2 GB above is an allocator high-water mark
+# and carries roughly a 2x multiplier over live bytes, which would make the
+# saving ~2 MB a token -- so this constant claims the smaller of the two
+# numbers on purpose. Being pessimistic here costs expert slots; being
+# optimistic costs the process. tools/verify_prefill_fp8.sh measures it.
+PREFILL_KV_FP8_SAVED_PER_TOKEN = 960 * 1024
+
+
+def chunk_from_env() -> int:
+    """DSV41_PREFILL_CHUNK, the same variable engine/model.py reads."""
+    return int(os.environ.get("DSV41_PREFILL_CHUNK") or PREFILL_CHUNK_DEFAULT)
+
+
+def kv_fp8_from_env() -> bool:
+    """DSV41_PREFILL_KV_FP8. Off by default, and with it off the engine's
+    prefill path is byte-for-byte what it is today."""
+    return (os.environ.get("DSV41_PREFILL_KV_FP8") or "0") == "1"
 
 # The watchdog kills the process below this, so a configuration has to leave the
 # prefill reserve AND this on top of it, not one or the other.
@@ -215,15 +260,23 @@ VALIDATED_MAX_SEQ = 131072   # prefilled and measured at this length, 2026-09-12
 GB = 1e9
 
 
-def prefill_bytes(max_seq: int = 32768, chunk: int = PREFILL_CHUNK_DEFAULT) -> float:
+def prefill_bytes(max_seq: int = 32768, chunk: int = PREFILL_CHUNK_DEFAULT,
+                  kv_fp8: bool = False) -> float:
     """Peak transient memory of one prefill chunk -- the reserve a configuration
-    must leave free, or the watchdog kills the server on the first request."""
-    return chunk * PREFILL_BYTES_PER_TOKEN + max_seq * PREFILL_BYTES_PER_CONTEXT_TOKEN
+    must leave free, or the watchdog kills the server on the first request.
+
+    Both terms are proportional to the chunk: the first by definition, the
+    second because the indexer's score tile is [chunk x compressed positions].
+    Kept identical to engine/v41_engine.py `prefill_reserve_bytes`;
+    tools/test_budget.py fails if the two drift."""
+    per_token = PREFILL_BYTES_PER_TOKEN - (PREFILL_KV_FP8_SAVED_PER_TOKEN if kv_fp8 else 0.0)
+    return (chunk * per_token
+            + max_seq * PREFILL_BYTES_PER_CONTEXT_TOKEN * (chunk / PREFILL_CHUNK_DEFAULT))
 
 
-def kv_bytes(max_seq: int) -> float:
+def kv_bytes(max_seq: int, ring: int | None = None) -> float:
     """Exact: the caches engine/model.py allocates up front for MAX_SEQ."""
-    return max_seq * KV_BYTES_PER_TOKEN + WINDOW_BYTES
+    return max_seq * KV_BYTES_PER_TOKEN + window_bytes(ring)
 
 
 # --- the box ----------------------------------------------------------------
@@ -798,6 +851,8 @@ class Plan:
     scratch: float
     floor: float
     available: float
+    chunk: int = PREFILL_CHUNK_DEFAULT
+    kv_fp8: bool = False
     coverage: dict = field(default_factory=dict)
     selection: tuple = ()
 
@@ -881,18 +936,24 @@ class Plan:
 def plan(host: Host, index: TopicIndex | None, selection, keep: float, max_seq: int,
          fmt: str = "cb3", select: str = "uniform", arena_gb: float | None = None,
          keep_free_gb: float = KEEP_FREE_GB_DEFAULT, dense_key=None,
-         chunk: int = PREFILL_CHUNK_DEFAULT,
+         chunk: int | None = None, kv_fp8: bool | None = None,
          transient_slots: int = TRANSIENT_SLOTS_DEFAULT,
          rank: str = RANK_DEFAULT) -> Plan:
     # the engine's own rounding: ceil(keep * 384) experts in every layer
     dense_key = dense_key or dense_key_from_env()
+    # The chunk and the fp8 switch are ordinary .env keys the engine reads, like
+    # DSV41_DENSE_FP4 above: a panel that prices a 2,048-token chunk on a box
+    # whose .env says 4,096 understates the reserve by 7 GB and its verdict
+    # cannot be trusted.
+    chunk = chunk_from_env() if chunk is None else chunk
+    kv_fp8 = kv_fp8_from_env() if kv_fp8 is None else kv_fp8
     kept = keep_n(keep) * N_LAYERS
     slots = kept + transient_slots
     arena = (arena_gb * GB) if arena_gb else slots * EXPERT_BYTES[fmt]
     if arena_gb:
         slots = int(arena / EXPERT_BYTES[fmt])
         kept = min(kept, slots - transient_slots)
-    kv = kv_bytes(max_seq)
+    kv = kv_bytes(max_seq, ring_from_env(chunk))
     cov = index.coverage(tuple(selection), keep, select, rank=rank) if index else {}
     return Plan(
         keep=keep, n_keep=keep_n(keep), kept=kept, slots=slots, transient=transient_slots,
@@ -901,7 +962,8 @@ def plan(host: Host, index: TopicIndex | None, selection, keep: float, max_seq: 
         dense=DENSE_BYTES.get(dense_key, DENSE_DEFAULT) / GB,
         dspark=DSPARK_BYTES / GB,
         kv=kv / GB,
-        prefill=prefill_bytes(max_seq, chunk) / GB,
+        prefill=prefill_bytes(max_seq, chunk, kv_fp8) / GB,
+        chunk=chunk, kv_fp8=kv_fp8,
         scratch=PACK_SCRATCH_BYTES[fmt] / GB,
         floor=keep_free_gb,
         available=host.available_gb,

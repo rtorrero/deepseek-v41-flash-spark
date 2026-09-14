@@ -145,17 +145,91 @@ check("  by 392 slots", round((ring8.max_keep() - ring400.max_keep()) * B.N_ROUT
 # ones it accepts and the watchdog then kills.
 import re as _re  # noqa: E402
 _src = open(os.path.join(ROOT, "engine/v41_engine.py")).read()
-_m = _re.search(r"prefill_reserve = \(MAX_CHUNK \* \(([0-9.e+]+) / 2048\)", _src)
+_m = _re.search(r"^PREFILL_BYTES_PER_TOKEN = ([0-9.e+]+) / 2048$", _src, _re.M)
 check("the engine reserves a prefill chunk at all", bool(_m), True)
 if _m:
     check("and at the same rate as this model", float(_m.group(1)) / 2048, B.PREFILL_BYTES_PER_TOKEN)
-_m3 = _re.search(r"max_seq \* ([0-9.]+) \* 1024", _src)
+_m3 = _re.search(r"^PREFILL_BYTES_PER_CONTEXT_TOKEN = ([0-9.]+) \* 1024$", _src, _re.M)
 check("the engine grows it with the context too", bool(_m3), True)
 if _m3:
     check("  at the same rate", float(_m3.group(1)) * 1024, B.PREFILL_BYTES_PER_CONTEXT_TOKEN, 1)
+_m4 = _re.search(r"^PREFILL_KV_FP8_SAVED_PER_TOKEN = ([0-9]+) \* 1024$", _src, _re.M)
+check("the engine knows what fp8 saves", bool(_m4), True)
+if _m4:
+    check("  and by the same amount", float(_m4.group(1)) * 1024, B.PREFILL_KV_FP8_SAVED_PER_TOKEN)
+# the context term has to carry the chunk factor in the engine too, or a 4,096
+# chunk passes a gate sized for 2,048
+check("the engine scales the context term with the chunk",
+      "PREFILL_BYTES_PER_CONTEXT_TOKEN * (chunk / 2048)" in _src, True)
 _m2 = _re.search(r"floor = max\(keep_free_gb \* 1e9, prefill_reserve\)", _src)
 check("the engine takes the larger of the two floors", bool(_m2), True)
-check("and adds the watchdog floor to its reserve", "DSV41_MEM_FLOOR_GB" in _src.split("prefill_reserve")[1][:400], True)
+check("and adds the watchdog floor to its reserve",
+      "DSV41_MEM_FLOOR_GB" in _src.split("prefill_reserve = (")[1][:400], True)
+
+# --- a 4,096-token chunk has to be priced as a 4,096-token chunk -------------
+# Both terms scale with it. Pricing only the first one understates the reserve
+# by the whole context term, which at 32k is 0.5 GB and at 128k is 2.0 GB.
+c2k = B.prefill_bytes(32768, 2048)
+c4k = B.prefill_bytes(32768, 4096)
+check("chunk 2048 at 32k is the measured 7.7 GB", round(c2k / B.GB, 1), 7.7, 0.05)
+check("doubling the chunk doubles the whole reserve", round(c4k / c2k, 3), 2.0, 0.001)
+check("  the chunk term doubled", round((4096 * B.PREFILL_BYTES_PER_TOKEN) / B.GB, 1), 14.4, 0.05)
+check("  and so did the context term",
+      round((c4k - 4096 * B.PREFILL_BYTES_PER_TOKEN) / B.GB, 2), 1.01, 0.01)
+
+# --- what fp8 buys, and that it is claimed conservatively --------------------
+# 128 KB (window) + 512 KB (compressed) + 640 KB (their concatenation) of bf16
+# a token, against one 640 x 512 fp8 buffer.
+_bf16 = (128 + 512) * 512 * 2 + (128 + 512) * 512 * 2
+_fp8 = (128 + 512) * 512
+check("the fp8 saving is the three bf16 buffers minus one fp8 one",
+      B.PREFILL_KV_FP8_SAVED_PER_TOKEN, _bf16 - _fp8)
+check("  which is under a third of the fitted per-token cost",
+      B.PREFILL_KV_FP8_SAVED_PER_TOKEN < B.PREFILL_BYTES_PER_TOKEN / 3, True)
+f4k = B.prefill_bytes(32768, 4096, kv_fp8=True)
+check("fp8 at chunk 4096 costs less than bf16 at chunk 2048", f4k < c2k, False)
+check("  but brings it back under the 16.5 GB that served", round(f4k / B.GB, 1), 11.4, 0.1)
+check("fp8 does not change the context term",
+      round((f4k - c4k + 4096 * B.PREFILL_KV_FP8_SAVED_PER_TOKEN) / B.GB, 6), 0.0, 1e-6)
+check("and it is off unless asked for", B.prefill_bytes(32768, 2048, kv_fp8=False), c2k)
+
+# --- the chunk must stay on a tile boundary ---------------------------------
+# MM_TILE/ATTN_TILE pad the last tile of every GEMM; a chunk that overruns one
+# pays ~30 % more iteration time for rows that only pad.
+for _c in (512, 2048, 4096):
+    check(f"chunk {_c} is a multiple of 128", _c % 128, 0)
+
+# --- the ring has to follow the chunk ---------------------------------------
+# The window gather runs after the whole chunk is in the ring, so RING must
+# exceed window_size + chunk. At chunk 4096 the shipped 4096-slot ring is too
+# small, and getting that wrong is silent: the first queries of a chunk read
+# the KV the last ones wrote.
+_msrc = open(os.path.join(ROOT, "engine/model.py")).read()
+check("engine/model.py derives the ring default from the chunk",
+      'os.environ.get("DSV41_RING", max(4096, MAX_CHUNK + 512))' in _msrc, True)
+check("and refuses a ring that is too short at all",
+      "RING < args.window_size + MAX_CHUNK" in _msrc, True)
+check("the model prices the default ring the way this does",
+      B.ring_from_env(2048), 4096)
+check("  and grows it at chunk 4096", B.ring_from_env(4096), 4608)
+check("a longer ring costs 44 MB per 1,000 slots",
+      round(B.window_bytes(5096) - B.window_bytes(4096)) / 1e6, 44.0, 0.05)
+check("the KV row at 32k is unchanged by the ring",
+      round(B.kv_bytes(32768, 4096) - B.window_bytes(4096)), 32768 * B.KV_BYTES_PER_TOKEN)
+
+# --- the panel must follow .env, not a hardcoded chunk ----------------------
+_sv = {k: os.environ.get(k) for k in ("DSV41_PREFILL_CHUNK", "DSV41_PREFILL_KV_FP8", "DSV41_RING")}
+os.environ["DSV41_PREFILL_CHUNK"], os.environ["DSV41_PREFILL_KV_FP8"] = "4096", "1"
+os.environ.pop("DSV41_RING", None)
+big = B.plan(host, None, (), 0.39, 32768)
+for k, v in _sv.items():
+    os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+small = B.plan(host, None, (), 0.39, 32768)
+check("a 4096 chunk with fp8 reserves more than a 2048 bf16 one",
+      big.prefill > small.prefill, True)
+check("  and the longer ring lands in the KV row", round(big.kv - small.kv, 3), 0.023, 0.001)
+check("the plan records what it priced", (big.chunk, big.kv_fp8), (4096, True))
+check("and the default records the shipped pair", (small.chunk, small.kv_fp8), (2048, False))
 
 print()
 print(f"{len(fails)} failed" if fails else "all checks passed")
