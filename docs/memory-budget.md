@@ -38,8 +38,9 @@ machine stops being reachable. Everything below is arranged around not doing tha
 | warm-start pack scratch | 3 GB for `cb3`, 1 GB for `fp4` | the 3-bit packer's GPU buffers |
 | keep-free floor | 6 GB as the tool writes it; 20 GB is the engine's default | `KEEP_FREE_GB` |
 | prefill chunk | 7.2 GB at the default 2,048-token chunk, plus 15.1 KB per token of context | measured; see below |
+| prefill unpack cache | 0 by default; whatever `DSV41_PREFILL_UNPACK_CACHE_GB` asks for, in whole 18.80 MB experts | see below |
 
-Everything except the last two rows stays resident for the whole run.
+Everything except the last three rows stays resident for the whole run.
 
 ### Kept experts
 
@@ -146,6 +147,69 @@ and measured. The indexer's score tiles do still grow with the compressed cache 
 still not characterised on its own, which is why the marked length is a run that happened rather
 than a ceiling derived from the formula.
 
+### The prefill unpack cache
+
+`DSV41_PREFILL_UNPACK_CACHE_GB`, off by default, and only meaningful with `EXPERT_FORMAT=cb3`.
+
+A prefill-sized MoE call cannot read a 3-bit expert. It unpacks the experts it needs back into
+packed FP4 — bit-exact, the CB3 codes are a subset of the FP4 grid — a batch at a time into a
+0.6 GB scratch arena, runs the ordinary FP4 kernel, and throws the unpack away. That is what
+prefill actually costs on this recipe (`NOTES.md` 2026-09-12), and the waste is structural:
+**chunk 1 of a prompt unpacks exactly the experts chunk 0 already unpacked.** A 7,000-token prompt
+is four chunks and pays the same unpack four times.
+
+This budget buys a second region of that same FP4 arena which is *not* overwritten between the
+chunks of one prompt. What it can buy is fixed arithmetic:
+
+```
+one expert          18,800,640 B                      (the FP4 slot, unchanged)
+one layer           ceil(PRUNE_KEEP x 384) experts    2.61 GB at keep 0.36
+                                                      2.90 GB at keep 0.40
+                                                      7.22 GB with nothing pruned
+one chunk           layers 0..20                      21 layers, 54.9 GB at keep 0.36
+```
+
+Nothing on this box holds 54.9 GB of cache, so the cache has to choose which layers it keeps — and
+**an LRU is the worst possible rule here**. Prefill is a sequential scan: by the time chunk 1 asks
+for layer 0 again, LRU has just evicted it as the oldest entry, and *every* reference misses.
+`tools/unpack_cache.py` therefore admits on first touch and never evicts inside a request. Because
+the chunk order is deterministic the cache fills with layers 0..k-1 plus a prefix of layer k, those
+layers hit on every later chunk, and the layers past the window miss without disturbing them. The
+hit rate is then simply
+
+```
+cached layers / layers per chunk
+```
+
+so at a 6 GB budget (319 experts, 2.3 layers of 21) about 8 % of a four-chunk prompt's expert
+lookups — chunk 0 cannot hit, and admission is switched off for the last chunk and the decoder
+replay because nothing admitted there is ever read back. `tools/test_unpack_cache.py` replays that
+trace and checks each of these properties, LRU's zero included, with no GPU.
+
+**Where it sits in the gates.** It is not transient — it is allocated at start-up and lives as long
+as the process — but it is allocated *on top of* everything the resident total names, so
+`tools/budget.py` charges it to `prefill_bytes` and it lands in both gates at once. The engine adds
+it to its own pre-flight in the same place, and **clamps** rather than refuses: an arena that
+serves must not stop serving because a cache budget was set too high, and the log says what was
+asked for and what was taken.
+
+At the shipped `cb3` sizes on a 118.6 GB box that is the difference between a configuration and no
+configuration:
+
+| keep | arena | free after load | + 6 GB cache | verdict with the cache |
+|---|---|---|---|---|
+| 0.36 | 80.5 GB | 19.4 GB | needs 16.2 GB | fits |
+| 0.39 | 86.8 GB | 13.0 GB | needs 16.2 GB | **will not load** |
+
+So the cache is not free headroom: at the shipped keep of 0.39 it has to be paid for with a step of
+the keep slider, and whether that trade is worth taking is a measurement, not an argument —
+`tools/verify_prefill_cache.sh` is the A/B that settles it, and the records go under
+`results/prefill/`.
+
+**What it cannot do.** In streaming mode (no keep-set, a transient ring recycling arena slots) every
+entry is invalidated before it can be reused and the cache correctly degenerates to a no-op. With
+`EXPERT_FORMAT=fp4` there is no unpack at all and the variable is ignored with a log line.
+
 ### What the panel leaves out
 
 * The **Engram row cache**, capped at 200,000 rows of 264 bytes per table across two tables, so
@@ -163,7 +227,7 @@ A configuration has to pass two separate checks, and they are not the same check
 `engine/v41_engine.py` refuses to start when
 
 ```
-arena + pack scratch + floor  >  MemAvailable
+arena + pack scratch + prefill unpack cache + floor  >  MemAvailable
 ```
 
 measured **after the dense weights are already resident**, with `floor = max(KEEP_FREE_GB, one
@@ -171,7 +235,7 @@ prefill chunk)`. The tool reproduces it against `MemAvailable` as it is now, bef
 loaded, so the dense term is explicit:
 
 ```
-room to launch = MemAvailable − (arena + pack scratch + dense weights
+room to launch = MemAvailable − (arena + pack scratch + dense weights + prefill unpack cache
                                  + max(keep-free floor, one prefill chunk + the 2.5 GB watchdog floor))
 ```
 
@@ -233,8 +297,8 @@ That one is about whether the box is free, not about whether the configuration i
 The largest arena that both starts and survives a prefill chunk is the smaller of the two gates:
 
 ```
-max_arena = min( MemAvailable − pack scratch − dense − keep-free floor,
-                 MemAvailable − dense − drafter − KV − one prefill chunk )
+max_arena = min( MemAvailable − pack scratch − unpack cache − dense − keep-free floor,
+                 MemAvailable − dense − drafter − KV − one prefill chunk − unpack cache )
 max_keep  = (max_arena / slot_bytes − 8) / 15,360
 ```
 
@@ -275,9 +339,15 @@ Reproduce any row without a terminal:
 
 ```bash
 python3 tools/test_budget.py
+python3 tools/test_unpack_cache.py
 ```
 
-Cross-checks the slot sizes against the kernel's own constant, the KV formula against two measured
+`test_unpack_cache.py` covers the unpack cache: the policy replayed against the access pattern
+prefill really has (and the zero an LRU would score on it) with no torch at all, then — on a box
+that has CUDA and the checkpoint — that the cache changes no number, bit for bit, against the same
+call with it off.
+
+`test_budget.py` cross-checks the slot sizes against the kernel's own constant, the KV formula against two measured
 lengths, the launch gate against an arena the box accepted and one it did not, the `ARENA_GB`
 rounding at every keep step and ring size, and — by reading `engine/v41_engine.py` with a regular
 expression — that the engine still reserves a prefill chunk at the same rate this model assumes. If

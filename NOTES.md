@@ -2589,3 +2589,55 @@ together", and the `DSV41_PRUNE_MODE` block in `env.example`). The unpruned mode
 `DSV41_TOPK=4` says the same thing with nothing pruned -- 1 of 3, identifiers corrupting with every
 expert available (`results/keepsets/null-topk4/GATE.md`). Six experts of which two are wrong beat
 four right ones here. `substitute` stays the default and `drop` stays a documented negative result.
+
+### 2026-09-15 -- prefill: stop unpacking the same experts for every chunk
+
+**What was being repeated.** With `EXPERT_FORMAT=cb3`, a prefill-sized MoE call cannot read a 3-bit
+expert. `tools/cb3_moe.py::moe_forward_prefill` unpacks the experts the call needs back into packed
+FP4 -- bit-exact, the CB3 codes are a subset of the FP4 grid -- 32 at a time into a 0.6 GB scratch
+arena, runs the ordinary FP4 kernel, and drops the unpack on the floor. Every chunk of the same
+prompt then unpacks the same experts again. At keep 0.36 a chunk can route to all 139 experts a
+layer's keep-set left, in each of the 21 layers `DSV41_SWA_REPLAY=1` runs over the prompt, so a
+four-chunk prompt pays 4 x 21 x 139 unpacks where 21 x 139 would do.
+
+**`DSV41_PREFILL_UNPACK_CACHE_GB`** (default 0 = off) buys a region of that same FP4 arena which is
+not overwritten between the chunks of one prompt. `tools/unpack_cache.py` holds the policy and the
+counters and is free of torch and triton, so the policy is tested off the box.
+
+**The policy is a fixed layer window, and LRU would have been worse than useless.** One layer costs
+`ceil(keep x 384) x 18.80 MB` -- 2.61 GB at keep 0.36, 7.22 GB unpruned -- and a chunk's whole
+working set is 21 of those, 54.9 GB. No budget on this box holds it, so the cache has to choose,
+and prefill is the textbook sequential scan: under LRU, by the time chunk 1 asks for layer 0 again
+it has just been evicted as the oldest entry and **every single reference misses** (checked, not
+assumed: `tools/test_unpack_cache.py` replays the trace through an LRU and gets exactly 0 hits, at
+every budget below the working set). Admitting on first touch and never evicting inside a request
+gives the opposite: the cache fills with layers 0..k-1 plus a prefix of layer k, those hit on every
+later chunk, and the layers past the window miss without ever disturbing them. The hit rate is
+`cached layers / layers per chunk`, which degrades linearly with the budget instead of collapsing.
+
+Admission is off for the last chunk and for the decoder replay -- nothing admitted there is read
+back, and an admission costs an 18.8 MB write.
+
+**Correctness is a slot-identity argument, not a numerical one.** The unpack is deterministic, so a
+cached expert and a freshly unpacked one are the same bytes; the only way the cache can be wrong is
+by serving a slot whose CB3 contents have changed under it. An arena slot changes in exactly one
+place, `CB3ArenaV2.load_slot`, which invalidates it. In pruned all-resident mode that never happens
+after the warm start; in streaming mode it happens constantly, every entry dies before it can be
+reused, and the cache degenerates to a no-op rather than to a wrong answer. With the cache off the
+prefill path is the original code, launch for launch.
+
+**Memory.** The cache is persistent, allocated at start-up, and sits on top of everything the
+resident total already names -- so `tools/budget.py::prefill_bytes` charges it and it lands in both
+gates at once, and the engine adds it to its own pre-flight. The engine **clamps** rather than
+refuses (an arena that serves must not stop serving because a cache budget was set too high) and
+logs what was asked for against what was taken. The trade is real and visible: on a 118.6 GB box a
+6 GB cache still fits keep 0.36 and does *not* fit keep 0.39.
+
+**What the arithmetic predicts, before the box says anything.** 6 GB is 319 experts, 2.3 layers of
+21. On a 7,000-token (four-chunk) prompt that is 957 hits of 11,676 expert lookups -- 8.2 %, 31.8 GB
+of unpack traffic, and about 0.12 s at the 0.125 ms/expert the 2026-09-11 A/B implies. Against a
+prefill of roughly 19 s that is under a percent, which is the honest expectation and the reason the
+default is 0. `tools/verify_prefill_cache.sh` is the A/B that settles whether it is worth turning
+on: one engine load each way, the same prompt both times (`tools/longprefill.py`, built
+deterministically from the checkout's corpus), then the generation gate against the cache-on load,
+with the record appended under `results/prefill/`. **No number from this box is in this entry yet.**

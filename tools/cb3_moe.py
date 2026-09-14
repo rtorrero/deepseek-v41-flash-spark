@@ -47,6 +47,9 @@ class CB3Arena:
         self.w2_cb = torch.empty((slots, DIM, 8), **u8)
         self.s2 = torch.empty((slots, DIM, SG2), **u8)
         self.sim = None  # engine.codebook_sim.CodebookSim(3), set by the caller
+        #: tools/unpack_cache.py::PrefillUnpackCache, attached by the engine when
+        #: DSV41_PREFILL_UNPACK_CACHE_GB is set. None = every prefill chunk unpacks from scratch.
+        self.unpack_cache = None
 
     @property
     def bytes_per_slot(self) -> int:
@@ -57,6 +60,8 @@ class CB3Arena:
         """Takes packed-FP4 CPU tensors as read from the checkpoint (same signature as the FP4 arena)
         and converts them to CB3 on the GPU on the way in."""
         assert self.sim is not None, "CB3Arena.sim must be a CodebookSim(3)"
+        if self.unpack_cache is not None:
+            self.unpack_cache.invalidate(slot)   # anything unpacked from this slot is now stale
         dev = self.device
         for (w, s, lo_t, hi_t, cb_t, s_t) in ((w1, s1, self.w1_lo, self.w1_hi, self.w1_cb, self.s1),
                                                (w3, s3, self.w3_lo, self.w3_hi, self.w3_cb, self.s3),
@@ -397,17 +402,56 @@ UNPACK_BATCH = int(os.environ.get("DSV41_CB3_UNPACK_BATCH", 32))
 PREFILL_MODE = os.environ.get("DSV41_CB3_PREFILL", "fp4")   # "fp4" = unpack fallback, "direct" = CB3 kernel
 PREFILL_MIN_P = int(os.environ.get("DSV41_CB3_PREFILL_MIN_P", 65))
 
+#: One packed-FP4 expert, the unit the unpack cache is measured in: 18,800,640 B = 18.80 MB.
+FP4_BYTES_PER_SLOT = 2 * (INTER * (DIM // 2) + INTER * SG1) + DIM * (INTER // 2) + DIM * SG2
+
+# The per-request unpack cache. Its policy and bookkeeping live in tools/unpack_cache.py, which is
+# free of torch and triton so the policy can be tested off the box; the kernels stay here.
+from unpack_cache import (CALIB_BATCHES, UNPACK_MS_PER_EXPERT, ZERO_UNPACK_STATS,  # noqa: E402
+                          PrefillUnpackCache)
+from unpack_cache import CB3_BYTES_PER_SLOT as _UC_CB3  # noqa: E402
+from unpack_cache import FP4_BYTES_PER_SLOT as _UC_FP4  # noqa: E402
+
+assert (_UC_FP4, _UC_CB3) == (FP4_BYTES_PER_SLOT, CB3_BYTES_PER_SLOT), \
+    "tools/unpack_cache.py's slot sizes have drifted from the kernels'"
+
+
+def _fp4_scratch(arena, slots: int):
+    """The FP4 arena a CB3/CB2 prefill call unpacks into: `[0, cache.slots)` is the persistent
+    unpack cache and the `slots` above it are the rotating scratch every call overwrites. Without a
+    cache attached it is exactly what it always was, `max(slots, UNPACK_BATCH)` slots of scratch."""
+    c = getattr(arena, "unpack_cache", None)
+    base = c.slots if c is not None else 0
+    need = base + max(slots, UNPACK_BATCH)
+    sc = getattr(arena, "_scratch", None)
+    if sc is None or sc.slots < need:
+        arena._scratch = sc = F4.ExpertArena(need, arena.device)
+        if c is not None:
+            c.flush()   # a new arena: every destination slot id in the map is stale
+    return sc
+
+
+def attach_unpack_cache(arena, budget_bytes: float, batch: int | None = None):
+    """Give `arena` a prefill unpack cache of `budget_bytes` and allocate it now, so a budget that
+    does not fit fails at start-up instead of on the first request. Returns the cache, or None."""
+    n = int(max(0.0, float(budget_bytes)) // FP4_BYTES_PER_SLOT)
+    if n <= 0:
+        arena.unpack_cache = None
+        return None
+    # one unpack moves a read of the packed expert and a write of the FP4 one
+    arena.unpack_cache = c = PrefillUnpackCache(n, arena.bytes_per_slot + FP4_BYTES_PER_SLOT)
+    arena._scratch = None           # the old scratch has no room for the cache region
+    _fp4_scratch(arena, batch or UNPACK_BATCH)
+    return c
+
 
 class CB3ArenaV2(CB3Arena):
     """Same tensors as CB3Arena, v2 bit layout inside them."""
 
     def fp4_scratch(self, slots: int):
         """A small packed-FP4 arena the prefill path unpacks into. Allocated once and reused; at the
-        default batch of 32 it is 0.6 GB."""
-        sc = getattr(self, "_scratch", None)
-        if sc is None or sc.slots < slots:
-            self._scratch = sc = F4.ExpertArena(max(slots, UNPACK_BATCH), self.device)
-        return sc
+        default batch of 32 it is 0.6 GB, plus the unpack cache when one is attached."""
+        return _fp4_scratch(self, slots)
 
     def load_slot(self, slot: int, w1, s1, w2, s2, w3, s3, non_blocking: bool = False, sim=None) -> None:
         """`sim` overrides the arena's own CodebookSim for this slot only.
@@ -417,6 +461,8 @@ class CB3ArenaV2(CB3Arena):
         the narrower format. That is how a 2-bit tier is measured for quality before it is built."""
         sim = sim or self.sim
         assert sim is not None, "CB3ArenaV2.sim must be a CodebookSim(3)"
+        if self.unpack_cache is not None:
+            self.unpack_cache.invalidate(slot)   # anything unpacked from this slot is now stale
         dev = self.device
         for (w, s, lo_t, hi_t, cb_t, s_t) in ((w1, s1, self.w1_lo, self.w1_hi, self.w1_cb, self.s1),
                                               (w3, s3, self.w3_lo, self.w3_hi, self.w3_cb, self.s3),
@@ -792,9 +838,13 @@ def _cb3_unpack_kernel(LO, HI, CB, OUT, SRC, N,
             _unpack_pair(o + 96, L3, H1, A, Bc, 1, BN, KB)
 
 
-def _unpack_into(arena, src_slots: torch.Tensor, scratch) -> None:
-    """CB3 slots `src_slots` (int32 [B]) -> packed-FP4 scratch slots 0..B-1 (scales are copied: the
-    UE8M0 bytes are the same in both formats)."""
+def _unpack_into(arena, src_slots: torch.Tensor, scratch, out0: int = 0) -> None:
+    """CB3 slots `src_slots` (int32 [B]) -> packed-FP4 scratch slots out0..out0+B-1 (scales are
+    copied: the UE8M0 bytes are the same in both formats).
+
+    `out0` is how the persistent unpack cache and the rotating scratch share one FP4 arena: the
+    kernel writes destination `b` of the tensor it is handed, and a slice along dim 0 is a
+    contiguous view whose base pointer is already offset, so nothing in the kernel changes."""
     B = src_slots.numel()
     BN = 64
     for (lo, hi, cb, N, K, out, s_src, s_dst) in (
@@ -803,15 +853,27 @@ def _unpack_into(arena, src_slots: torch.Tensor, scratch) -> None:
             (arena.w2_lo, arena.w2_hi, arena.w2_cb, DIM, INTER, scratch.w2, arena.s2, scratch.s2)):
         n512, n256 = CB3.block_plan(K)
         _cb3_unpack_kernel[(B, triton.cdiv(N, BN))](
-            lo, hi, cb, out, src_slots, N, KL=K // 4, KH=K // 8, KB=K // 2,
+            lo, hi, cb, out[out0:], src_slots, N, KL=K // 4, KH=K // 8, KB=K // 2,
             BN=BN, NB512=n512, NB256=n256, num_warps=4, num_stages=2)
-        s_dst[:B].copy_(s_src[src_slots.long()])
+        s_dst[out0:out0 + B].copy_(s_src[src_slots.long()])
 
 
-def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor,
-                        arena: CB3ArenaV2, swiglu_limit: float = 10.0,
-                        batch: int | None = None) -> torch.Tensor:
-    """Prefill-sized call over a CB3 arena, via the FP4 kernel and a batched unpack scratch."""
+def _prefill_via_fp4(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena,
+                     swiglu_limit: float, batch, unpack_into) -> torch.Tensor:
+    """Prefill-sized call over a CB3/CB2 arena, via the FP4 kernel and an unpack scratch.
+
+    Without an unpack cache this is the original path, instruction for instruction: the experts the
+    call needs are unpacked `batch` at a time into slots 0..b-1 of the scratch arena and the FP4
+    kernel runs once per batch.
+
+    With one (`arena.unpack_cache`, see `PrefillUnpackCache`), the experts already unpacked by an
+    earlier chunk of the same prompt are used where they lie -- the cache is the low region of the
+    same FP4 arena, so one kernel pass can read cached and freshly-unpacked experts together -- and
+    only the rest go through the rotating scratch region above it.
+
+    Either way every (token, k) pair's expert belongs to exactly ONE pass, so `h` and `parts` are
+    written exactly once, need no zeroing, and the reduction still runs once at the end.
+    """
     T, K = slots.shape
     P = T * K
     dev = x.device
@@ -819,28 +881,31 @@ def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Ten
     uniq = torch.unique(slots)
     uniq = uniq[uniq >= 0].to(torch.int32)
     n = int(uniq.numel())
+    if n == 0:
+        # every pair masked out (`drop` mode with nothing resident). There is no expert to unpack
+        # and no pass to run, so `parts` would never be written -- return the zero this sums to.
+        return torch.zeros((T, DIM), dtype=torch.bfloat16, device=dev)
     batch = min(batch, n)
+    cache = getattr(arena, "unpack_cache", None)
+    if cache is not None and cache.slots <= 0:
+        cache = None
     scratch = arena.fp4_scratch(batch)
+    base = cache.slots if cache is not None else 0     # first slot of the rotating scratch region
     inv = torch.full((arena.slots,), -1, dtype=torch.int32, device=dev)
-    ar = torch.arange(batch, dtype=torch.int32, device=dev)
+    ar = torch.arange(base, base + batch, dtype=torch.int32, device=dev)
     BM = _pick_bm(P)
     bn1, nw1, ns1 = F4._UP_CFG[BM]
     bn2, nw2, ns2 = F4._DOWN_CFG[BM]
     wgt = weights.reshape(-1)
     if wgt.dtype != torch.float32 or not wgt.is_contiguous():
         wgt = wgt.float().contiguous()
-    # h and parts are written exactly once per (token, k) pair across the batches -- every pair's
-    # expert is in exactly one batch -- so neither needs zeroing and the reduction runs once.
     h = torch.empty((P, INTER), dtype=torch.bfloat16, device=dev)
     parts = torch.empty((P, DIM), dtype=torch.float32, device=dev)
-    for i in range(0, n, batch):
-        sel = uniq[i:i + batch]
-        b = int(sel.numel())
-        _unpack_into(arena, sel, scratch)
-        inv.fill_(-1)
-        inv[sel.long()] = ar[:b]
+    # `build_routing` launches one program per slot, so the off path keeps naming just the batch it
+    # unpacked; with a cache a pass can name any slot of the FP4 arena and has to say so.
+    def run(n_slots: int):
         s2 = torch.where(slots >= 0, inv[slots.long().clamp_min(0)], slots.to(torch.int32))
-        block_slot, block_pair, NB = build_routing(s2, b, BM)
+        block_slot, block_pair, NB = build_routing(s2, n_slots, BM)
         F4._moe_up_kernel[(NB, INTER // bn1)](
             x, scratch.w1, scratch.s1, scratch.w3, scratch.s3, h, wgt, block_slot, block_pair,
             x.stride(0), h.stride(0), float(swiglu_limit),
@@ -848,7 +913,47 @@ def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Ten
         F4._moe_down_kernel[(NB, DIM // bn2)](
             h, scratch.w2, scratch.s2, parts, block_slot, block_pair, h.stride(0), parts.stride(0),
             TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, num_warps=nw2, num_stages=ns2)
+
+    if cache is None:
+        for i in range(0, n, batch):
+            sel = uniq[i:i + batch]
+            b = int(sel.numel())
+            unpack_into(arena, sel, scratch, 0)
+            inv.fill_(-1)
+            inv[sel.long()] = ar[:b]
+            run(b)
+        return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
+
+    hit_src, hit_dst, fresh = cache.lookup(uniq.tolist())
+    take, dst0 = cache.admit(fresh)
+    if take:
+        sel = torch.tensor(take, dtype=torch.int32, device=dev)
+        cache.timed(lambda: unpack_into(arena, sel, scratch, dst0), len(take))
+        hit_src += take
+        hit_dst += list(range(dst0, dst0 + len(take)))
+        fresh = fresh[len(take):]
+    if hit_src:
+        # one pass over everything that is in the cache region already
+        inv.fill_(-1)
+        inv[torch.tensor(hit_src, dtype=torch.long, device=dev)] = \
+            torch.tensor(hit_dst, dtype=torch.int32, device=dev)
+        run(scratch.slots)
+    for i in range(0, len(fresh), batch):
+        part = fresh[i:i + batch]
+        b = len(part)
+        sel = torch.tensor(part, dtype=torch.int32, device=dev)
+        cache.timed(lambda: unpack_into(arena, sel, scratch, base), b)
+        inv.fill_(-1)
+        inv[sel.long()] = ar[:b]
+        run(scratch.slots)
     return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
+
+
+def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor,
+                        arena: CB3ArenaV2, swiglu_limit: float = 10.0,
+                        batch: int | None = None) -> torch.Tensor:
+    """Prefill-sized call over a CB3 arena, via the FP4 kernel and a batched unpack scratch."""
+    return _prefill_via_fp4(x, slots, weights, arena, swiglu_limit, batch, _unpack_into)
 
 
 # ============================================================================= CB2: the 2-bit tier
@@ -885,6 +990,7 @@ class CB2ArenaV2:
         self.w2_cb = torch.empty((slots, DIM, 4), **u8)
         self.s2 = torch.empty((slots, DIM, SG2), **u8)
         self.sim = None  # engine.codebook_sim.CodebookSim(2), set by the caller
+        self.unpack_cache = None   # tools/unpack_cache.py::PrefillUnpackCache, or None
 
     @property
     def bytes_per_slot(self) -> int:
@@ -892,14 +998,13 @@ class CB2ArenaV2:
                                           self.s3, self.w2_lo, self.w2_cb, self.s2))
 
     def fp4_scratch(self, slots: int):
-        sc = getattr(self, "_scratch", None)
-        if sc is None or sc.slots < slots:
-            self._scratch = sc = F4.ExpertArena(max(slots, UNPACK_BATCH), self.device)
-        return sc
+        return _fp4_scratch(self, slots)
 
     def load_slot(self, slot: int, w1, s1, w2, s2, w3, s3, non_blocking: bool = False, sim=None) -> None:
         sim = sim or self.sim
         assert sim is not None and sim.bits == 2, "CB2ArenaV2.sim must be a CodebookSim(2)"
+        if self.unpack_cache is not None:
+            self.unpack_cache.invalidate(slot)
         dev = self.device
         for (w, s, lo_t, cb_t, s_t) in ((w1, s1, self.w1_lo, self.w1_cb, self.s1),
                                         (w3, s3, self.w3_lo, self.w3_cb, self.s3),
@@ -1173,7 +1278,7 @@ def _cb2_unpack_kernel(LO, CB, OUT, SRC, N,
             _unpack_pair2(o + 96, L3, A, BN)
 
 
-def _unpack_into_cb2(arena, src_slots: torch.Tensor, scratch) -> None:
+def _unpack_into_cb2(arena, src_slots: torch.Tensor, scratch, out0: int = 0) -> None:
     B = src_slots.numel()
     BN = 64
     for (lo, cb, N, K, out, s_src, s_dst) in (
@@ -1182,49 +1287,15 @@ def _unpack_into_cb2(arena, src_slots: torch.Tensor, scratch) -> None:
             (arena.w2_lo, arena.w2_cb, DIM, INTER, scratch.w2, arena.s2, scratch.s2)):
         n512, n256 = CB3.block_plan(K)
         _cb2_unpack_kernel[(B, triton.cdiv(N, BN))](
-            lo, cb, out, src_slots, N, KL=K // 4, KB=K // 2,
+            lo, cb, out[out0:], src_slots, N, KL=K // 4, KB=K // 2,
             BN=BN, NB512=n512, NB256=n256, num_warps=4, num_stages=2)
-        s_dst[:B].copy_(s_src[src_slots.long()])
+        s_dst[out0:out0 + B].copy_(s_src[src_slots.long()])
 
 
 def moe_forward_cb2_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor,
                             arena: CB2ArenaV2, swiglu_limit: float = 10.0,
                             batch: int | None = None) -> torch.Tensor:
     """Prefill-sized call over a CB2 arena: unpack to packed FP4 in batches (bit-exact, the CB2
-    codes are a subset of the FP4 grid) and run the FP4 kernel, exactly as the CB3 path does."""
-    T, K = slots.shape
-    P = T * K
-    dev = x.device
-    batch = batch or UNPACK_BATCH
-    uniq = torch.unique(slots)
-    uniq = uniq[uniq >= 0].to(torch.int32)
-    n = int(uniq.numel())
-    batch = min(batch, n)
-    scratch = arena.fp4_scratch(batch)
-    inv = torch.full((arena.slots,), -1, dtype=torch.int32, device=dev)
-    ar = torch.arange(batch, dtype=torch.int32, device=dev)
-    BM = _pick_bm(P)
-    bn1, nw1, ns1 = F4._UP_CFG[BM]
-    bn2, nw2, ns2 = F4._DOWN_CFG[BM]
-    wgt = weights.reshape(-1)
-    if wgt.dtype != torch.float32 or not wgt.is_contiguous():
-        wgt = wgt.float().contiguous()
-    h = torch.empty((P, INTER), dtype=torch.bfloat16, device=dev)
-    parts = torch.empty((P, DIM), dtype=torch.float32, device=dev)
-    for i in range(0, n, batch):
-        sel = uniq[i:i + batch]
-        b = int(sel.numel())
-        _unpack_into_cb2(arena, sel, scratch)
-        inv.fill_(-1)
-        inv[sel.long()] = ar[:b]
-        s2 = torch.where(slots >= 0, inv[slots.long().clamp_min(0)], slots.to(torch.int32))
-        block_slot, block_pair, NB = build_routing(s2, b, BM)
-        F4._moe_up_kernel[(NB, INTER // bn1)](
-            x, scratch.w1, scratch.s1, scratch.w3, scratch.s3, h, wgt, block_slot, block_pair,
-            x.stride(0), h.stride(0), float(swiglu_limit),
-            TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, num_warps=nw1, num_stages=ns1)
-        F4._moe_down_kernel[(NB, DIM // bn2)](
-            h, scratch.w2, scratch.s2, parts, block_slot, block_pair,
-            h.stride(0), parts.stride(0), TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T,
-            num_warps=nw2, num_stages=ns2)
-    return parts.view(K, T, DIM).sum(dim=0).to(torch.bfloat16)
+    codes are a subset of the FP4 grid) and run the FP4 kernel, exactly as the CB3 path does --
+    including the per-request unpack cache when one is attached."""
+    return _prefill_via_fp4(x, slots, weights, arena, swiglu_limit, batch, _unpack_into_cb2)
