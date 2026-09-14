@@ -27,6 +27,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 import v41_ref as R  # noqa: E402
 
+from engine import prefill_topk as PT  # noqa: E402  (torch-free; off unless the env asks)
+
 # Window ring slots. Must exceed window_size + the longest chunk a single forward sees, because
 # `attention` gathers a query's window out of the ring AFTER writing the whole chunk into it
 # (128 + 2048 here). 4096 slots x 512 dims x bf16 x 40 layers = 167 MB.
@@ -520,6 +522,11 @@ class Model:
         if pruned and not drop:
             # the router may only pick surviving experts
             logits = logits.masked_fill(~pm[L], float("-inf"))
+        # DSV41_PREFILL_TOPK_TEST (engine/prefill_topk.py): measurement-only, prefill-only override
+        # of the routed k. Unset -- every served configuration -- this returns `k` unchanged and
+        # the topk below is the one this engine has always issued.
+        if prefill and n_experts != 128:
+            k = PT.prefill_topk(k, drop=drop)
         indices = logits.topk(k, dim=-1)[1]
         weights = scores.gather(1, indices)
         slot_idx = indices
