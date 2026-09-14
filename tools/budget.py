@@ -215,10 +215,38 @@ VALIDATED_MAX_SEQ = 131072   # prefilled and measured at this length, 2026-09-12
 GB = 1e9
 
 
-def prefill_bytes(max_seq: int = 32768, chunk: int = PREFILL_CHUNK_DEFAULT) -> float:
+# DSV41_PREFILL_FP8_DEQUANT=cached keeps every dense fp8 weight prefill touches as a bf16 copy for
+# the rest of the request, so a weight is dequantised on the first chunk and read back on every
+# chunk after it. That copy is resident memory a prefill holds on top of everything above, and it
+# is not small: 2.16 GB for the encoder pass (layers 0..20) and 3.70 GB once the decoder replay and
+# the DSpark seed have touched their own weights. `engine/prefill_fp8.cache_bytes()` derives it
+# from the checkpoint's shapes; the derivation is pinned by tools/test_prefill_fp8.py.
+#
+# The high-water mark is what a reserve has to clear, so the whole-prompt figure is the one used.
+# The default mode is `fused`'s ancestor -- off -- and adds nothing.
+try:  # appended, not prepended: this must not shadow anything a caller already put first
+    import sys as _sys
+    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _ROOT not in _sys.path:
+        _sys.path.append(_ROOT)
+    from engine.prefill_fp8 import CACHE_BYTES as FP8_PREFILL_CACHE_BYTES  # noqa: E402
+except Exception:  # noqa: BLE001
+    FP8_PREFILL_CACHE_BYTES = 3.701e9
+
+
+def fp8_cache_from_env() -> bool:
+    """Whether the prefill fp8 dequant cache is on, from the variable the engine reads."""
+    return os.environ.get("DSV41_PREFILL_FP8_DEQUANT", "").strip().lower() == "cached"
+
+
+def prefill_bytes(max_seq: int = 32768, chunk: int = PREFILL_CHUNK_DEFAULT,
+                  fp8_cache: bool = False) -> float:
     """Peak transient memory of one prefill chunk -- the reserve a configuration
-    must leave free, or the watchdog kills the server on the first request."""
-    return chunk * PREFILL_BYTES_PER_TOKEN + max_seq * PREFILL_BYTES_PER_CONTEXT_TOKEN
+    must leave free, or the watchdog kills the server on the first request.
+
+    `fp8_cache` adds what DSV41_PREFILL_FP8_DEQUANT=cached holds; see above."""
+    return (chunk * PREFILL_BYTES_PER_TOKEN + max_seq * PREFILL_BYTES_PER_CONTEXT_TOKEN
+            + (FP8_PREFILL_CACHE_BYTES if fp8_cache else 0.0))
 
 
 def kv_bytes(max_seq: int) -> float:
@@ -901,7 +929,7 @@ def plan(host: Host, index: TopicIndex | None, selection, keep: float, max_seq: 
         dense=DENSE_BYTES.get(dense_key, DENSE_DEFAULT) / GB,
         dspark=DSPARK_BYTES / GB,
         kv=kv / GB,
-        prefill=prefill_bytes(max_seq, chunk) / GB,
+        prefill=prefill_bytes(max_seq, chunk, fp8_cache=fp8_cache_from_env()) / GB,
         scratch=PACK_SCRATCH_BYTES[fmt] / GB,
         floor=keep_free_gb,
         available=host.available_gb,

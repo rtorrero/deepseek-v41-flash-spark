@@ -104,6 +104,81 @@ class FP8Weight:
         return (self.w.float() * s).to(torch.bfloat16)
 
 
+# --------------------------------------------------------------------------- the same value, cheaper
+# `dequant()` above is what `v41_ref.dense` calls for an FP8Weight above decode-sized M, and it
+# costs ten transient bytes per weight: a full [N, K] fp32 scale table built by two
+# repeat_interleaves, a full [N, K] fp32 weight, and the bf16 result. At prefill row counts that is
+# ~1.06 s per 2,048-token chunk (docs/gemm-dispatch.md, rows 5 and 7) spent turning a weight into a
+# copy of itself. The two functions below produce the SAME bf16 tensor with two transient bytes per
+# weight and no fp32 intermediate; `engine/prefill_fp8.py` is the switch that reaches them.
+#
+# Bit-identical, not approximately. e4m3 -> bf16 is exact (4 significand bits into 8), the block
+# scale is a power of two, so the fp32 product is exact wherever `dequant()`'s is, and the closing
+# round-to-nearest-even to bf16 is the same rounding torch does.
+
+@triton.jit
+def _fp8_dequant_kernel(W, S, Y, N, K, stride_wn, stride_sn, stride_yn,
+                        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    rs = tl.arange(0, BLOCK_K // 32)
+    n_mask = rn < N
+    k_mask = rk < K
+    w = tl.load(W + rn[:, None] * stride_wn + rk[None, :],
+                mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+    ks = pid_k * (BLOCK_K // 32) + rs
+    s = tl.load(S + (rn // 32)[:, None] * stride_sn + ks[None, :],
+                mask=n_mask[:, None] & (ks[None, :] < (K + 31) // 32), other=127).to(tl.int32)
+    scale = tl.exp2((s - 127).to(tl.float32))                       # [BLOCK_N, BLOCK_K // 32]
+    wf = tl.reshape(w.to(tl.bfloat16), (BLOCK_N, BLOCK_K // 32, 32)) * scale[:, :, None]
+    tl.store(Y + rn[:, None] * stride_yn + rk[None, :],
+             tl.reshape(wf, (BLOCK_N, BLOCK_K)).to(tl.bfloat16),
+             mask=n_mask[:, None] & k_mask[None, :])
+
+
+def dequant_views(W: FP8Weight) -> torch.Tensor:
+    """`W.dequant()` without the fp32 scale table: a broadcast multiply over a blocked VIEW.
+
+    The scale table is one value per 32x32 block, so a [nb_n, 32, nb_k, 32] view of the weight
+    lines the blocks up with it and the multiply broadcasts -- no repeat_interleave, no [N, K] fp32
+    scale tensor. The last row block is handled separately when N is not a multiple of 32 (K always
+    is: FP8Weight asserts it). Runs anywhere torch does, which is what makes the CPU test possible;
+    on the device `dequant_fused` is the one that gets used.
+    """
+    N, K = W.N, W.K
+    nb_n, nb_k = W.s.shape
+    sf = torch.exp2(W.s.float() - 127.0)                  # [nb_n, nb_k] -- (N/32)(K/32) elements
+    out = torch.empty(N, K, dtype=torch.bfloat16, device=W.w.device)
+    full = (N // 32) * 32
+    if full:
+        wv = W.w[:full].view(N // 32, 32, nb_k, 32).float()
+        out[:full] = (wv * sf[: N // 32, None, :, None]).to(torch.bfloat16).view(full, K)
+    if full < N:
+        wv = W.w[full:].view(N - full, nb_k, 32).float()
+        out[full:] = (wv * sf[nb_n - 1][None, :, None]).to(torch.bfloat16).view(N - full, K)
+    return out
+
+
+def dequant_fused(W: FP8Weight) -> torch.Tensor:
+    """`W.dequant()` in one Triton launch: read the fp8 codes and the UE8M0 table, write bf16.
+
+    Three bytes of DRAM traffic per weight (one read, two written) against about twenty-seven, and
+    one launch against six. Falls back to `dequant_views` off the device, so the same call works in
+    a CPU test.
+    """
+    if W.w.device.type != "cuda":
+        return dequant_views(W)
+    N, K = W.N, W.K
+    y = torch.empty(N, K, dtype=torch.bfloat16, device=W.w.device)
+    BLOCK_N, BLOCK_K = 64, 128
+    grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
+    _fp8_dequant_kernel[grid](W.w, W.s, y, N, K, W.w.stride(0), W.s.stride(0), y.stride(0),
+                              BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=4, num_stages=2)
+    return y
+
+
 def quantize_to_fp8(ref: torch.Tensor, rows: int = 4096) -> FP8Weight:
     """fp32/bf16 [N, K] -> FP8Weight in the checkpoint's own dense format: e4m3 codes plus one
     UE8M0 power-of-two scale per 32x32 block.

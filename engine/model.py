@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 import v41_ref as R  # noqa: E402
 
 from engine import prefill_topk as PT  # noqa: E402  (torch-free; off unless the env asks)
+from engine import prefill_fp8 as PF  # noqa: E402  (torch-free; off unless the env asks)
 
 # Window ring slots. Must exceed window_size + the longest chunk a single forward sees, because
 # `attention` gathers a query's window out of the ring AFTER writing the whole chunk into it
@@ -58,6 +59,10 @@ MM_TILE = 16
 ATTN_TILE = 64
 KEY_BLOCK = 512  # indexer score tile along the compressed-key axis (= index_topk)
 R.MM_TILE = MM_TILE
+
+# The prefill fp8 dequant switch of docs/gemm-dispatch.md, pushed into v41_ref the same way MM_TILE
+# is. It defaults to off and off is byte-identical: "off" is FP8Weight.dequant() and nothing else.
+R.PREFILL_FP8_MODE = PF.MODE
 
 
 # ----------------------------------------------------------------------------- weights
@@ -590,6 +595,7 @@ class Model:
         """Drop whatever the previous prompt left in the replay buffer."""
         self._rep = {"h": [], "pre_mix": [], "topk": [], "cand": []}
         self._rep_end = 0
+        R.prefill_fp8_cache_clear()   # DSV41_PREFILL_FP8_DEQUANT=cached; a no-op otherwise
 
     def _rep_keep(self, h, pre_mix, sh: Shared, S: int, T: int):
         """Remember the last `window_size` encoder outputs of the prompt so far.
@@ -662,6 +668,9 @@ class Model:
             x = R.rmsnorm(x, self.W.norm, a.norm_eps)
             logits = R.head_logits(x, self.W.head)
         self.stats["replay_tokens"] = self.stats.get("replay_tokens", 0) + T
+        # The replay is the last thing prefill does, so the cached bf16 dequants are given back
+        # here -- before the first decode step, not at the next prompt.
+        R.prefill_fp8_cache_clear()
         return logits, (torch.cat(main_hiddens, dim=-1) if main_hiddens else None), S
 
     @torch.inference_mode()
@@ -716,6 +725,11 @@ class Model:
             x = R.hc_pre(h, pre_mix)
             x = R.rmsnorm(x, self.W.norm, a.norm_eps)
             logits = R.head_logits(x, self.W.head)
+        if prefill:
+            # A full (non-encoder-only) prefill forward is the whole prompt in one pass, so there
+            # is no later chunk to reuse a cached dequant: give the memory back here. The chunk
+            # loop runs with encoder_only=True and is freed by decoder_replay instead.
+            R.prefill_fp8_cache_clear()
         return logits, (torch.cat(main_hiddens, dim=-1) if main_hiddens else None)
 
     # ------------------------------------------------------------------ DSpark
