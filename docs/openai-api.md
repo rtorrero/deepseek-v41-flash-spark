@@ -65,12 +65,20 @@ thinking off (there is no reasoning span to guard).
 | `think_repeat_break` | `chat_template_kwargs.think_repeat_break` | `DSV41_THINK_REPEAT_BREAK` | n-gram length. Inside the think block only: when the last n tokens repeat a window already seen twice in this reasoning span, the tokens that continued the earlier copies are masked, so a third copy cannot be extended. `0` = off, `2`-`128` otherwise |
 
 Why they exist: with thinking on, a run that passes this repo's generation gate deliberates
-for about 4,000 reasoning tokens and a run that fails deliberates for about 19,000. The
+for about 4,000 reasoning **characters** and a run that fails deliberates for about 19,000. The
 Backend keep-set at keep 0.36 answered all ten of its prompts correctly but restated itself
-3-8 times on seven of them, at 18-38k reasoning tokens; a whole-page prompt on the Frontend
+3-8 times on seven of them, at 18-38k reasoning characters; a whole-page prompt on the Frontend
 keep-set spent 15,241 reasoning tokens on a "Maybe add X? Skip." loop and returned nothing
 ([`RESULTS.md`](../RESULTS.md) §5.4 and the 2026-09-14 addenda). The failure is not that the
 model cannot answer, it is that it will not stop thinking.
+
+The gate's length columns are **characters**; `reasoning_budget` is in **tokens**, and a token is
+about four characters in this register (2,001 forced reasoning tokens = 7,953 characters, measured
+2026-09-14). So the figures above are roughly 1,000 tokens for a run that passes, 4,800 for one
+that fails and 4.5-9.5k for the ones that loop — divide a gate figure by ~4 before setting a
+budget from it (`RESULTS.md`, correction of 2026-09-14 21:10). A reply says which it was:
+`usage.completion_tokens_details.reasoning_tokens`, and `reasoning_budget_hit` only when the
+budget is what ended the span.
 
 The budget is enforced in the decode loop, not by truncating text afterwards: the close token
 is masked into the next step (and on the speculative path the drafts are rejected so the step

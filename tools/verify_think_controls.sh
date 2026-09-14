@@ -5,10 +5,16 @@
 # Four generation-gate runs at the keep fraction that holds a filled 256k
 # context (0.36), two profiles, with the reasoning-span controls on:
 #
-#   1  Frontend   DSV41_THINK_BUDGET=8000
-#   2  Backend    DSV41_THINK_BUDGET=8000
-#   3  Frontend   DSV41_THINK_BUDGET=8000  DSV41_THINK_REPEAT_BREAK=12
-#   4  Backend    DSV41_THINK_BUDGET=8000  DSV41_THINK_REPEAT_BREAK=12
+#   1  Frontend   DSV41_THINK_BUDGET=2000
+#   2  Backend    DSV41_THINK_BUDGET=2000
+#   3  Frontend   DSV41_THINK_BUDGET=2000  DSV41_THINK_REPEAT_BREAK=12
+#   4  Backend    DSV41_THINK_BUDGET=2000  DSV41_THINK_REPEAT_BREAK=12
+#
+# The budget is in TOKENS. It was 8000 here, taken from gate figures that are
+# CHARACTERS (RESULTS.md, correction of 2026-09-14 21:10) -- about four times the
+# whole distribution, so the first run of this script never forced a single
+# close and measured nothing. In tokens the clean deliberations are ~1-2.3k and
+# the looping ones ~4.5-9.5k; 2000 cuts between them and fired on every prompt.
 #
 # The controls-off baselines on the same keep-sets are already in the record
 # (results/keepsets/{frontend,backend}/GATE.md), so this does not re-run them:
@@ -28,7 +34,7 @@
 # serves one engine at a time and two loads at once wedge it.
 #
 # Honours: PYTHON (default ./.venv/bin/python, else python3), PORT (from .env,
-# else 8000), KEEP (0.36), MAX_SEQ (262144), BUDGET (8000), NGRAM (12), and
+# else 8000), KEEP (0.36), MAX_SEQ (262144), BUDGET (2000, in tokens), NGRAM (12), and
 # EFFORT / MAX_TOKENS (gate_profile's own defaults when unset).
 # ---------------------------------------------------------------------------
 set -euo pipefail
@@ -37,7 +43,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 LOG=/tmp/think_controls.log
 KEEP="${KEEP:-0.36}"
 MAX_SEQ="${MAX_SEQ:-262144}"
-BUDGET="${BUDGET:-8000}"
+BUDGET="${BUDGET:-2000}"
 NGRAM="${NGRAM:-12}"
 
 err() { echo "ERROR: $*" >&2; exit 1; }

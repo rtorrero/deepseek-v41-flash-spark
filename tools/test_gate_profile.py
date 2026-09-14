@@ -725,6 +725,94 @@ check("the card records the keep-set the run measured",
 check("  and says so rather than inventing one when it is not in the environment",
       "| keep-set | not recorded" in WITHOUT)
 
+# =============================================================================
+# units: characters are not tokens
+# =============================================================================
+# On 2026-09-14 the two length columns -- character counts, headed `reason` and
+# `answer` -- were read as token counts, and an 8,000-TOKEN reasoning budget was
+# reported as broken because deliberations of 9,244 and 24,247 CHARACTERS (about
+# 2.3k and 6.1k tokens) had not reached it. So every length now carries its unit
+# and the server's own token counts travel with the row.
+
+USAGE = {"prompt_tokens": 38, "completion_tokens": 2_336,
+         "completion_tokens_details": {"reasoning_tokens": 2_001, "reasoning_budget_hit": True}}
+TC = G.token_counts(USAGE)
+check("the server's reasoning token count is carried, not a character count",
+      TC["reasoning_tokens"] == 2_001, str(TC))
+check("the answer token count is what is left of the completion",
+      TC["answer_tokens"] == 2_336 - 2_001, str(TC))
+check("a fired reasoning budget is carried off the response", TC["budget_hit"] is True)
+NO_USAGE = G.token_counts({})
+check("a server that sends no usage leaves the token counts empty, not zero",
+      NO_USAGE["reasoning_tokens"] is None and NO_USAGE["answer_tokens"] is None
+      and NO_USAGE["budget_hit"] is False, str(NO_USAGE))
+check("a reply the budget did not cut says so",
+      G.token_counts({"completion_tokens": 10,
+                      "completion_tokens_details": {"reasoning_tokens": 4}})["budget_hit"] is False)
+
+check("a length cell is the token count when the server reported one",
+      G._count(2_001, 7_953) == "2,001")
+check("  and a character count marked `c` when it did not",
+      G._count(None, 7_953) == "7,953c")
+
+BUDGET_GOT = {"budget_hit": True, "reasoning_tokens": 2_001}
+check("a row whose reasoning the SERVER ended says so in its why",
+      G.budget_note("20 declarations", BUDGET_GOT)
+      == "20 declarations [reasoning budget hit at 2,001 reasoning tokens]",
+      G.budget_note("20 declarations", BUDGET_GOT))
+check("  and a row it did not cut is left exactly as the judge wrote it",
+      G.budget_note("20 declarations", {"budget_hit": False}) == "20 declarations")
+
+check("the stdout columns name their unit",
+      G.HEADER[3] == "reas tok" and G.HEADER[4] == "ans tok", str(G.HEADER))
+_WIDE = G._row(("prompt-name-here", "on", "length", "24,247c", "12,010c", "999", "FAIL", ""))
+check("the table's fixed part still fits in 80 columns beside a why",
+      len(_WIDE.rstrip()) <= 64, f"{len(_WIDE.rstrip())} columns before `why`")
+
+TOKEN_ROWS = [dict(PASSED, reasoning_chars=7_953, answer_chars=12_010,
+                   reasoning_tokens=2_001, answer_tokens=3_002, budget_hit=True)]
+MD_TOK = G.report(TOKEN_ROWS, "frontend", ["html"], [], _args, {"id": "k", "max_model_len": 1})
+check("the GATE.md table names the unit of all four length columns",
+      "| prompt | thinking | finish | reasoning chars | reasoning tokens | answer chars | "
+      "answer tokens | s | | why |" in MD_TOK)
+check("a GATE.md row carries characters and tokens side by side",
+      "| 7,953 | 2,001 | 12,010 | 3,002 |" in MD_TOK, MD_TOK.splitlines()[-6])
+_NO_TOK = [ln for ln in G.report([PASSED], "frontend", ["html"], [], _args,
+                                 {"id": "k"}).splitlines() if ln.startswith("| `")]
+check("a row from a server without usage keeps its character counts and invents no tokens",
+      len(_NO_TOK) == 1 and _NO_TOK[0].count(" — ") == 2
+      and f"| {PASSED['reasoning_chars']:,} | — |" in _NO_TOK[0], _NO_TOK and _NO_TOK[0])
+
+# tools/language_gap.py reads every GATE.md in the repo to compare PASS and FAIL
+# deliberation length. It must go on reading the files already written AND the
+# ones with the token columns, or the correction breaks the analysis that found
+# the mistake. Lifted with `ast` (it imports numpy and a coverage file).
+
+
+def gate_table_rows():
+    tree = ast.parse(open(os.path.join(ROOT, "tools/language_gap.py")).read())
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "gate_table_rows":
+            ns = {}
+            exec(compile(ast.Module(body=[node], type_ignores=[]), "<lg>", "exec"), ns)
+            return ns["gate_table_rows"]
+    raise AssertionError("gate_table_rows not found in tools/language_gap.py")
+
+
+_parse = gate_table_rows()
+_new = _parse(MD_TOK)
+check("language_gap reads the new table shape",
+      len(_new) == 1 and _new[0]["reasoning_chars"] == 7_953
+      and _new[0]["reasoning_tokens"] == 2_001 and _new[0]["passed"], str(_new))
+_OLD_TABLE = ("| `html-page` | on | stop | 9,244 | 12,010 | 41 | PASS | 20 declarations |\n"
+              "| `css-card` | on | length | 24,247 | 139 | 99 | **FAIL** | repeat: looped |")
+_old = _parse(_OLD_TABLE)
+check("  and still reads the shape every existing gate file is written in",
+      [(r["reasoning_chars"], r["answer_chars"], r["reasoning_tokens"], r["passed"]) for r in _old]
+      == [(9_244, 12_010, None, True), (24_247, 139, None, False)], str(_old))
+check("  including the real records on disk",
+      len(_parse(open(os.path.join(ROOT, "results/keepsets/frontend/GATE.md")).read())) > 10)
+
 # The default --out is results/keepsets/<slug>/GATE.md, and a gate result is
 # appended to the record that is already there. A slug that does not name the
 # existing directory starts a second, empty one beside it.

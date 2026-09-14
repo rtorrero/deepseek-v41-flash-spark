@@ -315,7 +315,8 @@ on by itself. Change the default for every request with `DEFAULT_THINKING=on` /
 `DEFAULT_EFFORT=90` in `.env`.
 
 **Two guards over the think block, off by default.** A gate run that passes deliberates for about
-4,000 reasoning tokens and one that fails for about 19,000, so `reasoning_budget` (env
+4,000 reasoning *characters* and one that fails for about 19,000 — roughly 1,000 and 4,800 tokens,
+at about four characters to a token here — so `reasoning_budget` (env
 `DSV41_THINK_BUDGET`) caps the span — the decode loop forces `</think>` when the budget is spent
 and the answer is written from the deliberation so far — and `think_repeat_break` (env
 `DSV41_THINK_REPEAT_BREAK`) refuses the token that would extend a third verbatim copy of an

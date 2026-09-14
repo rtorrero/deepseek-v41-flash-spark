@@ -9,13 +9,22 @@ without a GPU (``server/test_think_controls.py``).
 Why they exist, measured on this repo's own gate (RESULTS.md 5.4 and the
 2026-09-14 addenda):
 
-* A run that passes deliberates for about 4,000 reasoning tokens; a run that
-  fails deliberates for about 19,000. The Backend keep-set at 0.36 produced a
-  correct answer on all ten prompts, but seven of them restated themselves
-  three to eight times first, at 18-38k reasoning tokens against 4-9k where
+* A run that passes deliberates for about 4,000 reasoning CHARACTERS; a run
+  that fails deliberates for about 19,000. The Backend keep-set at 0.36 produced
+  a correct answer on all ten prompts, but seven of them restated themselves
+  three to eight times first, at 18-38k reasoning characters against 4-9k where
   they do not loop. The failure is not "it cannot answer", it is "it will not
   stop thinking": a long deliberation ends in a "Maybe add X? Skip." loop, or
   it never closes the think block at all and the answer is empty.
+
+  Those are the gate's own columns, and they are character counts -- until
+  2026-09-14 they were quoted here as token counts, which they never were. A
+  budget below is in TOKENS, and a token is about four characters in this
+  register (2,001 forced reasoning tokens = 7,953 characters, measured
+  2026-09-14), so the numbers above are roughly 1,000 tokens for a run that
+  passes, 4,800 for one that fails and 4.5-9.5k for the ones that loop. A budget
+  chosen from the character figures is about four times too large to ever fire
+  (RESULTS.md, correction of 2026-09-14 21:10).
 * So: (1) cap the reasoning span and force the close token when the cap is
   reached -- the model then writes its answer from the deliberation it already
   has; (2) inside the span only, refuse the token that would start a third

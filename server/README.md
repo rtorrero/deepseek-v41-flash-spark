@@ -97,8 +97,9 @@ rolled back to one token and the bonus is the token the control asked for. `x_en
 server logs one line per request when the budget fires.
 
 They exist for a measured failure: with thinking on, a gate run that passes deliberates for about
-4,000 reasoning tokens and one that fails for about 19,000 (`RESULTS.md` §5.4 and the 2026-09-14
-addenda). The loop breaker is scoped to the reasoning span because the answer-side ban was
+4,000 reasoning **characters** and one that fails for about 19,000 -- about 1,000 and 4,800 tokens,
+at ~4 characters to a token in this register (`RESULTS.md` §5.4, the 2026-09-14 addenda and the
+21:10 correction: the gate's length columns are characters, and the budget below is in tokens). The loop breaker is scoped to the reasoning span because the answer-side ban was
 refuted -- `no_repeat_ngram` over an answer destroys CSS, which repeats `px` and `0` legitimately.
 
 A boolean from steps 1-2 decides thinking; an effort from step 3 still sets the budget

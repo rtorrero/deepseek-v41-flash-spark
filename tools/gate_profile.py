@@ -34,6 +34,17 @@ new prompts.
   python3 tools/gate_profile.py --topics python,sql,english --dry-run
   python3 tools/gate_profile.py --profile chat --thinking both --effort 60
 
+Every length on a row carries its unit, because one of them was read as the
+other. The stdout columns `reas tok` / `ans tok` are TOKENS, as the server
+counted them (`usage.completion_tokens_details`), falling back to a character
+count with a trailing `c` when a server sends no usage; GATE.md carries both
+units in named columns. They are not interchangeable -- about four characters
+to a token in this register (2,001 forced reasoning tokens = 7,953 characters,
+measured 2026-09-14) -- and on 2026-09-14 the char columns were read as token
+counts, which made an 8,000-TOKEN reasoning budget look broken when in truth no
+deliberation in that run had come near it. A row whose reasoning span was ended
+by the server says so in its `why`.
+
 The verdict carries two numbers, because they answer different questions. The
 strict one -- N of M runs passed -- is the gate, and it is unforgiving on
 purpose: a 12-word fragment redrafted three times fails the row wherever it
@@ -985,14 +996,42 @@ def generate(base: str, model: str, prompt: str, thinking: bool, effort: int,
     return {"reasoning": msg.get("reasoning_content") or "",
             "answer": msg.get("content") or "",
             "finish": choice.get("finish_reason") or "",
-            "seconds": time.perf_counter() - t0}
+            "seconds": time.perf_counter() - t0,
+            **token_counts(d.get("usage") or {})}
+
+
+def token_counts(usage: dict) -> dict:
+    """The server's own token counts for one reply, or Nones if it sent none.
+
+    The gate used to carry the two string lengths alone, and they were read as
+    token counts once too often (see this module's header), so the counts the
+    server actually measured travel with every row:
+
+    * ``reasoning_tokens`` -- ``usage.completion_tokens_details.reasoning_tokens``,
+      the index of the first ``</think>``;
+    * ``answer_tokens`` -- what is left of ``completion_tokens`` after it. With
+      thinking on that still includes the one ``</think>`` token, which is not
+      worth a special case at these magnitudes;
+    * ``budget_hit`` -- ``reasoning_budget_hit``, which the server sets ONLY when
+      the reasoning-span budget fired. It is the per-request truth about the
+      controls and it outranks the card's environment reading, which can only
+      see the environment of *this* process, not the server's.
+    """
+    det = usage.get("completion_tokens_details") or {}
+    rt = det.get("reasoning_tokens")
+    ct = usage.get("completion_tokens")
+    rt = rt if isinstance(rt, int) and not isinstance(rt, bool) else None
+    ct = ct if isinstance(ct, int) and not isinstance(ct, bool) else None
+    return {"reasoning_tokens": rt,
+            "answer_tokens": (ct - rt) if (ct is not None and rt is not None) else None,
+            "budget_hit": bool(det.get("reasoning_budget_hit"))}
 
 
 # =============================================================================
 # the run
 # =============================================================================
 
-HEADER = ("prompt", "think", "finish", "reason", "answer", "s", "", "why")
+HEADER = ("prompt", "think", "finish", "reas tok", "ans tok", "s", "", "why")
 
 
 def _row(cells) -> str:
@@ -1000,8 +1039,38 @@ def _row(cells) -> str:
     at the end: a full suite is an hour of generation and the row that matters
     is usually the first failure."""
     name, think, finish, nr, na, secs, verdict, why = cells
-    return (f"{name:<18.18} {think:<5} {finish:<8.8} {nr:>7} {na:>7} {secs:>6} "
+    return (f"{name:<18.18} {think:<5} {finish:<8.8} {nr:>8} {na:>8} {secs:>6} "
             f"{verdict:<4} {why}")
+
+
+def _count(tokens, chars) -> str:
+    """A cell of the two length columns, with its unit attached.
+
+    Tokens where the server reported them, and the character count with a
+    trailing `c` where it did not -- never a bare number that could be either.
+    """
+    return f"{tokens:,}" if isinstance(tokens, int) else f"{chars:,}c"
+
+
+def _tok(v) -> str:
+    """A token count for the GATE.md table, or an em dash when the server sent none."""
+    return f"{v:,}" if isinstance(v, int) else "—"
+
+
+def budget_note(why: str, got: dict) -> str:
+    """Say on the row when the SERVER ended the deliberation.
+
+    ``reasoning_budget_hit`` means the reasoning span was closed by the budget
+    rather than by the model, so that row measures a cut think block and not a
+    finished one. It belongs next to the verdict: the run card can only report
+    the environment of the process that ran the gate, which is not necessarily
+    the environment the server was started with.
+    """
+    if not got.get("budget_hit"):
+        return why
+    n = got.get("reasoning_tokens")
+    note = "reasoning budget hit" + (f" at {n:,} reasoning tokens" if isinstance(n, int) else "")
+    return f"{why} [{note}]" if why else f"[{note}]"
 
 
 def judge(p: dict, got: dict, thinking: bool) -> tuple:
@@ -1044,14 +1113,19 @@ def run(args, prompts, card) -> list:
             except (urlerror.URLError, OSError, ValueError, KeyError) as e:
                 got = {"reasoning": "", "answer": "", "finish": "error", "seconds": 0.0}
                 ok, why, kind = False, f"request failed: {e}", "content"
+            why = budget_note(why, got)
             row = {"name": p["name"], "topic": p["topic"], "check": p["check"],
                    "thinking": "on" if thinking else "off", "finish": got["finish"],
                    "reasoning_chars": len(got["reasoning"]), "answer_chars": len(got["answer"]),
+                   "reasoning_tokens": got.get("reasoning_tokens"),
+                   "answer_tokens": got.get("answer_tokens"),
+                   "budget_hit": bool(got.get("budget_hit")),
                    "seconds": got["seconds"], "ok": ok, "why": why, "kind": kind}
             rows.append(row)
-            print(_row((row["name"], row["thinking"], row["finish"], f"{row['reasoning_chars']:,}",
-                        f"{row['answer_chars']:,}", f"{row['seconds']:.0f}",
-                        "PASS" if ok else "FAIL", why)), flush=True)
+            print(_row((row["name"], row["thinking"], row["finish"],
+                        _count(row["reasoning_tokens"], row["reasoning_chars"]),
+                        _count(row["answer_tokens"], row["answer_chars"]),
+                        f"{row['seconds']:.0f}", "PASS" if ok else "FAIL", why)), flush=True)
     return rows
 
 
@@ -1118,12 +1192,21 @@ def report(rows, name, topics, silent, args, card) -> str:
     out.append(f"| reasoning-span controls | {guards} |" if guards else
                "| reasoning-span controls | off (neither DSV41_THINK_BUDGET nor "
                "DSV41_THINK_REPEAT_BREAK was set) |")
+    # Four length columns, each named for its unit. The character counts come
+    # first and keep the position they have always had, so tools/language_gap.py
+    # still reads every GATE.md ever written; the token counts are the server's
+    # own (`usage.completion_tokens_details`) and are the ones a reasoning budget
+    # is expressed in. A character here is not a token: about four characters per
+    # token in this register (2,001 forced reasoning tokens = 7,953 characters,
+    # measured 2026-09-14).
     out += ["",
-            "| prompt | thinking | finish | reasoning | answer | s | | why |",
-            "|---|---|---|---|---|---|---|---|"]
+            "| prompt | thinking | finish | reasoning chars | reasoning tokens | answer chars | "
+            "answer tokens | s | | why |",
+            "|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
         out.append(f"| `{r['name']}` | {r['thinking']} | {r['finish']} | {r['reasoning_chars']:,} | "
-                   f"{r['answer_chars']:,} | {r['seconds']:.0f} | "
+                   f"{_tok(r.get('reasoning_tokens'))} | {r['answer_chars']:,} | "
+                   f"{_tok(r.get('answer_tokens'))} | {r['seconds']:.0f} | "
                    f"{'PASS' if r['ok'] else '**FAIL**'} | {r['why']} |")
     out += [""]
     if failed:

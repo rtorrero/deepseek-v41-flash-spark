@@ -1023,3 +1023,37 @@ Correction, 09:20 — the 03:40 addendum says that with thinking off "every lang
 passed". Not so for European: the thinking-off run in `results/keepsets/european_languages/GATE.md`
 (2026-09-13 23:07) passed German and Italian and failed French and Spanish on the language-marker
 check, 2 of 4. World languages was the 4 of 4. The figures in the World addendum are unchanged.
+
+Correction, 21:10 — the gate's `reasoning` and `answer` columns are CHARACTERS, not tokens. This
+one is load-bearing, because a reasoning budget is set in tokens. `tools/gate_profile.py` recorded
+`len(reasoning_content)` and `len(content)` under the headings `reason` / `answer`, and every
+figure read out of a GATE.md length column — here, in `README.md`, `env.example`,
+`docs/openai-api.md` and `server/think_controls.py` — was then quoted as a token count. A token is
+about four characters in this register: a run forced closed at exactly 2,001 reasoning tokens wrote
+7,953 characters of reasoning (measured today). So, unchanged as measurements, correctly labelled:
+
+| statement | as measured | in tokens (÷ ~4) |
+|---|---|---|
+| a gate run that passes deliberates ~4,000, one that fails ~19,000 (from `tools/language_gap.py`, which reads the GATE.md columns) | characters | ~1,000 and ~4,800 |
+| Backend at 0.36: seven prompts restated themselves 3–8× "at 18–38k reasoning tokens a prompt against 4–9k" (06:20 addendum above) | characters | ~4.5–9.5k against ~1–2.3k |
+| any `reasoning` / `answer` number in any GATE.md table written before today | characters | ÷ ~4 |
+
+Not affected: the 07:20 design-test rows (15,241 and 9,386 reasoning tokens) are single chat runs
+whose counts came from `usage`, not from a gate table — their "40k-character design plan" is the
+same run's character count and they are consistent as written.
+
+What this cost: `DSV41_THINK_BUDGET=8000` was picked as "above every clean deliberation and below
+every loop" from the character figures, so it sits about four times above the whole distribution.
+That is why a gate run under it produced 9,244 / 10,354 / 24,247 reasoning *characters* with the
+budget never firing, and why the same suite at `DSV41_THINK_BUDGET=2000` forced `</think>` at
+2,000–2,003 tokens on all three prompts (server log, env mode). The control was never broken; the
+unit was.
+
+What changed so it cannot recur: gate rows now carry the server's own token counts
+(`usage.completion_tokens_details`) beside the character counts — stdout columns `reas tok` /
+`ans tok`, GATE.md columns `reasoning chars | reasoning tokens | answer chars | answer tokens` —
+every stdout cell without a token count is printed with a trailing `c`, and a row whose reasoning
+span the server ended says `[reasoning budget hit at N reasoning tokens]` in its `why`, which is
+per-request truth the run card's environment reading cannot give. `tools/language_gap.py` reads
+both table shapes, and `tools/test_gate_profile.py` covers the units, the fallbacks and both
+shapes.

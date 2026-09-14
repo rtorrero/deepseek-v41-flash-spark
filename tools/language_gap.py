@@ -562,16 +562,56 @@ def divergence():
           f"reasoning-reasoning_code {JS('reasoning', 'reasoning_code'):.3f}")
 
 
+def gate_table_rows(text: str) -> list:
+    """Every prompt row of a GATE.md table, in either table shape.
+
+    The lengths in a gate row are CHARACTER counts and always have been; until
+    2026-09-14 the columns were headed `reasoning` / `answer` and were read here
+    as token counts, which they are not (about four characters to a token in
+    this register). Gate files written from that date carry the server's token
+    counts as two extra columns, after each character count, so this reads the
+    cells rather than fixed regex groups: `| name | on/off | finish | chars
+    [| tokens] | chars [| tokens] | s | verdict | why |`.
+
+    Returns dicts with reasoning/answer CHARACTERS, the token counts when the
+    file has them (else None), and whether the run passed.
+    """
+    import re
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"\|\s*`([^`]+)`\s*\|\s*(on|off)\s*\|\s*(\w+)\s*\|(.*)$", line)
+        if not m:
+            continue
+        cells = [c.strip() for c in m.group(4).split("|")]
+        nums = []
+        for c in cells:
+            if c in ("PASS", "**FAIL**"):
+                break
+            nums.append(int(c.replace(",", "")) if re.fullmatch(r"[\d,]+", c) else None)
+        nums = nums[:-1]                      # drop the seconds column
+        if len(nums) == 4:                    # chars, tokens, chars, tokens
+            rc, rt, ac, at = nums
+        elif len(nums) == 2:                  # the pre-2026-09-14 shape: chars only
+            (rc, ac), rt, at = nums, None, None
+        else:
+            continue
+        if rc is None or ac is None:
+            continue
+        out.append({"name": m.group(1), "thinking": m.group(2), "finish": m.group(3),
+                    "reasoning_chars": rc, "answer_chars": ac,
+                    "reasoning_tokens": rt, "answer_tokens": at,
+                    "passed": "**FAIL**" not in line})
+    return out
+
+
 def repetition_abort():
     """`answer = 139` is a constant, not a language phenomenon."""
     import glob
-    import re
     hr("I. the repetition-abort signature across EVERY gate in the repo")
     tot = hits = 0
     for path in sorted(glob.glob(os.path.join(ROOT, "results/keepsets/*/GATE.md"))):
-        rows = re.findall(r"\|\s*`([^`]+)`\s*\|\s*(?:on|off)\s*\|\s*(\w+)\s*\|"
-                          r"\s*([\d,]+)\s*\|\s*([\d,]+)\s*\|", open(path).read())
-        n = sum(1 for _, _, _, a in rows if a.replace(",", "") == "139")
+        rows = gate_table_rows(open(path).read())
+        n = sum(1 for r in rows if r["answer_chars"] == 139)
         tot += len(rows)
         hits += n
         if n:
@@ -580,9 +620,8 @@ def repetition_abort():
 
 
 def gate_stats():
-    """Reasoning-token length of PASS vs FAIL runs, read out of the gate files."""
-    import re
-    hr("E. the gate files themselves: PASS vs FAIL reasoning length")
+    """Reasoning length (CHARACTERS) of PASS vs FAIL runs, read out of the gate files."""
+    hr("E. the gate files themselves: PASS vs FAIL reasoning length (characters)")
     files = {
         "Frontend": "results/keepsets/frontend/GATE.md",
         "Chat and explanation": "results/keepsets/chat_and_explanation/GATE.md",
@@ -596,28 +635,26 @@ def gate_stats():
         secs = text.split("\n# Generation gate")
         last = secs[-1]
         pa, fa = [], []
-        for line in last.splitlines():
-            m = re.match(r"\|\s*`([^`]+)`\s*\|\s*(on|off)\s*\|\s*(\w+)\s*\|\s*([\d,]+)\s*\|"
-                         r"\s*([\d,]+)\s*\|\s*([\d,]+)\s*\|\s*(\*\*FAIL\*\*|PASS)\s*\|", line)
-            if not m:
-                continue
-            r = int(m.group(4).replace(",", ""))
-            (fa if "FAIL" in m.group(7) else pa).append((m.group(1), r, m.group(3)))
+        for row in gate_table_rows(last):
+            (pa if row["passed"] else fa).append(
+                (row["name"], row["reasoning_chars"], row["finish"]))
         allp += pa
         allf += fa
         mp = np.mean([r for _, r, _ in pa]) if pa else float("nan")
         mf = np.mean([r for _, r, _ in fa]) if fa else float("nan")
-        print(f"{name:<22} pass {len(pa):>2} (mean reasoning {mp:>8,.0f})   "
-              f"fail {len(fa):>2} (mean reasoning {mf:>8,.0f})")
+        print(f"{name:<22} pass {len(pa):>2} (mean reasoning {mp:>8,.0f} chars)   "
+              f"fail {len(fa):>2} (mean reasoning {mf:>8,.0f} chars)")
     print(f"\nall four profiles, last run each: {len(allp)} PASS mean "
-          f"{np.mean([r for _, r, _ in allp]):,.0f} reasoning tokens; "
+          f"{np.mean([r for _, r, _ in allp]):,.0f} reasoning CHARACTERS; "
           f"{len(allf)} FAIL mean {np.mean([r for _, r, _ in allf]):,.0f}")
+    print("(characters, not tokens: about four characters to a token in this register, "
+          "so divide by ~4 to compare with a reasoning budget)")
     pr = sorted(r for _, r, _ in allp)
     fr = sorted(r for _, r, _ in allf)
     print(f"PASS  max {pr[-1]:,}   median {pr[len(pr)//2]:,}")
     print(f"FAIL  min {fr[0]:,}   median {fr[len(fr)//2]:,}")
     thr = 10000
-    print(f"runs over {thr:,} reasoning tokens: "
+    print(f"runs over {thr:,} reasoning characters: "
           f"{sum(1 for r in pr if r > thr)} PASS / {sum(1 for r in fr if r > thr)} FAIL")
     print(f"runs under {thr:,}: {sum(1 for r in pr if r <= thr)} PASS / "
           f"{sum(1 for r in fr if r <= thr)} FAIL")

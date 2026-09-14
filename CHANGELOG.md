@@ -218,6 +218,20 @@ derived where they are decided, instead of being copied out of a results file by
 - `./start.sh` no longer exits silently, before printing anything, on a checkout with no
   `results/trace-*/stats/coverage.json`: the fallback lookup ends in a failed test, and under
   `set -e` an assignment took that exit status with it.
+- **The generation gate's length columns are characters, and now say so.**
+  `tools/gate_profile.py` recorded `len(reasoning_content)` / `len(content)` under the headings
+  `reason` / `answer`, and those figures were quoted as token counts in `RESULTS.md`, `README.md`,
+  `env.example`, `docs/openai-api.md` and `server/think_controls.py` — a token is about four
+  characters in this register (2,001 forced reasoning tokens = 7,953 characters), so a reasoning
+  budget chosen from them was about 4× too large to fire and the reasoning-span controls were read
+  as broken when they were not. Rows now carry the server's own counts
+  (`usage.completion_tokens_details`): stdout columns `reas tok` / `ans tok`, with a trailing `c`
+  on any cell that could only be given in characters, GATE.md columns
+  `reasoning chars | reasoning tokens | answer chars | answer tokens`, and
+  `[reasoning budget hit at N reasoning tokens]` in the `why` of any row whose reasoning span the
+  server ended. `tools/language_gap.py` reads both table shapes and no longer calls the characters
+  it reads tokens. The corrected statements are listed in `RESULTS.md` (correction of
+  2026-09-14 21:10); no measurement changed, only its unit.
 
 ### Documentation
 - [`docs/tune.md`](docs/tune.md) — "The keep fraction can choose itself", and why thinking is part
