@@ -1090,3 +1090,27 @@ the hatch on: 6 of 10 strict, 10 of 10 finished (7 and 9 without it), every row 
 gate was stopped unrun. The record is `results/escape/GATE-frontend-escape.md`, kept out of the
 profile's own record. What would change the verdict: a much higher margin (fewer, better-chosen
 fetches) and a fetch that skips the CB3 repack; both untested. The hatch stays off by default.
+
+### 2026-09-15 04:20 — prefill: the profiler, the bound test, and the first two fixes measured
+
+One 2,048-token chunk under the profiler (`tools/audit_gemm_dispatch.py`, Frontend keep-set at 0.36):
+GPU busy 99 %, 24,816 launches, so not launch-bound. Where the time goes: 855 ms in fp32 SIMT
+`sgemm` (the prefill attention softmax, 32 tiles × 21 layers × two products, operands widened to
+fp32), 893 ms in the FP4 MoE kernels, 597 ms in elementwise copies, 305 ms in the CB3 → FP4
+unpack, 252 ms in the KV concat. `tools/prefill_bound_test.py` at layer 10: routed MoE 54.1 ms at
+k = 6, 38.3 at k = 4, 30.9 at k = 3 — 0.57× at half the experts, so prefill MoE is compute-bound.
+
+Two fixes measured on one 7,003-token prompt (median of three, TTFT to first byte):
+
+| configuration | prefill | TTFT |
+|---|---|---|
+| shipped | 409 tok/s | 17.3 s |
+| `DSV41_PREFILL_FP8_DEQUANT=fused` | 422 tok/s (+3.3 %) | 16.7 s |
+| `DSV41_PREFILL_FUSED_SINKHORN=1` | 409 tok/s | 17.2 s |
+| both | 424 tok/s | 16.6 s |
+
+The fused Sinkhorn buys nothing — the launch count was never the cost — and the Frontend gate
+with both on came back 5 of 10 strict, 6 of 10 finished, with a think-exit and a corruption, against
+7 and 9. The Sinkhorn path is the only one of the two whose arithmetic differs from the shipped
+kernels; it stays off. The fused dequant is bit-identical by construction and gets its own gate
+before it is recommended. Records under `results/prefill/`.
