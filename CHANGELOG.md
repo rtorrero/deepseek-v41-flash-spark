@@ -102,6 +102,68 @@ so there is no measured long generation and no thinking-mode figure in this repo
 The earlier bring-up figures in `NOTES.md` taken on a 20 GB debug arena (6.9 % of the
 routed experts) are a measurement of that arena, not of the recipe — do not quote them.
 
+## 0.5.1-wip — 2026-09-15
+
+**Nothing here changes a shipped default, and nothing here has been measured on the box yet.** The
+prefill chunk has been the single largest transient this engine holds since 2,048-token chunks
+landed in 0.2.0, and the 7.2 GB the budget model reserves for it was a fit to a measurement with no
+itemisation behind it. This entry writes down what is in it and adds an opt-in way to make it
+smaller.
+
+### Added
+- **`DSV41_PREFILL_KV_FP8=1`** (default `0`) — the prefill path's gathered window and compressed KV
+  as one fp8 e4m3 buffer instead of two bf16 gathers and a concatenation of both. At a 2,048-token
+  chunk that is 1,280 KB a token of live bytes down to 320 KB, and the attention gather — 3.01 GB
+  at 32k context, four times the next largest moment — stops being the peak of a chunk at all. The
+  caches are untouched: the window ring and the compressed/index caches stay bf16, so everything
+  decode reads is in the format it is in today, and the decode path never takes this branch. The
+  bounded replay does not either — 128 queries have nothing to save and produce the prompt's final
+  logits. e4m3 rather than e5m2 for the mantissa bit (2^-4 against 2^-3 worst-case relative error)
+  and because range is not what is scarce in an rmsnorm output; it is also the format the reference
+  implementation uses for these very tensors. With the flag off, not one byte of the path changes.
+- **`DSV41_PREFILL_CHUNK=4096`** now works. It did not before: `DSV41_RING` was pinned at 4,096
+  slots and the window gather runs *after* the whole chunk is written into the ring, so a
+  4,096-token chunk wrapped the ring inside itself and the first queries of a chunk silently read
+  what the last ones wrote — the same failure class as the 64-slot ring in `docs/architecture.md`,
+  with the same absence of an exception. The ring default follows the chunk now
+  (`max(4096, chunk + 512)`, 22.5 MB more at 4,096), `Caches` refuses a ring that is too short by
+  name, and `start.sh` passes `DSV41_PREFILL_CHUNK`, `DSV41_PREFILL_KV_FP8` and `DSV41_RING` from
+  the environment the way it passes every other engine variable.
+- **`tools/verify_prefill_fp8.sh`** — the run that turns all of this into numbers: baseline, fp8,
+  and fp8 at a 4,096-token chunk, one identical ~7,000-token prompt each, with prefill tok/s, TTFT
+  measured at the client, and the low-water mark of `MemAvailable` sampled five times a second
+  throughout; then `tools/gate_profile.py --profile Frontend --thinking on` on the last of them,
+  because the rounding reaches an attention score and a memory number cannot see that. Results
+  under `results/prefill/`.
+- **`engine/test_prefill_kv_fp8.py`** — the e4m3 round trip against its 2^-4 bound, bit-identity
+  between the tiled fp8 gather and the bf16 gather it replaces at every chunk length and tile size,
+  the effect on an attention output, and that an out-of-range value saturates rather than becoming
+  a NaN that takes a whole query's softmax with it. Self-skips without CUDA.
+
+### Fixed
+- **The budget model priced a longer chunk wrong in one of its two terms.** The context term
+  (15.1 KB per token of context) comes from the indexer's score tiles, which are shaped
+  `[chunk × compressed positions]` — so it scales with the chunk as much as the chunk term does. It
+  was modelled as a constant, which at a 4,096-token chunk understated the reserve by 0.5 GB at 32k
+  and 2.0 GB at 128k. Corrected in `tools/budget.py` and `engine/v41_engine.py` together, and
+  `tools/test_budget.py` now fails if the two drift on the chunk factor, the fp8 saving, or either
+  rate.
+- `tools/budget.py` reads `DSV41_PREFILL_CHUNK`, `DSV41_PREFILL_KV_FP8` and `DSV41_RING` from the
+  environment, the way it already read `DSV41_DENSE_FP4` and `DSV41_HEAD_FMT`. A panel pricing a
+  2,048-token chunk on a box whose `.env` says 4,096 understates the reserve by 7 GB and its verdict
+  cannot be trusted.
+- `/health` reports `prefill_kv_fp8` and `ring` beside `prefill_chunk`, so a run can be told what
+  the engine actually read rather than what it was meant to be given.
+
+### Documentation
+- [`docs/memory-budget.md`](docs/memory-budget.md) gains **Where a prefill chunk's memory goes**:
+  every per-chunk allocation with its dtype and size at chunk 2,048, split into the terms that scale
+  with the chunk and the terms that scale with chunk × context, and the four moments that compete
+  for the peak. The headline of it is that the line items add up to **1.47 MB a token, not the ~5 MB
+  a token the pre-flight quotes** — the rest is the caching allocator's high-water mark, not a
+  tensor, and the instrument for that is `memory_allocated()` against `memory_reserved()`, which
+  nobody has run.
+
 ## 0.5.0 — 2026-09-14
 
 **Choosing what the box is good at becomes a thing you can see.** About 40 % of the routed experts

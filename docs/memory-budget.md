@@ -34,10 +34,11 @@ machine stops being reachable. Everything below is arranged around not doing tha
 | dense weights | 7.61 GB | measured at load, `7.09 GiB allocated after weights`, 2026-09-12 |
 | drafter experts | `3 x 128 x 18,800,640` = 7.22 GB | the DSpark MTP blocks, `engine/v41_engine.py` |
 | KV + indexer cache | `max_seq x 3,200 B` | `Caches` in `engine/model.py` |
-| sliding-window rings | `43 x 4096 x 512 x 2` = 180,355,072 B | same, and independent of `max_seq` |
+| sliding-window rings | `43 x RING x 512 x 2` = 180,355,072 B at `RING` 4,096 | same, independent of `max_seq`, but `RING` follows the prefill chunk |
 | warm-start pack scratch | 3 GB for `cb3`, 1 GB for `fp4` | the 3-bit packer's GPU buffers |
 | keep-free floor | 6 GB as the tool writes it; 20 GB is the engine's default | `KEEP_FREE_GB` |
-| prefill chunk | 7.2 GB at the default 2,048-token chunk, plus 15.1 KB per token of context | measured; see below |
+| prefill chunk | 7.2 GB at the default 2,048-token chunk, plus 15.1 KB per token of context — **both** scale with the chunk | measured; itemised in [Where a prefill chunk's memory goes](#where-a-prefill-chunks-memory-goes) |
+| prefill gather format | `DSV41_PREFILL_KV_FP8=1` takes 960 KB a token off the row above | `PREFILL_KV_FP8_SAVED_PER_TOKEN`, same section |
 
 Everything except the last two rows stays resident for the whole run.
 
@@ -154,6 +155,177 @@ than a ceiling derived from the formula.
 * The **pack scratch** and the **prefill chunk**, which are transient rather than resident. They are
   not in the resident total but they are in the gates, which is where they belong.
 
+## Where a prefill chunk's memory goes
+
+The 7.2 GB row above is a fit to a measurement, not a sum of tensors, and until 2026-09-15 nobody
+had written down what it is made of. This section does that: every allocation the prefill path makes
+for one chunk, with its dtype and its size at the shipped `DSV41_PREFILL_CHUNK=2048`, taken by
+reading `engine/model.py`, `tools/v41_ref.py` and the MoE kernels rather than by measuring.
+
+Shapes come from the checkpoint: `dim` 5,120, `hc_mult` 4, `n_heads` 64, `head_dim` 512,
+`q_lora_rank` 1,280, `o_groups` 8 × `o_lora_rank` 1,024, `window_size` 128, `index_topk` 512,
+`index_n_heads` 32 × `index_head_dim` 128, `moe_inter_dim` 2,304, six activated experts.
+
+### Per token of the chunk
+
+One layer at a time — the chunk loop holds one layer's working set, not forty. `T` is the chunk,
+2,048 in the right-hand column.
+
+| where | tensor | shape | dtype | B / token | at T=2,048 |
+|---|---|---|---|---:|---:|
+| carried | `h` (the residual stream) | `[T, 4, 5120]` | bf16 | 40,960 | 83.9 MB |
+| carried | `sh.topk` | `[T, 512]` | int64 | 4,096 | 8.4 MB |
+| attention | `qr` after `wq_a` | `[T, 1280]` | bf16 | 2,560 | 5.2 MB |
+| attention | `q` after `wq_b` + RoPE | `[T, 64, 512]` | bf16 | 65,536 | 134.2 MB |
+| attention | `kv`, the new window row | `[T, 512]` | bf16 | 1,024 | 2.1 MB |
+| attention | `wpos` | `[T, 128]` | int64 | 1,024 | 2.1 MB |
+| attention | **`wkv`, the gathered window** | `[T, 128, 512]` | bf16 | **131,072** | **268.4 MB** |
+| attention | **`ckv_rows`, the gathered compressed KV** | `[T, 512, 512]` | bf16 | **524,288** | **1,073.7 MB** |
+| attention | **`kv_all`, the concatenation of both** | `[T, 640, 512]` | bf16 | **655,360** | **1,342.2 MB** |
+| attention | the three masks | `[T, 128/512/640]` | bool | 1,280 | 2.6 MB |
+| attention | `outs`, the softmax rows, and their `cat` | `[T, 64, 512]` ×2 | fp32 | 262,144 | 536.9 MB |
+| attention | `o` after the inverse RoPE | `[T, 64, 512]` | bf16 | 65,536 | 134.2 MB |
+| attention | `wo_a` output | `[T, 8, 1024]` | bf16 | 16,384 | 33.6 MB |
+| attention | the block's output | `[T, 5120]` | bf16 | 10,240 | 21.0 MB |
+| indexer (8 layers) | `q` | `[T, 32, 128]` | bf16 | 8,192 | 16.8 MB |
+| indexer (8 layers) | the top-k indices | `[T, 512]` | int64 | 4,096 | 8.4 MB |
+| hyper-connections | `hc_mixes` flattened input | `[T, 20480]` | fp32 | 81,920 | 167.8 MB |
+| hyper-connections | `hc_pre` product | `[T, 4, 5120]` | fp32 | 81,920 | 167.8 MB |
+| hyper-connections | `hc_post` `mixed`, `residual.float()`, `y` | `[T, 4, 5120]` ×3 | fp32 | 245,760 | 503.3 MB |
+| MoE | `h`, the SwiGLU intermediate | `[6T, 2304]` | bf16 | 27,648 | 56.6 MB |
+| MoE | `parts`, one row per `(token, k)` | `[6T, 5120]` | fp32 | 122,880 | 251.7 MB |
+| MoE | routed + shared + their sum | `[T, 5120]` ×3 | fp32 | 61,440 | 125.8 MB |
+| MoE | router scores and logits | `[T, 384]` ×2 | fp32 | 3,072 | 6.3 MB |
+
+The softmax's own fp32 tiles are missing from the table on purpose: `_softmax_attn` runs in fixed
+64-query tiles, so its scratch — 83.9 MB for `kvt`, 8.4 MB for `qt`, three score tiles of 10.5 MB —
+is about 133 MB **whatever the chunk is**, and does not belong in a per-token column.
+
+### Per token of the context
+
+These are the indexer's, and they are shaped `[chunk × compressed positions]` — so they grow with
+the context **and** with the chunk. The column below is the rate at T=2,048; at T=4,096 every one of
+them doubles. Worst case is a ratio-1 layer (20 and up), where the compressed cache has one row per
+position.
+
+| where | tensor | shape | dtype | B / context token | at 32k |
+|---|---|---|---|---:|---:|
+| `_indexer` | `score` | `[T, n_c]` | fp32 | 8,192 | 268.4 MB |
+| `_select_candidates` (layer 20) | the `-inf`-padded copy of it | `[T, n_c]` | fp32 | 8,192 | 268.4 MB |
+| `_select_candidates` | the per-block maxima | `[T, n_c/8]` | fp32 | 1,024 | 33.6 MB |
+| carried, layers 20-39 | `sh.candidates` | `[T, n_c]` | bool | 2,048 | 67.1 MB |
+| layers 24, 28, 32, 36 | `~candidates` and the masked copy of `score` | `[T, n_c]` | bool + fp32 | 10,240 | 335.5 MB |
+
+`sh.candidates` is the one that is live for the rest of the chunk; the rest are transient inside one
+layer. Added up the way the engine meets them, the fitted 15.1 KB per context token is the right
+order and slightly conservative, which is the direction it was chosen in.
+
+### So where is the peak, and where is the 5 MB a token
+
+Two moments compete, and at the shipped configuration they are not close:
+
+| moment | live bytes at T=2,048, 32k context |
+|---|---:|
+| **`kv_all = cat([wkv, ckv_rows])` in `attention`** | **3.01 GB** |
+| `_select_candidates` at layer 20 | ~0.80 GB |
+| `hc_post` | ~0.67 GB |
+| the MoE kernel | ~0.61 GB |
+
+The attention gather is the peak by a factor of four, and it is the peak because the same values are
+held three times: the window gather, the compressed gather, and the concatenation of the two, all
+bf16, all alive at once — 1,280 KB a token of the 1,470 KB the whole moment costs.
+
+That also settles a question the 7.2 GB row could not answer. **The line items do not add up to
+5 MB a token. They add up to 1.47 MB a token** — the same order as the ~1.5 MB a token reported for
+this model on SGLang, which is the figure this path was being measured against. The rest of the
+fitted 3.5 MB a token, and of the ~5 MB a token the engine's pre-flight comment quotes, is **not a
+tensor**. It is the caching allocator's high-water mark: a chunk cycles
+through a dozen differently-shaped blocks per layer (the fp32 softmax tiles, `parts`, the three fp32
+copies inside `hc_post`), the allocator keeps every size class it has ever served, and on this box
+`MemAvailable` sees the reservation and not the live set.
+
+Two consequences follow, and they are the whole reason this section exists:
+
+* Cutting the largest live tensor also cuts the largest block class the allocator has to retain, so
+  it pays twice.
+* Whatever is left over after that is an allocator problem, not a tensor problem, and the instrument
+  for it is `torch.cuda.memory_allocated()` against `memory_reserved()` during a chunk — not another
+  pass over the shapes above. That measurement has not been taken.
+
+### `DSV41_PREFILL_KV_FP8=1`
+
+The three bold rows are what the flag addresses. With it on, `attention` stops building two bf16
+gathers and concatenating them and fills **one** `[T, window_size + index_topk, head_dim]` fp8
+buffer directly, 128 rows at a time (`Model._gather_kv_fp8`):
+
+| | bf16 (default) | fp8 e4m3 |
+|---|---:|---:|
+| gathered window | 128 KB / token | — |
+| gathered compressed KV | 512 KB / token | — |
+| their concatenation | 640 KB / token | 320 KB / token |
+| bf16 scratch, 128 rows, independent of T | — | 84 MB |
+| **the attention peak at T=2,048, 32k** | **3.01 GB** | **0.75 GB** |
+
+So the gather stops being the peak at all: at 32k the binding moment becomes `_select_candidates`
+at ~0.8 GB, which is a context term rather than a chunk term. `tools/budget.py` claims only the
+live-byte saving — 960 KB a token, `PREFILL_KV_FP8_SAVED_PER_TOKEN` — and not the allocator
+multiplier, because being pessimistic here costs expert slots and being optimistic costs the
+process.
+
+**e4m3 and not e5m2.** Three mantissa bits against two, so round-to-nearest is within 2^-4 = 6.25 %
+of a value instead of 2^-3 = 12.5 %, and the error lands in an attention score. The range e5m2
+would buy is range these tensors do not use: both are the output of an rmsnorm (plus RoPE on the
+last 64 dims), so O(1), and e4m3's ±448 is nine binades above that. Values are clamped to ±448
+before the cast because `float8_e4m3fn` has no infinity and overflows to NaN, and one NaN in a
+gathered row takes that query's whole softmax with it. It is also the format the reference
+implementation uses for exactly these tensors — `engine/model.py`'s docstring lists "window KV and
+compressed KV caches are kept in bf16 instead of fp8 / FP4-E4M3" as a deviation *towards* more
+precision, and this flag gives that deviation back for the prefill working copy only.
+
+**What it does not touch.** The window ring (`Caches.win`), the compressed KV cache (`Caches.ckv`)
+and the index cache (`Caches.ik`) stay bf16, so every byte decode later reads is in the format it is
+in today, and the decode path is not on this branch at all. The bounded replay is excluded as well
+(`T > window_size` guards it): 128 queries are 42 MB of gathered KV, there is nothing to save, and
+it is the pass that produces the prompt's final logits.
+
+**The quality risk is real and is not bounded by the round trip.** The rounding changes an attention
+output, the attention output changes the residual stream, and layers 21-39 write their window KV
+from that residual stream during the prompt — so prefill precision does reach the KV decode reads,
+by a longer path than the caches. The round trip itself is checked in
+`engine/test_prefill_kv_fp8.py` (at most 6.25 % relative on a value; well under 1 % on an attention
+output, once the softmax has reduced over 512 dimensions). The only instrument for the rest is a
+profile gate, which is why `tools/verify_prefill_fp8.sh` runs one.
+
+### A 4,096-token chunk
+
+Fewer chunks is the point: a chunk unpacks every resident expert of every layer once, so halving
+the number of chunks halves the unpack passes — and, on a streaming configuration, halves the NVMe
+traffic as well (`NOTES.md` S.2 measured 512 → 2,048 as a 52 % cut in prefill time). Three things
+have to be true for 4,096:
+
+1. **The ring has to grow.** The window gather runs *after* the whole chunk is written into the
+   ring, so `DSV41_RING` must exceed `window_size + chunk`; at chunk 4,096 the shipped 4,096-slot
+   ring wraps inside one chunk and the first queries silently read what the last ones wrote. The
+   default now follows the chunk — `max(4096, chunk + 512)` — and `Caches` refuses a ring that is
+   too short instead of computing the wrong answer. 4,608 slots is 202.9 MB against 180.4, i.e.
+   22.5 MB and about two expert slots.
+2. **The budget has to price it as a 4,096-token chunk in both terms.** `prefill_bytes` used to add
+   a context term that did not move with the chunk; it does now, in `tools/budget.py` and in
+   `engine/v41_engine.py` alike. At 32k the reserve goes 7.7 GB → 15.4 GB in bf16, and → 11.4 GB
+   with fp8.
+3. **It has to stay on a tile boundary.** `MM_TILE` is 16 rows and `ATTN_TILE` 64, and the last tile
+   of every GEMM is padded, so a chunk that overruns one pays about 30 % more iteration time for
+   rows that are only padding. 4,096 is a multiple of 128; so is 2,048; so is 512.
+
+Point 2 is why a 4,096-token chunk is not free even with fp8: 11.4 GB against the 7.7 GB the shipped
+configuration reserves is still 3.7 GB less free memory — about 250 expert slots at `cb3` — which is
+affordable at keep 0.36 and is not at keep 0.40.
+
+None of the three numbers in this subsection has been measured on the box yet.
+`tools/verify_prefill_fp8.sh` is the run that does it: baseline, fp8, fp8 at chunk 4,096, one
+identical ~7,000-token prompt each, with the low-water mark of `MemAvailable` sampled throughout and
+a profile gate on the last one.
+
 ## The two gates
 
 A configuration has to pass two separate checks, and they are not the same check.
@@ -195,7 +367,9 @@ free after load = MemAvailable − resident
 
 and that has to leave room for one prefill chunk. At the default 2,048-token chunk that is **7.2 GB**,
 plus **15.1 KB for every token of context**: 7.5 GB at 32k, 9.2 GB at 128k, 11.2 GB at 256k. Measured, not
-derived, and the measurement is the reason the gate exists:
+derived, and the measurement is the reason the gate exists. Both terms are proportional to
+`DSV41_PREFILL_CHUNK` and the first one moves with `DSV41_PREFILL_KV_FP8`; what is inside them is
+itemised in [Where a prefill chunk's memory goes](#where-a-prefill-chunks-memory-goes).
 
 | arena | free after load | what happened |
 |---|---|---|
@@ -280,6 +454,26 @@ python3 tools/test_budget.py
 Cross-checks the slot sizes against the kernel's own constant, the KV formula against two measured
 lengths, the launch gate against an arena the box accepted and one it did not, the `ARENA_GB`
 rounding at every keep step and ring size, and — by reading `engine/v41_engine.py` with a regular
-expression — that the engine still reserves a prefill chunk at the same rate this model assumes. If
-the two ever drift, the tool would start advising configurations the engine refuses, or worse, ones
-it accepts and the watchdog then kills.
+expression — that the engine still reserves a prefill chunk at the same rate this model assumes, by
+the same chunk factor, with the same fp8 saving. If the two ever drift, the tool would start
+advising configurations the engine refuses, or worse, ones it accepts and the watchdog then kills.
+It also checks that a 4,096-token chunk is priced in both terms, that the chunk stays on a tile
+boundary, and that `engine/model.py` still derives the ring default from the chunk and refuses a
+ring that is too short for it.
+
+```bash
+python3 engine/test_prefill_kv_fp8.py
+```
+
+The fp8 gather itself: the e4m3 round trip against its 2^-4 bound, that `_gather_kv_fp8` is
+bit-identical to quantising what the bf16 path gathers at every chunk length and gather tile, what
+the rounding does to an attention output, and that an out-of-range value saturates instead of
+becoming a NaN. Needs CUDA; skips itself with exit 0 anywhere else.
+
+```bash
+./tools/verify_prefill_fp8.sh
+```
+
+On the serving box: baseline, fp8, and fp8 at a 4,096-token chunk, one identical ~7,000-token
+prompt each, with prefill tok/s, TTFT and the low-water mark of `MemAvailable` per run, then a
+profile gate on the last one. This is the run that turns the arithmetic above into a measurement.

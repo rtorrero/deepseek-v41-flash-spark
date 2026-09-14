@@ -72,6 +72,23 @@ below 384 slots it **wraps inside a single layer** and the engine computes that 
 the wrong experts. No exception, no warning — just an 0.88 relative error in the output,
 which is exactly what the first smoke test produced. Default 400. Do not lower it.
 
+## The window ring must be longer than the chunk, and `DSV41_RING` is not the only thing that sets it
+
+A different ring, the same failure. Every layer keeps its own sliding-window KV in a ring of
+`DSV41_RING` positions, and `attention` writes the whole chunk into it **and then** gathers each
+query's 128-token window out of it — because a query's window reaches into its own chunk. So the
+ring has to be longer than `window_size + DSV41_PREFILL_CHUNK`, or the first queries of a chunk
+read the KV the last ones wrote. Wrong output, no exception, nothing in the log.
+
+This is why `DSV41_PREFILL_CHUNK=4096` did nothing useful before 0.5.1: the ring was pinned at
+4,096 slots and 128 + 4,096 does not fit in it. The default follows the chunk now
+(`max(4096, chunk + 512)`) and `Caches` refuses a short ring by name, so the two can only be wrong
+together if both are set by hand. 44 MB per 1,000 slots, over 40 layers plus 3 MTP blocks.
+
+While setting the chunk: keep it a **multiple of 128**. `MM_TILE` is 16 rows and `ATTN_TILE` is 64,
+the last tile of every GEMM is padded to full width, and a chunk that overruns a tile boundary pays
+about 30 % more iteration time for rows that are only padding.
+
 ## An expert is two reads, not six and not one
 
 The six tensors of an expert (`w1/w2/w3` × weight and scale) are not adjacent in the shard:
