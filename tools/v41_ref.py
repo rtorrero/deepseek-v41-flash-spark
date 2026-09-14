@@ -437,6 +437,13 @@ def prefill_dequant(w) -> torch.Tensor:
     return y
 
 
+# ----------------------------------------------------------- the fused HC Sinkhorn (Fix B)
+# `engine/hc_sinkhorn.hc_split_sinkhorn`, assigned by `engine/model.py` when triton is importable.
+# None keeps `hc_mixes(fused=True)` from being reachable at all, so a torch-only checkout still
+# runs. See engine/prefill_sinkhorn.py.
+HC_SINKHORN_FUSED = None
+
+
 # --------------------------------------------------------------------------- the LM head's format
 # DSV41_HEAD_FMT picks the stored format of `head.weight` ([129280, 5120], the one weight that is
 # read in full on every decode step):
@@ -616,11 +623,23 @@ def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc: int, iters: int, eps: float)
     return pre, post, comb
 
 
-def hc_mixes(x: torch.Tensor, hc_fn, hc_scale, hc_base, args: Args):
-    """x: [s, hc, d] -> (pre [s,hc], post [s,hc], comb [s,hc,hc]); normalized over the flattened stream."""
+def hc_mixes(x: torch.Tensor, hc_fn, hc_scale, hc_base, args: Args, fused: bool = False):
+    """x: [s, hc, d] -> (pre [s,hc], post [s,hc], comb [s,hc,hc]); normalized over the flattened stream.
+
+    `fused=True` runs the Sinkhorn on HC_SINKHORN_FUSED (engine/hc_sinkhorn.py, one Triton program
+    per token row) instead of the torch port under `tiled_rows`. The GEMM and the rsqrt above it
+    are unchanged and stay tiled -- only the ~130-kernel Sinkhorn moves, which at T = 2048 is
+    16,640 launches per call against one. One program per row is row-count- AND row-offset-
+    invariant by construction, so the tiling the torch path needs for chunk invariance is not
+    merely skipped there, it is replaced by something stronger. Off by default; see
+    engine/prefill_sinkhorn.py.
+    """
     xf = x.flatten(1).float()
     rsqrt = rms_rsqrt(xf, args.norm_eps)
     mixes = mm(xf, hc_fn) * rsqrt
+    if fused and HC_SINKHORN_FUSED is not None:
+        return HC_SINKHORN_FUSED(mixes, hc_scale, hc_base, args.hc_mult,
+                                 args.hc_sinkhorn_iters, args.hc_eps)
     return tiled_rows(lambda t: hc_split_sinkhorn(t, hc_scale, hc_base, args.hc_mult,
                                                   args.hc_sinkhorn_iters, args.hc_eps), mixes)
 

@@ -29,6 +29,7 @@ import v41_ref as R  # noqa: E402
 
 from engine import prefill_topk as PT  # noqa: E402  (torch-free; off unless the env asks)
 from engine import prefill_fp8 as PF  # noqa: E402  (torch-free; off unless the env asks)
+from engine import prefill_sinkhorn as PS  # noqa: E402  (torch-free; off unless the env asks)
 
 # Window ring slots. Must exceed window_size + the longest chunk a single forward sees, because
 # `attention` gathers a query's window out of the ring AFTER writing the whole chunk into it
@@ -60,9 +61,15 @@ ATTN_TILE = 64
 KEY_BLOCK = 512  # indexer score tile along the compressed-key axis (= index_topk)
 R.MM_TILE = MM_TILE
 
-# The prefill fp8 dequant switch of docs/gemm-dispatch.md, pushed into v41_ref the same way MM_TILE
-# is. It defaults to off and off is byte-identical: "off" is FP8Weight.dequant() and nothing else.
+# The two prefill switches of docs/gemm-dispatch.md, pushed into v41_ref the same way MM_TILE is.
+# Both default to off and off is byte-identical: PREFILL_FP8_MODE "off" is FP8Weight.dequant(), and
+# with HC_SINKHORN_FUSED never asked for, hc_mixes keeps the tiled torch Sinkhorn.
 R.PREFILL_FP8_MODE = PF.MODE
+try:  # the fused Sinkhorn decode has used all along; absent only where triton is not importable
+    from engine.hc_sinkhorn import hc_split_sinkhorn as _hc_fused  # noqa: E402
+    R.HC_SINKHORN_FUSED = _hc_fused
+except Exception:  # noqa: BLE001
+    _hc_fused = None
 
 
 # ----------------------------------------------------------------------------- weights
@@ -575,7 +582,9 @@ class Model:
               win_lo: int = 0):
         a = self.args
         residual = h
-        attn_pre, attn_post, attn_comb = R.hc_mixes(h, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, a)
+        fused_hc = PS.fused_prefill(prefill)
+        attn_pre, attn_post, attn_comb = R.hc_mixes(h, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, a,
+                                                    fused=fused_hc)
         y = R.hc_pre(h, pre_mix)
         y = R.rmsnorm(y, w.attn_norm, a.norm_eps)
         t0 = time.perf_counter()
@@ -583,7 +592,8 @@ class Model:
         self.stats["attn_s"] += time.perf_counter() - t0
         h = R.hc_post(y, residual, attn_post, attn_comb)
         residual = h
-        ffn_pre, ffn_post, ffn_comb = R.hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, a)
+        ffn_pre, ffn_post, ffn_comb = R.hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, a,
+                                                 fused=fused_hc)
         y = R.hc_pre(h, attn_pre)
         y = R.rmsnorm(y, w.ffn_norm, a.norm_eps)
         y = self.moe(y, w, L, prefill, store, arena, n_experts)
