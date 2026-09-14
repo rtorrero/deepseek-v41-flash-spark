@@ -12,7 +12,10 @@
 #       import torch and dispatch CUDA kernels. Named below so that a new
 #       tools/test_*.py is picked up without anyone editing a list.
 #   engine/test_*.py
-#       all five import torch, most of them load real expert weights.
+#       torch, and most of them real expert weights. The whole directory is left
+#       alone rather than listed by exception, so the two that would in fact run
+#       here -- engine/test_think_budget.py, and engine/test_attn_gemm_modes.py,
+#       which exits 0 when there is no CUDA device -- are skipped with the rest.
 #   server/test_server.py
 #       torch-free -- it drives server/app.py against the mock engine -- but it
 #       needs tokenizer.json and encoding/encoding.py out of the checkpoint, and

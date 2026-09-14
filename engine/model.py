@@ -29,6 +29,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 import v41_ref as R  # noqa: E402
 
+from engine import prefill_attn_gemm as AG  # noqa: E402  (torch-free; fp32 unless the env asks)
 from engine import prefill_topk as PT  # noqa: E402  (torch-free; off unless the env asks)
 from engine import prefill_fp8 as PF  # noqa: E402  (torch-free; off unless the env asks)
 from engine import prefill_sinkhorn as PS  # noqa: E402  (torch-free; off unless the env asks)
@@ -464,7 +465,7 @@ class Model:
         # fp32 PV product, like tools/v41_ref: rounding the probabilities to bf16 first is a
         # cliff that turns 1e-7 fp32 GEMM jitter into 1e-4 output jitter, which is enough to flip
         # a borderline router top-k and make the MoE output depend on the chunk length.
-        o = self._softmax_attn(q, kv_all, mask, w.attn_sink)
+        o = self._softmax_attn(q, kv_all, mask, w.attn_sink, prefill)
         o = torch.cat([o[..., :-rd], R.apply_rotary(o[..., -rd:], fq, inverse=True)], dim=-1)
         o = o.reshape(T, a.o_groups, -1)
         # grouped output projection: "sgd,grd->sgr" is a GEMM with M = number of tokens, so it too
@@ -474,34 +475,50 @@ class Model:
         self._tap("attn_out", L, out)
         return out
 
-    def _softmax_attn(self, q, kv_all, mask, sink):
+    def _softmax_attn(self, q, kv_all, mask, sink, prefill: bool = False):
         """Sinked softmax attention over [T, n, d] KV, in fixed-size query tiles.
 
         Padding rows are all-masked: their scores are -inf, so m clamps to -1e30, p is 0 and the
         sink term makes the denominator +inf -- 0/inf = 0, no NaN.
+
+        These two einsums are the two largest kernels of a prefill chunk: at ATTN_TILE=64 a
+        2,048-token chunk is 32 tiles, each tile issues one score product and one PV product, and
+        the encoder is 21 layers -- 672 of each, 855 ms together in the profile behind
+        docs/gemm-dispatch.md, against 893 ms for both FP4 MoE kernels. They are fp32, and fp32
+        means the SIMT pipeline: `cutlass_80_simt_sgemm_128x32_8x5_tn_align1` for the score
+        product and the `_nn_` variant for the PV product, neither of which touches a tensor core.
+        DSV41_PREFILL_ATTN_GEMM (engine/prefill_attn_gemm.py) is the switch that puts them there;
+        `mode_for` returns fp32 for every call that is not a prefill call, so the decode path is
+        untouched, and fp32 is byte-identical to the engine that shipped -- `.to(torch.float32)`
+        of a bf16 tensor is `.float()`, and the two `.to(dt)` calls are no-ops at dt=float32.
         """
         T = q.size(0)
         scale = self.args.head_dim ** -0.5
         B = ATTN_TILE if ATTN_TILE > 0 else T
+        mode = AG.mode_for(prefill)
+        dt = torch.bfloat16 if mode == "bf16" else torch.float32
 
         def tile(qt, kvt, mt):
-            scores = torch.einsum("thd,tnd->thn", qt, kvt) * scale
+            # .float() on the score product so the softmax is fp32 in every mode: bf16 operands
+            # still accumulate in fp32 on the tensor cores, it is only the epilogue that rounds.
+            scores = torch.einsum("thd,tnd->thn", qt, kvt).float() * scale
             scores = scores.masked_fill(~mt[:, None, :], float("-inf"))
             mx = scores.amax(dim=-1, keepdim=True).clamp_min(-1e30)
             p = torch.exp(scores - mx)
             denom = p.sum(-1, keepdim=True) + torch.exp(sink[None, :, None] - mx)
-            return torch.einsum("thn,tnd->thd", p / denom, kvt)
+            return torch.einsum("thn,tnd->thd", (p / denom).to(dt), kvt)
 
         outs = []
-        for i in range(0, T, B):
-            j = min(i + B, T)
-            qt, kvt, mt = q[i:j].float(), kv_all[i:j].float(), mask[i:j]
-            n = j - i
-            if n < B:  # pad the last tile so every call sees exactly B query rows
-                qt = torch.cat([qt, qt.new_zeros(B - n, *qt.shape[1:])])
-                kvt = torch.cat([kvt, kvt.new_zeros(B - n, *kvt.shape[1:])])
-                mt = torch.cat([mt, mt.new_zeros(B - n, mt.size(1))])
-            outs.append(tile(qt, kvt, mt)[:n])
+        with AG.math_scope(mode):
+            for i in range(0, T, B):
+                j = min(i + B, T)
+                qt, kvt, mt = q[i:j].to(dt), kv_all[i:j].to(dt), mask[i:j]
+                n = j - i
+                if n < B:  # pad the last tile so every call sees exactly B query rows
+                    qt = torch.cat([qt, qt.new_zeros(B - n, *qt.shape[1:])])
+                    kvt = torch.cat([kvt, kvt.new_zeros(B - n, *kvt.shape[1:])])
+                    mt = torch.cat([mt, mt.new_zeros(B - n, mt.size(1))])
+                outs.append(tile(qt, kvt, mt)[:n])
         return torch.cat(outs).to(torch.bfloat16)
 
     def _gather_kv_fp8(self, ring, wpos, sh: Shared, cidx, T: int):

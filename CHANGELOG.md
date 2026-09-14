@@ -124,9 +124,6 @@ bit, and no acceptance number in this repository moves until a fine-tuned head p
 `tools/verify_mtp.sh`.
 
 ### Added
-
-
-
 - **`DSV41_ESCAPE_K` / `DSV41_ESCAPE_MARGIN` — the escape hatch.** The keep-set is a hard mask, and
   a pick it takes away stays taken away for the whole request; the two ends of that trade are the
   measured ones (no mask at all passes the prompts every keep-set fails, at 1,008–1,549 s each —
@@ -363,9 +360,46 @@ bit, and no acceptance number in this repository moves until a fine-tuned head p
   forward would move the tokens the DSpark verify step accepts and nothing would crash — and off by
   default. Ungated, like the above.
 
+- **`DSV41_PREFILL_ATTN_GEMM=fp32|tf32|bf16` — the math type of prefill's two attention GEMMs**,
+  and the finding that made it worth having. The first `tools/audit_gemm_dispatch.py --phase
+  prefill` run on the box put the largest single kernel cost of a 2,048-token chunk not in the MoE
+  but in `cutlass_80_simt_sgemm_128x32_8x5_tn_align1` (559.5 ms, 672 calls) and its `_nn_` variant
+  (295.7 ms, 672 calls) — **855 ms, more than both FP4 MoE kernels together** (`_moe_up` 483 +
+  `_moe_down` 410). The call counts name the matmuls with no ambiguity: they are the score product
+  and the PV product of `engine/model.py::Model._softmax_attn`, which runs in `ATTN_TILE = 64`
+  query tiles, so 2,048 / 64 = 32 tiles × 1 product × 21 encoder layers = 672 of each, 1,344
+  together, and nothing else in the prefill path has that count (the `MM_TILE = 16` sites issue 128
+  per layer per projection). `simt_sgemm` says fp32 through the FFMA pipeline: those GEMMs never
+  touch a tensor core. `tf32` arms `torch.backends.cuda.matmul.allow_tf32` and
+  `float32_matmul_precision` around the tile loop and restores both in a `finally` — inputs rounded
+  to an 11-bit significand, accumulation still fp32, ~1e-3 on the product; `bf16` skips the fp32
+  widening altogether — 8-bit significand, ~4e-3, and 84 MB less transient per tile (the
+  `[64, 640, 512]` fp32 copy of the gathered KV, ~56 GB written per chunk, which `tf32` keeps).
+  Prefill only in both cases: `mode_for(prefill)` returns fp32 for every other call, so the captured
+  decode graphs, the DSpark drafter and `engine/fastdecode.py` keep strict fp32 whatever the
+  environment says. **`fp32` is the default and is byte-for-byte the engine that shipped** — the new
+  `engine/prefill_attn_gemm.py` writes nothing and imports no torch on that path, and
+  `tools/test_prefill_attn_gemm.py` (torch-free) holds the default, the alias, the prefill guard,
+  the scoped restore and every call site to that mechanically;
+  `engine/test_attn_gemm_modes.py` compares all three modes on the real shapes against those error
+  bounds from both sides and self-skips where there is no GPU. `tools/budget.py::prefill_bytes` is
+  unaffected — `tf32` allocates what the engine always did and `bf16` allocates less.
+  **Ungated**: no prompt has been generated with either non-default mode armed, and a speed number
+  cannot accept one. This engine's chunk-invariance argument is built on 1e-7 GEMM jitter — the
+  comment directly above these two einsums says rounding the probabilities to bf16 is "a cliff that
+  turns 1e-7 fp32 GEMM jitter into 1e-4 output jitter, which is enough to flip a borderline router
+  top-k" — so what breaks is a different expert deep in a long prompt, which only generation shows.
+  `tools/verify_prefill_hc.sh` is the run that would say: one identical ~7,000-token prompt in each
+  of the three modes (prefill tok/s and TTFT from the server), then the kernel audit in `fp32` and
+  `tf32` with the server stopped, then `tools/gate_profile.py --profile Frontend --thinking on` on
+  the recommended mode; record under `results/prefill/`, transcript in `/tmp/prefill_hc.log`.
+  `DSV41_PREFILL_HC_GEMM` is accepted as an alias — the name the investigation started under,
+  before the call counts said attention rather than the Hyper-Connection residual. The audit is
+  appended to [`docs/gemm-dispatch.md`](docs/gemm-dispatch.md), including why `align1` is **not** a
+  layout bug to fix (both operands are already contiguous and 16-byte aligned) and why the other
+  fp32 GEMM, the HC mix projection, needs `tools/fp32_skinny.py` rather than a math type.
+
 ### Changed
-
-
 
 - `env.example` ships `PRUNE_KEEP=auto` with `ARENA_GB` **empty**. When the keep fraction is
   resolved and no arena is pinned, `./start.sh` sizes the arena for the kept set: the engine's own
@@ -382,8 +416,6 @@ bit, and no acceptance number in this repository moves until a fine-tuned head p
   0.36 and does not fit keep 0.39 — the trade is explicit rather than discovered by the watchdog.
 
 ### Fixed
-
-
 
 - `./start.sh` no longer exits silently, before printing anything, on a checkout with no
   `results/trace-*/stats/coverage.json`: the fallback lookup ends in a failed test, and under
@@ -418,8 +450,6 @@ bit, and no acceptance number in this repository moves until a fine-tuned head p
 
 ### Documentation
 
-
-
 - [`docs/tune.md`](docs/tune.md) — "The keep fraction can choose itself", and why thinking is part
   of a gate result rather than a preference.
 - [`docs/memory-budget.md`](docs/memory-budget.md) — "Asking the ladder instead of reading it",
@@ -444,8 +474,6 @@ bit, and no acceptance number in this repository moves until a fine-tuned head p
   prefill reserve, with what `cached` holds after each phase of a prompt.
 
 ### Checks
-
-
 
 - `tools/test_keep_for_context.py` — the resolution at every context length against a fake host,
   monotonicity in the context, `ARENA_GB` capping, the gate-floor warning, numeric passthrough,

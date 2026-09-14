@@ -425,3 +425,168 @@ microscopic, so none of them appears in a top-20-by-GPU-time list at any share; 
 either way is the launch count and the GPU-busy fraction that `tools/audit_gemm_dispatch.py`
 reports beside the table, which is why the verify script runs it on the baseline and on both-on
 and on nothing in between.
+
+---
+
+## What the run found: two fp32 attention GEMMs, 855 ms of a 2,048-token chunk
+
+*Added 2026-09-15, after the first `tools/audit_gemm_dispatch.py --phase prefill` run on the box:
+one 2,048-token chunk, the shipped configuration, GPU 99 % busy over 24,816 launches.*
+
+The prediction above was about the MoE. The largest single line in the table is not in the MoE and
+is not a quantised kernel at all:
+
+| kernel | ms | calls |
+|---|---|---|
+| `cutlass_80_simt_sgemm_128x32_8x5_tn_align1` | 559.5 | 672 |
+| `cutlass_80_simt_sgemm_128x32_8x5_nn_align1` | 295.7 | 672 |
+| **both together** | **855.2** | **1,344** |
+| `_moe_up_kernel` | 483 | — |
+| `_moe_down_kernel` | 410 | — |
+
+`simt_sgemm` says fp32 through the SIMT pipeline: FFMA, not a tensor core. On this box that costs
+roughly an order of magnitude against the tensor-core path before any tiling question is asked.
+The two rows are more expensive than both FP4 MoE kernels the chunk exists to run.
+
+### Which matmuls they are, from the call counts
+
+The count settles it without a single ambiguity. `engine/model.py::Model._softmax_attn` runs the
+attention softmax in fixed query tiles of `ATTN_TILE = 64` rows, and each tile issues exactly two
+products:
+
+```python
+scores = torch.einsum("thd,tnd->thn", qt, kvt) * scale   # the score product
+...
+return torch.einsum("thn,tnd->thd", p / denom, kvt)      # the PV product
+```
+
+with `qt = q[i:j].float()` and `kvt = kv_all[i:j].float()` — both widened from the bf16 they are
+stored in, so both einsums are fp32, and `torch.einsum` on a `[t, ·, ·]` pair is a strided-batched
+cuBLAS GEMM, which reaches the same cutlass kernels `F.linear` does.
+
+```
+      2048 tokens / ATTN_TILE 64        =  32 tiles per layer
+      x 1 score product per tile        =  32 score GEMMs per layer
+      x 21 encoder layers (0..20, the candidate-source layer; DSV41_SWA_REPLAY=1)
+                                        = 672 calls   <- the _tn_ row
+      and the same arithmetic for the PV product
+                                        = 672 calls   <- the _nn_ row
+                                  total = 1,344
+```
+
+32 per layer, 672 per product, 1,344 together: exactly the profile. Nothing else in the prefill
+path has that count — the `MM_TILE = 16` sites issue 128 calls per layer per projection at this
+chunk length (the HC mix GEMM twice, the router gate once, the compressor twice on the KV-source
+layers), and the indexer's score einsum is bf16 and nested two deep. *Verified in code.*
+
+The `_tn_` / `_nn_` split matches the two contractions: `thd,tnd->thn` contracts the last axis of
+both operands (one operand transposed, `tn`, and the more expensive of the two because N = the KV
+width), `thn,tnd->thd` is an ordinary product (`nn`).
+
+Shapes, per tile, batch 64 (the query rows):
+
+| | M | N | K | operands |
+|---|---|---|---|---|
+| score | 64 (`n_heads`) | 640 (`window_size` 128 + `index_topk` 512) | 512 (`head_dim`) | fp32, contiguous |
+| PV | 64 | 512 | 640 | fp32, contiguous |
+
+Two of the 21 encoder layers have no compressed stream (`w.ratio == 0`), and their KV width is 128
+rather than 640; the arithmetic above is unchanged because the tile count is a property of the
+query axis, not of the KV axis.
+
+That is 2.68 GFLOP per product per tile, so 3.6 TFLOP per chunk for the pair — 855 ms of it is
+~4.2 TFLOP/s, which is about a quarter of this box's fp32 SIMT ceiling. Half of the shortfall is
+visible in the kernel name: a `128x32` threadblock tile against M = 64 leaves half the tile idle.
+
+### About `align1`
+
+`align1` is the alignment-1 (scalar-load, non-vectorised) variant, and it is worth saying plainly
+that **there is no alignment fix to make here**. `q` is a fresh contiguous tensor out of
+`torch.cat`, `kv_all` a fresh contiguous tensor out of `torch.cat`, `p / denom` a fresh contiguous
+tensor, and every leading dimension in play — 512, 640, 128 — is a multiple of four floats, i.e.
+16-byte aligned, on top of base pointers the caching allocator hands out 512-byte aligned. Both
+operands already satisfy `align4`. The alignment-1 pick follows from cuBLAS's heuristics for the
+batched fp32 path, not from anything the caller can restride, so the lever is the **math type**,
+not the layout. (This is the one place the audit's own advice — read the kernel name — can be
+read too eagerly: a name that describes the kernel cuBLAS chose is not always a description of a
+mistake the caller made.)
+
+Nor is the tiling the lever. Raising `ATTN_TILE` above 64 would halve or quarter the launch count,
+but at 855 ms over 1,344 calls each call is 0.64 ms — launch overhead is well under a percent of
+it — and it would not improve a single GEMM, because the batch axis is the query rows and M stays
+`n_heads = 64` whatever the tile is. It would only cost transient memory, linearly.
+
+One layout cost *is* real and is not in the sgemm rows: `kv_all[i:j].float()` materialises a
+`[64, 640, 512]` fp32 tile, 83.9 MB, once per tile — 2.7 GB written per layer, ~56 GB written and
+~28 GB read per 2,048-token chunk, purely to widen bf16 that the GEMM is about to reduce anyway.
+It shows up in the profile's `elementwise` / `copy_` rows, not in the GEMM rows. Only the `bf16`
+mode below removes it; `tf32` keeps every byte of it.
+
+### The switch: `DSV41_PREFILL_ATTN_GEMM=fp32|tf32|bf16`
+
+`engine/prefill_attn_gemm.py`, prefill-only, `fp32` by default, and `fp32` is byte-for-byte the
+engine that shipped — the module writes nothing and imports no torch on that path, and the two
+`.to(dt)` calls in `_softmax_attn` are identities at `dt=float32`.
+
+| mode | what changes | error against fp32 | memory |
+|---|---|---|---|
+| `fp32` | nothing | 0 (bit-identical) | as shipped |
+| `tf32` | `torch.backends.cuda.matmul.allow_tf32` and `float32_matmul_precision` armed around the tile loop and restored after it | inputs rounded to an 11-bit significand, fp32 accumulate: ~2^-11 = 4.9e-4 per operand, of the order of 1e-3 on the product | as shipped |
+| `bf16` | the operands are never widened; bf16 in, fp32 accumulate on the tensor cores; the score product is widened back before the softmax | 8-bit significand: ~2^-8 = 3.9e-3 | **less** — the 84 MB-per-tile fp32 widening disappears |
+
+`tf32` is the "keep fp32 accumulate" path: TF32 truncates the operands and still accumulates in
+fp32, which is why it sits an order of magnitude closer to the reference than `bf16` does.
+
+`tools/budget.py::prefill_bytes` is unaffected: `fp32` and `tf32` allocate exactly what the engine
+always allocated, and `bf16` allocates strictly less, so the ceiling the budget enforces still
+holds in every mode and no gate moves.
+
+### The risk, and why a tok/s number cannot accept either mode
+
+This engine's precision argument is chunk invariance — `v41_ref.mm`'s 16-row tiling, `ATTN_TILE`
+itself, `allow_bf16_reduced_precision_reduction = False` — and the reason is written directly above
+this GEMM pair in `engine/model.py`: *"rounding the probabilities to bf16 first is a cliff that
+turns 1e-7 fp32 GEMM jitter into 1e-4 output jitter, which is enough to flip a borderline router
+top-k and make the MoE output depend on the chunk length."* Both non-default modes are far above
+1e-7. `tf32`'s 5e-4 on the operands is three orders of magnitude above the jitter the design
+budgets for, and `bf16`'s 4e-3 is the cliff itself, named.
+
+What goes wrong is therefore not a wrong number but a different expert, deep in a long prompt, and
+the only instrument that sees it is generation. `tools/verify_prefill_hc.sh` ends on
+`tools/gate_profile.py --profile Frontend --thinking on` for that reason, and its record says so
+in as many words when the gate was skipped. The prefill path also writes the global KV and the
+window rings that every later decode step reads, so a prefill-only precision change is not
+decode-neutral in its *effects*, only in its *kernels*.
+
+Both modes remain ungated as this is written: the arithmetic and the bounds are settled, no
+generation has been taken on the box with either armed.
+
+### What to run, and what each answer means
+
+```
+./tools/verify_prefill_hc.sh                 # three speed runs, two audits, one gate
+SKIP_GATE=1 ./tools/verify_prefill_hc.sh     # speed + audit only, and accepts nothing
+```
+
+| what the run shows | reading |
+|---|---|
+| the two 672-call `simt_sgemm` rows present in the `fp32` audit | the finding reproduces |
+| the `tf32` audit still showing them, unchanged | the flag never reached cuBLAS — every speed number in that run is fp32 measured three times, and nothing else in the record is worth reading |
+| `tf32` showing a `tensorop` / `s1688` / `s16816` name at roughly 672 calls, sgemm ms down | the GEMMs moved to the tensor cores; the prefill tok/s row says what that bought |
+| prefill tok/s flat while the sgemm ms fell | the chunk was never bound by those kernels — look at the GPU-busy fraction and the launch count instead (the Sinkhorn tiling, §8–9) |
+| `bf16` much faster than `tf32` | that is the 56 GB of widening, not the GEMM; it is the strongest speed case and the weakest precision case |
+| the gate on `tf32` matching `results/keepsets/frontend/GATE.md` | the only evidence that would accept the mode |
+
+### The other fp32 GEMM, which this switch deliberately does not touch
+
+The Hyper-Connection mix projection (`tools/v41_ref.py::hc_mixes` → `mm`) is fp32 too, at M=16,
+N=24, K=20480 under the `MM_TILE` tiling — 5,376 calls per chunk. It is cuBLAS's
+`gemmSN_TN_kernel`, not a cutlass simt sgemm, it is latency-bound rather than FLOP-bound, and its
+cure is not a math type: the split-K Triton kernel in `tools/fp32_skinny.py` already does it in
+fp32 throughout (`input_precision="ieee"`) at 3× cuBLAS's speed, and `engine/fastdecode.py` has
+used it since it was written. Prefill does not. That is a separate, precision-free change and it
+belongs with the Sinkhorn item in §8–9, not here.
+
+`DSV41_PREFILL_HC_GEMM` is accepted as an alias for the switch: the investigation began on the
+assumption that the 1,344 calls were the HC residual's, the call counts said attention instead, and
+the alias is kept so that name still reaches the right knob.
