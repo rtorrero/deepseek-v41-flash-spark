@@ -128,7 +128,10 @@ def safetensors_header(path: str) -> dict:
 
 def mtp_inventory(model_dir: str) -> dict:
     """{name: (shape, dtype)} for every `mtp.*` tensor, plus embed/head, from the headers alone."""
-    wm = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))["weight_map"]
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    if not os.path.exists(index):
+        raise SystemExit(f"no checkpoint index at {index}; set MODEL_DIR or pass --model-dir")
+    wm = json.load(open(index))["weight_map"]
     want = [k for k in wm if k.startswith("mtp.") or k in ("embed.weight", "head.weight")]
     by_file = {}
     for k in want:
