@@ -44,6 +44,15 @@ STEP_TIMING = os.environ.get("DSV41_STEP_TIMING", "0") == "1"
 # draw, and the greedy path computes argmax of the same logits in the same order.
 LEAN_STEP = os.environ.get("DSV41_LEAN_STEP", "1") == "1"
 
+# Training data for the DSpark drafter (engine/draft_record.py, docs/architecture.md "Fine-tuning
+# the drafter"). Unset -- the default -- and the module is never imported, no buffer is allocated,
+# and the decode loop runs one `is not None` test per verified block; the arithmetic of a step is
+# byte-identical either way. Set to a directory and every settled position of every request is
+# appended to a per-request shard: the target's last hidden state, the token it settled on and its
+# top-32 next-token logits. ~31 KB per token, which at 17 tok/s is 527 KB/s -- it is the D2H copy
+# and not the disk that this costs, about 0.3 ms per block.
+RECORD_DRAFT_DATA = os.environ.get("DSV41_RECORD_DRAFT_DATA", "").strip()
+
 
 class StepPhases:
     """Accumulating per-phase timer, printed as a table over a whole run."""
@@ -750,6 +759,16 @@ class V41Engine:
         self._vhost = torch.empty(_TV + 1, dtype=torch.long).pin_memory()
         torch.cuda.synchronize()
         self.last_stats = {}
+        self.recorder = None
+        if RECORD_DRAFT_DATA:
+            from engine.draft_record import DraftRecorder
+            self.recorder = DraftRecorder(
+                RECORD_DRAFT_DATA,
+                hidden_dim=self.args.dim * len(self.args.dspark_target_layer_ids),
+                meta={"block": self._tv - 1, "spec": bool(spec), "max_seq": max_seq,
+                      "prune_keep": prune_keep, "trace_stats": trace_stats})
+            log(f"recording DSpark training data to {RECORD_DRAFT_DATA} "
+                f"(~{self.recorder.dt.itemsize / 1024:.1f} KiB per settled token)")
         log("ready")
 
     # ------------------------------------------------------------------ generation
@@ -803,10 +822,17 @@ class V41Engine:
         accepted_hist = []
         t_prefill = 0.0
         t_decode0 = t_start
+        rec = self.recorder
+        if rec is not None:
+            rec.open_run(tag=f"p{P}", prompt_tokens=P)
         try:
             yield from self._decode_loop(ids, P, max_tokens, temperature, top_p, stop_ids,
                                          _st := {}, grammar, penalties)
         finally:
+            if rec is not None:
+                # the server closes the generator on a stop string or a disconnect, so the shard is
+                # closed here and not at the end of the loop, which an abort never reaches
+                rec.close_run("done")
             n_out = _st.get("n_out", n_out)
             steps = _st.get("steps", steps)
             accepted_hist = _st.get("accepted", accepted_hist)
@@ -862,6 +888,10 @@ class V41Engine:
             logits, mh, s_rep = m.decoder_replay(need_logits=True)
             if self.spec:
                 m.dspark_seed(mh, s_rep)
+            if self.recorder is not None:
+                # the replay pass covers exactly the last `window_size` prompt positions, which is
+                # exactly the drafter's window at the first decode position
+                self.recorder.add_context(ids[s_rep:s_rep + mh.size(0)], mh, s_rep)
         else:
             for s in range(0, P, MAX_CHUNK):
                 chunk = ids[s:s + MAX_CHUNK]
@@ -869,6 +899,10 @@ class V41Engine:
                 logits, mh = m.forward(chunk, s, prefill=True, need_logits=last)
                 if self.spec:
                     m.dspark_seed(mh, s)
+                if last and self.recorder is not None:
+                    w = self.args.window_size
+                    n = min(w, mh.size(0))
+                    self.recorder.add_context(chunk[-n:], mh[-n:], s + chunk.size(0) - n)
         t_prefill = time.perf_counter() - t_start
         out_st["t_prefill"] = t_prefill
         pen = penalties if (penalties is not None and penalties.active) else None
@@ -970,6 +1004,11 @@ class V41Engine:
                     m.c.rollback(pos + a + 1)
                     if ph is not None:
                         ph.mark("rollback")
+                    if self.recorder is not None:
+                        # rows 0..a of the block are settled tokens at positions pos..pos+a, and row
+                        # i of `logits` is the distribution that follows position pos+i. The bonus
+                        # token has no hidden state yet -- it becomes row 0 of the next step.
+                        self.recorder.add_block(block, logits, mh, pos, a + 1)
                     accepted_hist.append(a)
                     emitted = list(new)
                     if bonus is not None:
@@ -1032,6 +1071,8 @@ class V41Engine:
                     m.dspark_seed(mh[:a + 1], pos)
                 if ph is not None:
                     ph.mark("rollback")
+                if self.recorder is not None:
+                    self.recorder.add_block(block, logits, mh, pos, a + 1)
                 accepted_hist.append(a)
                 emitted = list(new)
                 if bonus is not None:
@@ -1063,6 +1104,10 @@ class V41Engine:
                     grammar.mask_rows(logits, None)
                 if pen is not None:
                     pen.apply(logits, out)
+                if self.recorder is not None:
+                    # SPEC=0: one settled position per step, `tok` at `pos`, logits[0] after it.
+                    # Slower to collect, but the data is not shaped by the drafter that produced it.
+                    self.recorder.add_block(torch.tensor([tok], device=self.device), logits, mh, pos, 1)
                 pt = sample_probs(logits[0], temperature, top_p)
                 tok = int(torch.multinomial(pt, 1)) if temperature > 0 else int(pt.argmax())
                 pos += 1
