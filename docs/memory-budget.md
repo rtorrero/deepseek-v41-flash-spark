@@ -40,8 +40,9 @@ machine stops being reachable. Everything below is arranged around not doing tha
 | prefill chunk | 7.2 GB at the default 2,048-token chunk, plus 15.1 KB per token of context — **both** scale with the chunk | measured; itemised in [Where a prefill chunk's memory goes](#where-a-prefill-chunks-memory-goes) |
 | prefill gather format | `DSV41_PREFILL_KV_FP8=1` takes 960 KB a token off the row above | `PREFILL_KV_FP8_SAVED_PER_TOKEN`, same section |
 | prefill unpack cache | 0 by default; whatever `DSV41_PREFILL_UNPACK_CACHE_GB` asks for, in whole 18.80 MB experts | see below |
+| prefill fp8 dequant cache | 0 by default; 3.70 GB with `DSV41_PREFILL_FP8_DEQUANT=cached` | `engine/prefill_fp8.CACHE_BYTES`; see below |
 
-Everything except the last four rows stays resident for the whole run.
+Everything except the last five rows stays resident for the whole run.
 
 ### Kept experts
 
@@ -451,6 +452,30 @@ FATAL: host MemAvailable 0.4 GB stayed below the 2.5 GB floor for 3.0 s
 has prefilled, so it cannot see the 7.2 GB of drafter and the chunk cost that turn 98 GB from a
 configuration that starts into one that dies. That asymmetry is the single most useful thing the
 tool does: it applies gate 2 and refuses configurations the engine would have accepted.
+
+#### One setting adds to this reserve: `DSV41_PREFILL_FP8_DEQUANT=cached`
+
+The weights that are still fp8 at prefill row counts — `ffn.shared_experts.w1/w2/w3` on every
+layer, the indexer `wq_b` on every index-source layer, the engram `wkv` on every engram layer — are
+dequantised to bf16 and handed to cuBLAS above M = 16. `cached` keeps that bf16 copy for the rest
+of the request's prefill instead of rebuilding it per chunk, and a copy that outlives a chunk is
+memory the gate has to clear:
+
+| what has run | weights held | bf16 bytes |
+|---|---|---|
+| the encoder pass, layers 0..20 (the chunk loop) | 1.079 G | **2.16 GB** |
+| + the decoder replay (21..39) and the DSpark seed | 1.851 G | **3.70 GB** |
+
+The engram `wkv` is `[25600, 6144]` and is 0.63 GB of the first row on its own — the item nobody
+expects to be large. `tools/budget.py` charges the **whole-prompt** figure, because that is the
+high-water mark a reserve has to clear, and it reads the variable itself
+(`fp8_cache_from_env()`), so `PRUNE_KEEP=auto` and `./tune.sh` already answer for the mode that is
+actually set. At 256k that moves the reserve from 11.25 GB to 14.96 GB, which is about 250 expert
+slots off the arena.
+
+`engine/prefill_fp8.cache_bytes()` derives both rows from the checkpoint's shapes and
+`tools/test_prefill_fp8.py` pins the derivation. The default (`off`) and the recommended mode
+(`fused`) add nothing: `fused` produces the same bf16 bits in one Triton launch and keeps nothing.
 
 ### The verdict
 

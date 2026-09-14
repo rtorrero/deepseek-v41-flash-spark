@@ -42,8 +42,10 @@ import torch.nn.functional as F
 
 try:
     from fp8_linear import FP8Weight, fp8_linear, quantize_to_fp8  # tools/fp8_linear.py (Triton); dense weights stay fp8 in memory
+    from fp8_linear import dequant_fused as fp8_dequant_fused      # the same bf16, two transient bytes per weight
 except Exception:  # noqa: BLE001
     FP8Weight, fp8_linear, quantize_to_fp8 = None, None, None
+    fp8_dequant_fused = None
 
 try:
     from fp8_linear import FP8GroupedWeight, fp8_grouped_linear  # wo_a stays fp8 too (grouped GEMM)
@@ -392,6 +394,55 @@ class EngramWeights:
 # ----------------------------------------------------------------------------- ops
 MM_TILE = 0  # 0 = plain GEMMs. >0 = run every activation GEMM in fixed-size row tiles; see mm().
 
+# --------------------------------------------------------------- the prefill fp8 dequant (Fix A)
+# How `dense()` turns an FP8Weight into bf16 above decode-sized M. "off" is `FP8Weight.dequant()`,
+# the shipped path, and is what this module does on its own -- `engine/model.py` assigns the mode
+# here from `engine.prefill_fp8`, the same way it assigns MM_TILE, so tools that import v41_ref
+# without the engine keep the reference behaviour. See engine/prefill_fp8.py for the arithmetic
+# behind the three modes and for why `scaled_mm` is refused rather than implemented.
+PREFILL_FP8_MODE = "off"
+
+# `cached` keeps the bf16 result for the rest of a request's prefill, so a weight is dequantised on
+# the first chunk and read back on every chunk after it. Keyed by the weight object, which lives as
+# long as the process; `engine/model.py` empties it at `begin_prompt()` and at the end of
+# `decoder_replay()`, i.e. before the first decode step.
+_FP8_PREFILL_CACHE: dict = {}
+
+
+def prefill_fp8_cache_clear() -> None:
+    """Drop every cached bf16 dequant. Cheap and safe to call when the mode is off."""
+    _FP8_PREFILL_CACHE.clear()
+
+
+def prefill_fp8_cache_bytes() -> int:
+    """Bytes the cache is holding right now -- what `engine/prefill_fp8.cache_bytes()` predicts."""
+    return sum(t.numel() * t.element_size() for t in _FP8_PREFILL_CACHE.values())
+
+
+def prefill_dequant(w) -> torch.Tensor:
+    """The bf16 weight `dense()` hands to cuBLAS above M = 16.
+
+    Off (the default) this is `w.dequant()` and nothing else; the byte-identical path. `fused` is
+    one Triton launch producing the same bf16 values (tools/fp8_linear.dequant_fused), `cached` is
+    `fused` plus memoisation for the rest of the prefill.
+    """
+    mode = PREFILL_FP8_MODE
+    if mode == "off" or fp8_dequant_fused is None:
+        return w.dequant()
+    if mode != "cached":
+        return fp8_dequant_fused(w)
+    y = _FP8_PREFILL_CACHE.get(w)
+    if y is None:
+        y = _FP8_PREFILL_CACHE[w] = fp8_dequant_fused(w)
+    return y
+
+
+# ----------------------------------------------------------- the fused HC Sinkhorn (Fix B)
+# `engine/hc_sinkhorn.hc_split_sinkhorn`, assigned by `engine/model.py` when triton is importable.
+# None keeps `hc_mixes(fused=True)` from being reachable at all, so a torch-only checkout still
+# runs. See engine/prefill_sinkhorn.py.
+HC_SINKHORN_FUSED = None
+
 
 # --------------------------------------------------------------------------- the LM head's format
 # DSV41_HEAD_FMT picks the stored format of `head.weight` ([129280, 5120], the one weight that is
@@ -539,7 +590,8 @@ def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
 def dense(x: torch.Tensor, w) -> torch.Tensor:
     """x @ w^T where w is a bf16 tensor, an FP8Weight (stored-format fp8 + ue8m0 block scales) or an
     FP4Weight (E2M1 codes + one ue8m0 scale per 32 K weights).
-    FP8Weight: the Triton kernel for decode-sized M, otherwise a transient bf16 dequant + cuBLAS.
+    FP8Weight: the Triton kernel for decode-sized M, otherwise a transient bf16 dequant + cuBLAS
+    (DSV41_PREFILL_FP8_DEQUANT picks how that dequant is produced; see prefill_dequant).
     FP4Weight: the Triton kernel at every M (BLOCK_M 16 / 64); DSV41_FP4_DENSE_PREFILL=dequant
     restores the transient-dequant + cuBLAS shape of the fp8 path for M > 16."""
     if FP4Weight is not None and isinstance(w, FP4Weight):
@@ -549,7 +601,7 @@ def dense(x: torch.Tensor, w) -> torch.Tensor:
     if FP8Weight is not None and isinstance(w, FP8Weight):
         if x.numel() // x.shape[-1] <= 16:
             return fp8_linear(x, w)
-        return F.linear(x.to(torch.bfloat16), w.dequant())
+        return F.linear(x.to(torch.bfloat16), prefill_dequant(w))
     return F.linear(x, w)
 
 
@@ -571,11 +623,23 @@ def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc: int, iters: int, eps: float)
     return pre, post, comb
 
 
-def hc_mixes(x: torch.Tensor, hc_fn, hc_scale, hc_base, args: Args):
-    """x: [s, hc, d] -> (pre [s,hc], post [s,hc], comb [s,hc,hc]); normalized over the flattened stream."""
+def hc_mixes(x: torch.Tensor, hc_fn, hc_scale, hc_base, args: Args, fused: bool = False):
+    """x: [s, hc, d] -> (pre [s,hc], post [s,hc], comb [s,hc,hc]); normalized over the flattened stream.
+
+    `fused=True` runs the Sinkhorn on HC_SINKHORN_FUSED (engine/hc_sinkhorn.py, one Triton program
+    per token row) instead of the torch port under `tiled_rows`. The GEMM and the rsqrt above it
+    are unchanged and stay tiled -- only the ~130-kernel Sinkhorn moves, which at T = 2048 is
+    16,640 launches per call against one. One program per row is row-count- AND row-offset-
+    invariant by construction, so the tiling the torch path needs for chunk invariance is not
+    merely skipped there, it is replaced by something stronger. Off by default; see
+    engine/prefill_sinkhorn.py.
+    """
     xf = x.flatten(1).float()
     rsqrt = rms_rsqrt(xf, args.norm_eps)
     mixes = mm(xf, hc_fn) * rsqrt
+    if fused and HC_SINKHORN_FUSED is not None:
+        return HC_SINKHORN_FUSED(mixes, hc_scale, hc_base, args.hc_mult,
+                                 args.hc_sinkhorn_iters, args.hc_eps)
     return tiled_rows(lambda t: hc_split_sinkhorn(t, hc_scale, hc_base, args.hc_mult,
                                                   args.hc_sinkhorn_iters, args.hc_eps), mixes)
 

@@ -328,6 +328,40 @@ bit, and no acceptance number in this repository moves until a fine-tuned head p
   trip and the rows a verified block may record, and the FastMTP loop on a 32-dimensional toy head
   — every trainable tensor gets a gradient, twenty steps overfit one batch, and the acceptance
   proxy counts a leading prefix rather than a per-step mean.
+- **`DSV41_PREFILL_FP8_DEQUANT` — the fp8 weights stop being dequantised into fp32 and back.**
+  Above decode-sized M, `v41_ref.dense` hands an `FP8Weight` to cuBLAS as a bf16 dequant, and
+  `FP8Weight.dequant()` builds a full `[N, K]` fp32 scale table with two `repeat_interleave`s plus
+  a full fp32 weight to get there — **ten transient bytes per weight, per weight, per layer, per
+  chunk**. Under the shipped `DSV41_DENSE_FP4=attn,wo_a` that is the shared experts on all 21
+  encoder layers, the indexer `wq_b` on four of them and the engram `wkv` on two: 1.079 G weights a
+  chunk, at the 0.98 ns per weight this shape was measured at, or **~1.06 s of a ~5.55 s
+  2,048-token chunk**. `fused` does it in one new Triton kernel
+  (`tools/fp8_linear.dequant_fused`) — fp8 codes in, bf16 out, two transient bytes per weight, one
+  launch instead of six — and **bit-identically**: e4m3 → bf16 loses nothing, the block scale is a
+  power of two, and the closing rounding is the same one torch does. `cached` adds memoisation for
+  the rest of a request's prefill, which buys the residual ~16 ms a chunk from the second chunk on
+  and costs 2.16 GB while the encoder pass runs and 3.70 GB once the replay and the DSpark seed
+  have run; `tools/budget.py` reads the variable and charges that against the prefill reserve, so
+  `PRUNE_KEEP=auto` answers for it. `scaled_mm` is refused with its reason: this checkpoint's
+  scales are one UE8M0 value per **32x32** block and `torch._scaled_mm` takes no such granularity,
+  so reaching it would mean re-quantising the weight. **Off by default, and off calls
+  `FP8Weight.dequant()` — which is untouched — so it is the old code and not a re-derivation of
+  it.** Ungated: no prompt has been generated with either mode armed;
+  `tools/verify_prefill_fixes.sh` is the run that would say. See
+  [`docs/gemm-dispatch.md`](docs/gemm-dispatch.md).
+- **`DSV41_PREFILL_FUSED_SINKHORN` — prefill picks up the Sinkhorn kernel decode already had.**
+  `v41_ref.hc_mixes` runs the 20-iteration Hyper-Connection Sinkhorn through `tiled_rows` in
+  16-row tiles, and the torch port is ~130 tiny kernels per call on a `[m, 4, 4]` tensor: at a
+  2,048-token chunk that is 128 tiles × ~130 kernels × two calls per layer × 21 layers =
+  **698,880 launches a chunk**, each on a 16×4×4 tensor. `engine/hc_sinkhorn.py` has replaced all
+  of that with one launch, one program per token row, since the fast decode path existed —
+  `engine/fastdecode.py` imports it, `engine/model.py` never did. With the flag on the count is
+  **42**. No new kernel and no fork of the old one: the grid is `(max(n, 1),)` with a tail guard
+  and there was no decode-shaped limit to extend. One program per row is row-count- *and*
+  row-offset-invariant by construction, so it replaces the chunk-invariance the tiling was there to
+  manufacture rather than skipping it. **Prefill-only** — a fused Sinkhorn in the un-graphed decode
+  forward would move the tokens the DSpark verify step accepts and nothing would crash — and off by
+  default. Ungated, like the above.
 
 ### Changed
 
@@ -403,6 +437,11 @@ bit, and no acceptance number in this repository moves until a fine-tuned head p
   and its size, the training loop as implemented, the memory budget, and what a fine-tune can cost
   — markup drift, the bf16→fp8 round trip, data shaped by the drafter that produced it, and a
   greedy proxy for a sampled path.
+- [`docs/gemm-dispatch.md`](docs/gemm-dispatch.md) — "What changed after the audit", with the byte
+  and launch arithmetic behind both switches, why `fused` is the recommendation over `cached`, and
+  why `scaled_mm` is a refusal rather than a task.
+- [`docs/memory-budget.md`](docs/memory-budget.md) — gate 2 gains the one setting that adds to the
+  prefill reserve, with what `cached` holds after each phase of a prompt.
 
 ### Checks
 
@@ -413,6 +452,20 @@ bit, and no acceptance number in this repository moves until a fine-tuned head p
   the CLI's exit codes, and `./start.sh --print-env` resolving it end to end.
 - `tools/test_tune_profiles.py` and `tools/test_tune_draw.py` cover the thinking field, what
   `--print` writes for it, and the gate line at every width.
+- `tools/test_prefill_fp8.py` and `tools/test_prefill_sinkhorn.py` — torch-free: both parsers, the
+  refusal of `scaled_mm` and the reason it carries, the 2.16 / 3.70 GB of `cached` derived from the
+  checkpoint's shapes, the 698,880 → 42 launch arithmetic derived from the op count, and regex pins
+  holding both switches off by default, prefill-only, and `FP8Weight.dequant()` untouched.
+- `tools/test_fp8_dequant.py` — the fused dequant against `FP8Weight.dequant()` compared as raw
+  bits, on the CPU for the torch fallback and on the device for the Triton kernel, plus the cache's
+  identity and lifetime. `tools/test_hc_sinkhorn_prefill.py` — the fused Sinkhorn against the tiled
+  path at 1 to 2,048 rows, that the disagreement does not grow with the row count, and that a slice
+  of a call is bit-identical to those rows of the whole call. Both self-skip without torch or CUDA,
+  so they sit in the ordinary sweep.
+- `tools/verify_prefill_fixes.sh` — the run on the box: four runs on the shipped `.env` over one
+  identical ~7,000-token prompt (both off, each alone, both), TTFT and `prefill_tok_s` per run,
+  `tools/audit_gemm_dispatch.py`'s launch count and GPU-busy fraction on the first and the last,
+  and one Frontend generation gate on the last. Records under `results/prefill/`.
 
 ## 0.5.0 — 2026-09-14
 

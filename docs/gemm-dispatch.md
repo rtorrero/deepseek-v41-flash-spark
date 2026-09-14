@@ -326,3 +326,102 @@ per-expert unpack whose size does not depend on k, and the existing chunk-size m
 cost rather than a per-token one. So `r` near 1 is the expected outcome and ExFold is expected to
 be the *wrong* next thing on this engine. That is a prediction, not a finding — it is what the run
 is for.
+
+---
+
+## What changed after the audit — the two fixes, both off by default
+
+Two of the items above were fixed rather than only measured. Both are behind an environment
+variable, both default to the behaviour that shipped, and off is byte-identical — the audit's own
+figures in the sections above are still figures of the default engine.
+`tools/verify_prefill_fixes.sh` is the run that says whether either is worth turning on: four runs
+on the shipped `.env` over one identical ~7,000-token prompt (both off, each alone, both), TTFT and
+`prefill_tok_s` from the server, plus this page's own script for the launch count and the GPU-busy
+fraction of the first and the last, then one generation gate on the last. It records under
+`results/prefill/`.
+
+### Fix A — `DSV41_PREFILL_FP8_DEQUANT`, for row 5 and row 7
+
+`FP8Weight.dequant()` is untouched; what changed is that `v41_ref.dense` no longer has to call it.
+The M > 16 branch now goes through `v41_ref.prefill_dequant`, which is `w.dequant()` unless the
+variable says otherwise.
+
+`fused` (`tools/fp8_linear.dequant_fused`, a new Triton kernel next to the two that were already
+there) reads the fp8 codes and the UE8M0 table and writes bf16 in one launch. **Two transient bytes
+per weight instead of ten, about three bytes of DRAM traffic instead of about twenty-seven, one
+launch instead of six, and no fp32 intermediate at all.** It is bit-identical, not approximately:
+e4m3 → bf16 loses nothing (four significand bits into eight), the block scale is a power of two so
+the fp32 product is exact wherever `dequant()`'s is, and the closing round-to-nearest-even to bf16
+is the same rounding. `tools/test_fp8_dequant.py` compares raw bits, on the CPU for the torch
+fallback and on the device for the kernel, and self-skips where neither is available.
+
+The size of the prize, from the numbers already on this page. The weights still on that branch
+under `DSV41_DENSE_FP4=attn,wo_a` are `ffn.shared_experts.w1/w2/w3` on all 21 encoder layers, the
+indexer `wq_b` on layers {2, 8, 14, 20} and the engram `wkv` on layers {1, 14}:
+
+```
+21 x  shared w1/w3 [2304, 5120] + w2 [5120, 2304]      743,178,240 weights
+ 4 x  indexer wq_b [4096, 1280]                         20,971,520
+ 2 x  engram  wkv  [25600, 6144]                       314,572,800
+                                             total   1,078,722,560 weights per chunk
+```
+
+The measured rate of this shape is the datum in the row-5 section: 5.14 ms to dequantise a
+[4096, 1280] weight at M = 2048, i.e. **0.98 ns per weight** — six allocator-bound elementwise
+kernels, not one streaming copy, which is why it is nowhere near this box's ~210 GB/s. 1.079 G
+weights at that rate is **~1.06 s per 2,048-token chunk**, against ~5.55 s for a chunk at the
+measured 369 tok/s. **About a fifth of prefill is spent turning a weight into a copy of itself**,
+and a kernel that streams 3 bytes per weight at device bandwidth would spend ~16 ms doing it.
+
+`cached` is `fused` plus memoisation for the rest of a request's prefill: a weight is dequantised
+on the first chunk and read back on every chunk after it, which buys the residual ~16 ms a chunk
+and only from the second chunk on. It costs **2.16 GB** while the encoder pass is running and
+**3.70 GB** once the decoder replay and the DSpark seed have touched their own weights — the
+engram `wkv` alone is 0.63 GB of the first figure — and that comes out of the arena. It is in the
+pre-flight model: `tools/budget.py` reads the variable itself and adds the whole-prompt figure to
+the prefill reserve, so `PRUNE_KEEP=auto` and `./tune.sh` already answer for it
+(`docs/memory-budget.md`, gate 2). **`fused` is the recommendation**: it helps the first chunk as
+well as the rest, it helps the replay, and it costs nothing, where `cached` pays 3.70 GB for the
+last 1.5 % of the same lever and gives a single-chunk prompt nothing at all.
+
+`scaled_mm` is **refused with a reason rather than implemented**, and the name is kept so the
+reason is discoverable. `torch._scaled_mm` takes per-tensor, per-row, 1x128/128x128 block-wise or
+1x32 (MX) scales. This checkpoint stores **one UE8M0 scale per 32x32 block** — `FP8Weight.__init__`
+asserts exactly that. 32x32 is not one of those granularities, so reaching `_scaled_mm` would mean
+re-quantising the weight into a layout it accepts, which moves the numbers the recipe was measured
+on. This page's own warning is the point: a layout mismatch does not raise, it dispatches to
+something slow and correct, and that is precisely the failure the 35 → 118 tok/s public win was.
+
+### Fix B — `DSV41_PREFILL_FUSED_SINKHORN=1`, for the 16-row tiling of rows 8–9
+
+No new kernel. `engine/hc_sinkhorn.py` already replaces the whole 20-iteration Sinkhorn with one
+Triton launch, one program per token row, and `engine/fastdecode.py` has used it since the fast
+decode path existed; `engine/model.py` simply never picked it up. It needed no extension for
+prefill shapes either — the grid is `(max(n, 1),)` with an `if row >= n_rows: return` guard, `HC`
+is a `tl.constexpr` of 4, and there is no batch or row limit in it. `v41_ref.hc_mixes` takes a
+`fused` keyword, `engine/model.py` passes `PS.fused_prefill(prefill)`, and the GEMM and the rsqrt
+above the Sinkhorn stay tiled in both modes.
+
+The count, per 2,048-token chunk of the encoder pass:
+
+| | launches |
+|---|---|
+| today: 128 tiles × ~130 torch kernels × 2 calls per layer × 21 layers | **698,880** |
+| fused: 1 launch × 2 calls per layer × 21 layers | **42** |
+
+One program per row is row-count- *and* row-offset-invariant by construction, which is the property
+`tiled_rows` exists to manufacture, so the tiling is not merely skipped on this path — it is
+replaced by something stronger. The two paths are not expected to be bit-identical (130 torch
+kernels and one Triton program do the same normalisations in a different order, and `tl.exp` is not
+`torch.exp`), so `tools/test_hc_sinkhorn_prefill.py` measures the disagreement at every row count
+from 1 to 2,048, checks that it does not grow with the row count, and checks the invariance
+directly; it self-skips off a CUDA box. It is **prefill-only** — a fused Sinkhorn leaking into the
+un-graphed decode forward would change the tokens the DSpark verify step is asked to accept and
+nothing would crash, the acceptance rate would just quietly move — and `tools/test_prefill_sinkhorn.py`
+pins that guard mechanically.
+
+**This is the fix the kernel table cannot score.** Every one of those 698,880 launches is
+microscopic, so none of them appears in a top-20-by-GPU-time list at any share; the only evidence
+either way is the launch count and the GPU-busy fraction that `tools/audit_gemm_dispatch.py`
+reports beside the table, which is why the verify script runs it on the baseline and on both-on
+and on nothing in between.

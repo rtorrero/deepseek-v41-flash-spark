@@ -299,25 +299,53 @@ def unpack_cache_layers(cache_gb: float, keep: float) -> float:
     per_layer = keep_n(keep) * UNPACK_SLOT_BYTES
     return unpack_cache_bytes(cache_gb) / per_layer if per_layer else 0.0
 
+# DSV41_PREFILL_FP8_DEQUANT=cached keeps every dense fp8 weight prefill touches as a bf16 copy for
+# the rest of the request, so a weight is dequantised on the first chunk and read back on every
+# chunk after it. That copy is resident memory a prefill holds on top of everything above, and it
+# is not small: 2.16 GB for the encoder pass (layers 0..20) and 3.70 GB once the decoder replay and
+# the DSpark seed have touched their own weights. `engine/prefill_fp8.cache_bytes()` derives it
+# from the checkpoint's shapes; the derivation is pinned by tools/test_prefill_fp8.py.
+#
+# The high-water mark is what a reserve has to clear, so the whole-prompt figure is the one used.
+# The default mode is `fused`'s ancestor -- off -- and adds nothing.
+try:  # appended, not prepended: this must not shadow anything a caller already put first
+    import sys as _sys
+    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _ROOT not in _sys.path:
+        _sys.path.append(_ROOT)
+    from engine.prefill_fp8 import CACHE_BYTES as FP8_PREFILL_CACHE_BYTES  # noqa: E402
+except Exception:  # noqa: BLE001
+    FP8_PREFILL_CACHE_BYTES = 3.701e9
+
+
+def fp8_cache_from_env() -> bool:
+    """Whether the prefill fp8 dequant cache is on, from the variable the engine reads."""
+    return os.environ.get("DSV41_PREFILL_FP8_DEQUANT", "").strip().lower() == "cached"
+
 
 def prefill_bytes(max_seq: int = 32768, chunk: int = PREFILL_CHUNK_DEFAULT,
-                  cache_gb: float = 0.0, kv_fp8: bool = False) -> float:
+                  cache_gb: float = 0.0, kv_fp8: bool = False,
+                  fp8_cache: bool = False) -> float:
     """Peak transient memory of one prefill chunk -- the reserve a configuration
     must leave free, or the watchdog kills the server on the first request --
-    plus the prefill unpack cache, which is not transient but is allocated on
-    top of everything the resident total already names.
+    plus the two persistent allocations a prefill may hold on top of everything
+    the resident total already names: the unpack cache and the fp8 dequant
+    cache.
 
     Both of the transient terms are proportional to the chunk: the first by
     definition, the second because the indexer's score tile is
     [chunk x compressed positions]. `kv_fp8` (DSV41_PREFILL_KV_FP8) takes the
     fp8 gather's saving off the per-token term; `cache_gb`
-    (DSV41_PREFILL_UNPACK_CACHE_GB) adds the persistent unpack cache on top.
-    Kept identical to engine/v41_engine.py `prefill_reserve_bytes`;
-    tools/test_budget.py fails if the two drift."""
+    (DSV41_PREFILL_UNPACK_CACHE_GB) adds the persistent unpack cache; and
+    `fp8_cache` (DSV41_PREFILL_FP8_DEQUANT=cached) adds the bf16 copies of the
+    dense fp8 weights a prompt touches. Kept identical to
+    engine/v41_engine.py `prefill_reserve_bytes`; tools/test_budget.py fails if
+    the two drift."""
     per_token = PREFILL_BYTES_PER_TOKEN - (PREFILL_KV_FP8_SAVED_PER_TOKEN if kv_fp8 else 0.0)
     return (chunk * per_token
             + max_seq * PREFILL_BYTES_PER_CONTEXT_TOKEN * (chunk / PREFILL_CHUNK_DEFAULT)
-            + unpack_cache_bytes(cache_gb))
+            + unpack_cache_bytes(cache_gb)
+            + (FP8_PREFILL_CACHE_BYTES if fp8_cache else 0.0))
 
 
 def kv_bytes(max_seq: int, ring: int | None = None) -> float:
@@ -900,6 +928,7 @@ class Plan:
     available: float
     chunk: int = PREFILL_CHUNK_DEFAULT
     kv_fp8: bool = False
+    fp8_cache: bool = False
     coverage: dict = field(default_factory=dict)
     selection: tuple = ()
 
@@ -990,6 +1019,7 @@ def plan(host: Host, index: TopicIndex | None, selection, keep: float, max_seq: 
          fmt: str = "cb3", select: str = "uniform", arena_gb: float | None = None,
          keep_free_gb: float = KEEP_FREE_GB_DEFAULT, dense_key=None,
          chunk: int | None = None, kv_fp8: bool | None = None,
+         fp8_cache: bool | None = None,
          transient_slots: int = TRANSIENT_SLOTS_DEFAULT,
          rank: str = RANK_DEFAULT, cache_gb: float | None = None) -> Plan:
     # the engine's own rounding: ceil(keep * 384) experts in every layer
@@ -1000,6 +1030,7 @@ def plan(host: Host, index: TopicIndex | None, selection, keep: float, max_seq: 
     # by 7 GB and its verdict cannot be trusted.
     chunk = chunk_from_env() if chunk is None else chunk
     kv_fp8 = kv_fp8_from_env() if kv_fp8 is None else kv_fp8
+    fp8_cache = fp8_cache_from_env() if fp8_cache is None else fp8_cache
     cache_gb = unpack_cache_gb_from_env() if cache_gb is None else cache_gb
     if fmt != "cb3":
         cache_gb = 0.0   # an fp4 arena is already in the kernel's format; nothing is unpacked
@@ -1018,8 +1049,8 @@ def plan(host: Host, index: TopicIndex | None, selection, keep: float, max_seq: 
         dense=DENSE_BYTES.get(dense_key, DENSE_DEFAULT) / GB,
         dspark=DSPARK_BYTES / GB,
         kv=kv / GB,
-        prefill=prefill_bytes(max_seq, chunk, cache_gb, kv_fp8) / GB,
-        chunk=chunk, kv_fp8=kv_fp8,
+        prefill=prefill_bytes(max_seq, chunk, cache_gb, kv_fp8, fp8_cache) / GB,
+        chunk=chunk, kv_fp8=kv_fp8, fp8_cache=fp8_cache,
         scratch=PACK_SCRATCH_BYTES[fmt] / GB,
         unpack_cache=unpack_cache_bytes(cache_gb) / GB,
         floor=keep_free_gb,
