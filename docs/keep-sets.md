@@ -249,6 +249,109 @@ Two limits on that reading, both recorded in [`LIMITATIONS.md`](../LIMITATIONS.m
   [`docs/tune.md`](tune.md#fewer-topics-are-not-faster-under-sum-they-are-cheaper-under-maxmin-breadth-is-cheap-but-not-free) for the mechanism, the one
   measurement that supports it, and the A/B that has not been run.
 
+## Escaping the mask
+
+Everything above takes the mask as given: an expert outside the keep-set is not routable, and a
+token whose real pick is outside it is computed with a substitute for the whole request. The two
+ends of that trade are both measured and they are very far apart. With **no mask at all** — every
+one of the 384 experts a layer reachable, streamed from NVMe — the three prompts that fail on
+every keep-set all pass, at 1,008–1,549 s per prompt
+(`results/keepsets/null-unmasked/GATE.md`; `RESULTS.md` §5.1). With the mask the same prompts run
+at 15–25 tok/s and fail. Streaming everything is far too slow. Streaming *a little* had not been
+tried.
+
+`DSV41_ESCAPE_K` is that middle. It allows up to K non-resident experts **per layer-step** to be
+streamed into the transient ring and routed to, when the router's own scores say the mask took
+away something worth the read. `DSV41_ESCAPE_K=0` is the default and means the engine builds no
+hatch at all: no object, no buffers, no branch, and both routing paths run the code they ran
+before this existed (`tools/test_escape_rule.py` pins that, and `tools/test_route_modes.py`'s pins
+on the two mask lines are untouched).
+
+### The decision is taken on the raw scores, before the mask
+
+The gate is `scores = sqrt(softplus(y @ gate_w))`, `logits = scores + gate_bias`, and the routed
+weights are the *scores* of the top-k by logit, renormalised. There is no softmax, so a margin has
+to be defined rather than read off a probability. Two conditions have to hold, and both are read
+off the router's output before `masked_fill` touches it:
+
+* **the mask actually took it away** — the candidate is the best non-resident expert by logit, and
+  its logit is above the resident pick it would displace. A non-resident expert the router ranked
+  below the sixth resident pick is not in the unmasked top-6 either; fetching it would change
+  nothing.
+* **it is worth the read** —
+
+  ```
+  margin = (score[candidate] - score[displaced]) / sum(score[resident top-k])   >=  DSV41_ESCAPE_MARGIN
+  ```
+
+  the share of this token's routed weight that changes hands if the escape is taken. The
+  denominator is the one the renormalisation already uses, so the number is dimensionless and
+  comparable across layers. For scale, a uniform top-6 gives every pick 0.167. The default is
+  **0.10**, and nothing has been gated behind it: it is where the torch-free reference in
+  `tools/test_escape_rule.py` fires on about one layer-step in twenty, i.e. roughly 1.5 fetches in
+  a 40-layer decode step. That reference's gate scores are synthetic. Re-derive the number from
+  `escapes_per_token` on a real run.
+
+Candidate *j* is scored against the *j*-th weakest resident pick, which is only the right
+bookkeeping if the *j*−1 candidates before it were taken as well, so admission is a prefix: it
+stops at the first candidate that does not clear the margin rather than skipping it. At `K=1` — the
+setting the idea is about — the rule reads exactly as it sounds.
+
+The decision is taken on **row 0 of the verify block** and applied to the whole block. A decode
+step is one accepted token followed by five DSpark drafts, and row 0 is the only row whose hidden
+state contains no drafted content; its logits also produce the one token of the step that is always
+accepted. Deciding on any other row would let a draft that is about to be rejected fetch an expert
+and change the routing of the token that is actually emitted. Prefill does not escape at all: a
+2,048-token chunk touches ~370 of a layer's 384 experts, so the rule would fire on all 40 layers of
+every chunk and thrash an 8-slot ring for tokens that are not where the failure shows.
+
+### The fetch, and what it does to the step
+
+An admitted expert is read into the **transient ring** — not the LRU, whose every slot holds a
+keep-set expert the router is still masked to; evicting one of those would shrink the shipped
+keep-set behind the operator's back. The ring is otherwise idle in all-resident mode, because
+nothing routable ever misses there.
+
+Then one line does the rest: the expert's bit is set in `prune_mask[L]` **in place**. That tensor
+is the router's mask in both routing paths and is captured by pointer in the decode graphs, so the
+expert becomes routable without re-capturing anything. Its device LUT entry is written in the same
+breath, and both are withdrawn together the moment the ring recycles the slot underneath it
+(`ExpertStore.on_transient_evict`) — a routable expert whose LUT entry is still −1 is a gather off
+the end of the arena.
+
+Three costs, in the order they matter:
+
+| | |
+|---|---|
+| the read | 18.80 MB of `O_DIRECT` per escape. The checkpoint stores FP4; the 14.45 MB figure is what an expert occupies in a CB3 arena, not what comes off NVMe. ~4 ms at the single-read rate of 4.08 GB/s. |
+| the repack | with `EXPERT_FORMAT=cb3` the three matrices are converted to the 3-bit format on the GPU before the slot is usable. The warm start's own arithmetic (6,160 experts, 183 s against 19 s for FP4) puts that at tens of ms per expert, and it lands on the decode step's critical path. **This is the number that decides whether the hatch is usable**, and it has not been measured on its own. |
+| the graphs | the decision needs the host between a layer's router and its MoE, so an armed engine gives up the merged graph segments and replays 41 graphs per step instead of 3. That exact swap was measured at 147.2 → 146.6 ms, 16.56 vs 16.63 tok/s (`RESULTS.md` §2.11). What that measurement did **not** include is the 8·K-byte device-to-host read the decision needs after every layer: 40 host syncs a step, each of which ends the overlap between the host and a GPU that had the next segment already queued. Unmeasured, and the first thing to look at if the hatch is slower than its escape count explains. |
+
+The step is bounded at `8 × K` fetches across all 40 layers, because K alone bounds nothing useful:
+at K=1 a step could otherwise fetch 40 experts and, at even 4 ms each, take 295 ms instead of 135.
+
+An escape stays routable until its slot is recycled, so a second token that wants the same expert
+pays nothing — which is the only way a fetch this expensive can amortise, since consecutive tokens
+route to overlapping experts. The ring is the cache, and it is 8 slots in the shipped
+configuration; `TRANSIENT_SLOTS` is the dial (14.45 MB each). Every escape is withdrawn at the end
+of the request, so one prompt cannot change the keep-set the next one is measured on.
+
+### What it reports, and what it does not prove
+
+Per request, in `x_engine_stats`: `escapes`, `escapes_per_token`, `escape_gb`, `escape_ms`,
+`escape_ms_each`, `escape_margin_mean`, `escape_live`, `escape_peak_live`, `escape_evictions`, and
+the three refusal counters (`escape_blocked_margin`, `_k`, `_budget`). `tools/verify_escape.sh`
+runs the gate with the hatch on and measures decode speed with it on and off.
+
+**No gate has been run on it.** Not one prompt has been generated on this box with the hatch armed
+as this is written. The rule is argued from the router's arithmetic and tested against a numpy
+reference; whether it removes the identifier corruption of §5.3, and what it costs per token, are
+both open. Two things are known to be given up when it is armed: speculation is no longer
+bit-lossless against a non-speculative run (`engine/test_spec_lossless.py` passes because the hatch
+is off, not because the two agree under it — the escape set is decided per verify block and a block
+of six is not six blocks of one), and the request's routing depends on its own history through the
+ring. Both are reasons this is opt-in.
+
 ## How many experts a step actually reads
 
 Six per layer is the per-token figure, and it is not the figure a decode step pays. DSpark verifies
