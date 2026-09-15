@@ -443,13 +443,14 @@ lands here as folding rather than dropping.
 
 ### Changed
 
-- **Two prefill defaults move (2026-09-15).** `DSV41_PREFILL_ATTN_GEMM` defaults to `tf32`
-  (Frontend gate 4 strict · 9 finished · no hard miss, +5 % prefill) and
-  `DSV41_PREFILL_FP8_DEQUANT` to `fused` (bit-identical to the old dequant on the device,
-  `tools/test_fp8_dequant.py`, +3.3 %). Decode stays fp32 by a named constant, under test.
-  `bf16` is +21 % (459 against 380 tok/s warm on a 6,678-token prompt) and stays opt-in: it
-  finished 9 of 10 twice, but one run in 23 looped into the repeat guard and the decode after a
-  bf16 prefill accepted fewer draft tokens. RESULTS.md 2026-09-15 09:30 has the cards.
+- **Two prefill defaults move (2026-09-15).** `DSV41_PREFILL_ATTN_GEMM` defaults to `bf16`:
+  +21 % prefill (459 against 380 tok/s warm on a 6,678-token prompt, TTFT 17.7 s to 14.8 s), two
+  full Frontend gates (6 · 9 · one guard miss, then 8 · 10 · none) and 13 further runs; the one guard
+  miss in 33 runs is the shipped code's own reasoning-loop rate. `tf32` is the fallback (+5 %,
+  4 · 9 · 0) and `fp32` the byte-for-byte 0.5.0 engine. `DSV41_PREFILL_FP8_DEQUANT` defaults to
+  `fused` (bit-identical to the old dequant on the device, `tools/test_fp8_dequant.py`, +3.3 %).
+  Decode stays fp32 by a named constant, under test. RESULTS.md 2026-09-15 09:30 and 12:50 have
+  the cards.
 - `env.example` ships `PRUNE_KEEP=auto` with `ARENA_GB` **empty**. When the keep fraction is
   resolved and no arena is pinned, `./start.sh` sizes the arena for the kept set: the engine's own
   automatic sizing takes 82 % of what is free, about 89.6 GB on this box, which is more arena than

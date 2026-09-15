@@ -1227,3 +1227,15 @@ believed.
 The Writing prompts on the **Frontend** keep-set are a new column here and not comparable with the
 Writing record (its own keep-set at 0.40, 5 of 8 strict with one guard miss on 2026-09-13 20:45); a
 Writing gate on its own keep-set under the new prefill defaults is queued tonight.
+
+### 2026-09-15 12:50 — bf16 passes its second gate and becomes the prefill default
+
+The second full Frontend gate on `DSV41_PREFILL_ATTN_GEMM=bf16`: 8 strict, 10 of 10 finished, no
+think-exit, guard or corruption (`results/prefill/GATE-frontend-bf16-2.md`). Added to the morning's
+runs that is 33 bf16 generations with one guard miss and 31 finished answers, and the shipped code
+at this keep loops in its reasoning three to six times a gate on its own, so one run reaching the
+guard in 33 is that rate, not the mode. The mode ships: +21 % prefill (459 against 380 tok/s warm
+on the 6,678-token prompt) and TTFT 17.7 s to 14.8 s. tf32 stays as the fallback and fp32 as the
+byte-for-byte 0.5.0 engine. The decode-acceptance signal from the morning's short-prompt probe
+gets a proper measurement tonight: the drafter verify runs its shipped-head baseline under bf16,
+and the prose row (2.69 accepted tokens a step under tf32 today) is the comparison.
