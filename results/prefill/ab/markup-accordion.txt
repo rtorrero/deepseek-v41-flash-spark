@@ -1,0 +1,1 @@
+Write a single-file HTML page with a CSS-only accordion of five sections about the water cycle. Inline CSS in a style tag, no JavaScript, no external assets.

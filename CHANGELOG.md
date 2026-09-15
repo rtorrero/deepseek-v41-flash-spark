@@ -450,8 +450,10 @@ lands here as folding rather than dropping.
   `bf16` is +21 % prefill (459 against 380 tok/s warm on a 6,678-token prompt) and passed two
   full gates, and it was the default for four hours of 2026-09-15 until the drafter verify
   measured prose decode acceptance after a bf16 prefill at 1.99 a step against 2.69 (10.4
-  against 14.3 tok/s) on the same prompt and head, markup unchanged. It is opt-in. RESULTS.md
-  2026-09-15 09:30, 12:50 and 17:20 have the cards and the rows.
+  against 14.3 tok/s) on the same prompt and head, markup unchanged. A sampled A/B (fifteen runs a side, three prompts) then put bf16 3 % below tf32 in draft
+  acceptance on prose and markup alike, which with thinking on costs more decode seconds than
+  the prefill gives back. It is opt-in. RESULTS.md 2026-09-15 09:30, 12:50, 17:20 and 18:25 have
+  the cards, the rows and the A/B.
 - `env.example` ships `PRUNE_KEEP=auto` with `ARENA_GB` **empty**. When the keep fraction is
   resolved and no arena is pinned, `./start.sh` sizes the arena for the kept set: the engine's own
   automatic sizing takes 82 % of what is free, about 89.6 GB on this box, which is more arena than

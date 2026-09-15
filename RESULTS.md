@@ -1294,3 +1294,27 @@ dequant). Four hours of bf16 as the default changed no shipped record: every gat
 is filed under `results/prefill/` by mode, and the drafter verify rows above are the only rows
 taken under it. A 3 s TTFT gain on a 6,678-token prompt is worth less than 4 tok/s on every prose
 answer past a few hundred tokens, and that arithmetic is the whole decision.
+
+### 2026-09-15 18:25 — the sampled A/B: bf16 costs about 3 % of draft acceptance everywhere, and tf32 stays
+
+Five sampled runs (temperature 0.7, 400 tokens, thinking off) per prompt and mode, plus one greedy
+run each, on the Frontend keep-set at 0.36 (`results/prefill/ab/probes.log`):
+
+| prompt | tf32, mean acceptance (min to max) | bf16, mean acceptance (min to max) | greedy tf32 / bf16 |
+|---|---|---|---|
+| train story | 2.31 (1.96 to 2.65) | 2.23 (2.04 to 2.46) | 2.69 / 1.99 |
+| lighthouse story | 2.67 (1.98 to 3.11) | 2.61 (2.47 to 2.98) | 3.14 / 2.84 |
+| CSS accordion page | 4.81 (4.72 to 4.98) | 4.67 (4.49 to 4.89) | 5.25 / 4.72 |
+
+Two readings. The greedy rows that drove the afternoon's reversal (1.99 against 2.69) were one
+path each: a rounded prefill picks a different continuation at temperature 0, and under tf32 alone
+the five sampled runs of the same prompt spread from 1.96 to 2.65. The verify script's single
+greedy row cannot resolve a mode difference on prose, and now says so in its header. And the mode
+does cost something: bf16 sits 3 % below tf32 on all three prompts, prose and markup alike, fifteen
+runs a side. Decode is acceptance over a flat step, so that is 3 % of decode.
+
+The arithmetic for this box: bf16 buys about 2 s of TTFT on a 6,678-token prompt over tf32 and
+pays 3 % on every generated token. With thinking on, the recipe's default, an answer runs to
+thousands of tokens and the 3 % is 5 to 10 s, more than the prefill gave back. bf16 wins only
+when the prompt is long and the answer short. tf32 stays the default, bf16 stays opt-in with this
+table beside it, and the verify script's prose row is read as a greedy sample from now on.
