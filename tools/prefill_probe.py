@@ -22,9 +22,9 @@ DECODE_PROMPT = ("Write a short story of about 300 words about a lighthouse keep
                  "message in a bottle. Plain prose, no headings.")
 
 
-def probe(base, prompt, max_tokens, timeout):
+def probe(base, prompt, max_tokens, timeout, temperature=0.0):
     body = {"model": "default", "messages": [{"role": "user", "content": prompt}], "stream": True,
-            "chat_template_kwargs": {"thinking": False}, "max_tokens": max_tokens, "temperature": 0,
+            "chat_template_kwargs": {"thinking": False}, "max_tokens": max_tokens, "temperature": temperature,
             "stream_options": {"include_usage": True}}
     try:
         with urllib.request.urlopen(base + "/models", timeout=30) as r:
@@ -76,9 +76,12 @@ def main() -> int:
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--timeout", type=int, default=3600)
     ap.add_argument("--tag", default="", help="a label copied into every line")
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="0 is greedy; a sampled A/B of decode acceptance needs several runs above 0")
+    ap.add_argument("--decode-prompt-file", help="with --decode: this prompt instead of the built-in story")
     a = ap.parse_args()
     if a.decode:
-        prompt = DECODE_PROMPT
+        prompt = open(a.decode_prompt_file, encoding="utf-8").read() if a.decode_prompt_file else DECODE_PROMPT
         max_tokens = a.max_tokens or 200
     else:
         if not a.prompt_file:
@@ -86,8 +89,9 @@ def main() -> int:
         prompt = open(a.prompt_file, encoding="utf-8").read()
         max_tokens = a.max_tokens or 64
     for i in range(a.repeat):
-        d = probe(a.url, prompt, max_tokens, a.timeout)
+        d = probe(a.url, prompt, max_tokens, a.timeout, a.temperature)
         d["run"] = i + 1
+        d["temperature"] = a.temperature
         if a.tag:
             d["tag"] = a.tag
         print("PROBE " + json.dumps(d), flush=True)
