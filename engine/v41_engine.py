@@ -904,8 +904,13 @@ class V41Engine:
                 self.store.cb_bits = pol2
                 log(f"simulated 2-bit codebook on {len(pol2)} of {len(ranked)} kept experts "
                     f"(coldest {self.sim_cb2_frac:.0%} per layer); slot size unchanged")
+            from engine.keep_guard import check_fit
+            misfit = check_fit(len(ranked), self.store.lru_slots)
+            if misfit:
+                log("FATAL: " + misfit)
+                raise SystemExit(misfit)
             if len(ranked) > self.store.lru_slots:
-                log(f"WARNING: pruned set {len(ranked)} experts > {self.store.lru_slots} LRU slots; the tail will stream")
+                log(f"WARNING: pruned set {len(ranked)} experts > {self.store.lru_slots} LRU slots; the tail will stream (allowed by env)")
             # The rank rule and the histogram family both change WHICH experts these are, so both
             # belong in the line that reports the set -- a measurement quoted without them cannot
             # be reproduced.
