@@ -22,6 +22,7 @@ import importlib.util
 import json
 import logging
 import os
+from server.dsml_tolerant import parse_tolerant
 import re
 import sys
 import threading
@@ -738,35 +739,10 @@ class State:
     # will not let the model write them. This tolerant pass is the fallback for the cases where
     # there is no grammar -- xgrammar missing, DSV41_TOOL_GRAMMAR=0, a schema the builder could not
     # express, an engine that cannot mask -- and it runs only after the strict parser has raised.
-    _RE_INVOKE = re.compile(r'<｜DSML｜ invoke name="(?P<name>[^"]*)"\s*>?\n?(?P<body>.*?)(?=<｜DSML｜ invoke |</｜DSML｜ calls>|\Z)', re.DOTALL)
-    _RE_PARAM_SPEC = re.compile(r'<｜DSML｜ parameter name="(?P<k>[^"]*)" string="(?P<s>true|false)"\s*>(?P<v>.*?)<', re.DOTALL)
-    _RE_PARAM_ATTR = re.compile(r'<｜DSML｜ parameter name="(?P<k>[^"]*)" string="(?P<v>.*?)"\s*>', re.DOTALL)
-
     @classmethod
     def _parse_tool_calls_tolerant(cls, text: str) -> List[dict]:
-        """Best-effort DSML tool calls. Returns [] when nothing parses."""
-        out: List[dict] = []
-        for m in cls._RE_INVOKE.finditer(text):
-            name, body = m.group("name"), m.group("body")
-            if not name:
-                continue
-            args: Dict[str, Any] = {}
-            for pm in cls._RE_PARAM_SPEC.finditer(body):
-                k, is_str, v = pm.group("k"), pm.group("s"), pm.group("v")
-                if is_str == "true":
-                    args[k] = v
-                else:
-                    try:
-                        args[k] = cls._loads_lenient(v)
-                    except Exception:  # noqa: BLE001 - a malformed literal is still worth sending as text
-                        args[k] = v
-            consumed = {pm.group("k") for pm in cls._RE_PARAM_SPEC.finditer(body)}
-            for pm in cls._RE_PARAM_ATTR.finditer(body):
-                k, v = pm.group("k"), pm.group("v")
-                if k and k not in consumed and k not in args:
-                    args[k] = v
-            out.append({"function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
-        return out
+        """Best-effort DSML tool calls (server/dsml_tolerant.py). Returns [] when nothing parses."""
+        return parse_tolerant(text)
 
     @staticmethod
     def _schemas(tools: Optional[List[dict]]) -> Dict[str, set]:
@@ -854,6 +830,17 @@ class State:
                 text, thinking_mode="thinking" if thinking else "chat")
         except Exception as e:
             recovered = self._parse_tool_calls_tolerant(text)
+            if os.environ.get("DSV41_LOG_TOOL_TEXT") == "1":
+                # The strict parser's message names the rule; the text it refused is the evidence.
+                try:
+                    os.makedirs("logs/tooltext", exist_ok=True)
+                    dump = os.path.join("logs/tooltext", time.strftime("%Y%m%d-%H%M%S") + ".txt")
+                    with open(dump, "w", encoding="utf-8") as fh:
+                        fh.write(f"# strict parser: {e}\n")
+                        fh.write(router.tool_text)
+                    log.warning("refused tool text saved to %s (%d chars)", dump, len(router.tool_text))
+                except OSError as oe:
+                    log.warning("could not save the refused tool text: %s", oe)
             if recovered:
                 log.warning("tool-call strict parse failed (%s); recovered %d call(s) tolerantly",
                             e, len(recovered))
