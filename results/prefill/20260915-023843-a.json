@@ -1,0 +1,18 @@
+{
+  "run": "a",
+  "prefill_kv_fp8": false,
+  "prefill_chunk": 2048,
+  "prompt_tokens": 6666,
+  "prefill_s": 25.917,
+  "prefill_tok_s": 257.2,
+  "ttft_s": 25.936,
+  "decode_tok_s": 12.51,
+  "mem_available_min_gb": 10.51,
+  "nvme_gb": 0.0,
+  "expert_hit_rate": 1.0,
+  "engine_prefill_chunk": 2048,
+  "engine_prefill_kv_fp8": false,
+  "engine_ring": 4096,
+  "error": null,
+  "predicted_reserve_gb": 11.25
+}

@@ -1,0 +1,233 @@
+{
+  "config": {
+    "engine": "v41",
+    "arena_gb": 81.0,
+    "arena_slots": 5603,
+    "lru_slots": 5595,
+    "transient_slots": 8,
+    "resident_expert_pct": 36.5,
+    "max_seq": 8192,
+    "spec": true,
+    "trace_stats": "results/keepsets/topics/coverage.json",
+    "kernel": "triton-cb3",
+    "expert_format": "cb3",
+    "expert_mb": 14.45,
+    "dense_fp4": "attn,wo_a",
+    "head_fmt": "fp8",
+    "routed_topk": 6,
+    "sim_cb2_frac": 0.0,
+    "act_quant": false,
+    "swa_replay": true,
+    "prune_keep": 0.36,
+    "prune_select": "uniform",
+    "prune_mode": "substitute",
+    "escape_k": 0,
+    "escape_margin": null,
+    "prune_source": "saliency",
+    "expert_topics": [
+      "html",
+      "css",
+      "javascript",
+      "typescript",
+      "english",
+      "technical",
+      "config",
+      "reasoning",
+      "reasoning_code",
+      "reasoning_design"
+    ],
+    "hot_profile": "mixed",
+    "prefill_chunk": 2048,
+    "io_threads": 12,
+    "read_threads": 24,
+    "read_chunk_mb": 4.0
+  },
+  "chunk": 2048,
+  "expect": [
+    "_cb3v3_up_kernel",
+    "_cb3v3_down_kernel",
+    "_moe_up_kernel",
+    "_moe_down_kernel",
+    "_route_kernel",
+    "_fp4_linear_kernel",
+    "_fp4_grouped_kernel",
+    "_fp8_linear_kernel",
+    "_fp8_grouped_kernel",
+    "_skinny_kernel",
+    "_hc_kernel",
+    "cutlass",
+    "gemm",
+    "sgemm",
+    "wgrad",
+    "ampere",
+    "sm80",
+    "sm90",
+    "sm120"
+  ],
+  "prefill": {
+    "wall_s": 4.5176,
+    "gpu_ms": 4475.07,
+    "gpu_busy_frac": 0.9906,
+    "launches": 18934,
+    "kernels": [
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_simt_sgemm_128x32_8x5_tn_align1>(cutlass_80_simt_sgemm_128x32_8x5_tn_align1::Params)",
+        "calls": 672,
+        "ms": 569.798,
+        "pct": 12.73,
+        "expected": true
+      },
+      {
+        "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>, 4, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)",
+        "calls": 2130,
+        "ms": 535.323,
+        "pct": 11.96,
+        "expected": false
+      },
+      {
+        "name": "_moe_up_kernel",
+        "calls": 66,
+        "ms": 471.423,
+        "pct": 10.53,
+        "expected": true
+      },
+      {
+        "name": "_moe_down_kernel",
+        "calls": 66,
+        "ms": 403.419,
+        "pct": 9.01,
+        "expected": true
+      },
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_simt_sgemm_128x32_8x5_nn_align1>(cutlass_80_simt_sgemm_128x32_8x5_nn_align1::Params)",
+        "calls": 672,
+        "ms": 295.524,
+        "pct": 6.6,
+        "expected": true
+      },
+      {
+        "name": "_cb3_unpack_kernel",
+        "calls": 198,
+        "ms": 294.98,
+        "pct": 6.59,
+        "expected": false
+      },
+      {
+        "name": "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized<at::native::(anonymous namespace)::OpaqueType<2u>, unsigned int, 2, 128, 1, 16, 8>(char*, at::native::(anonymous namespace)::CatArrInputTensorMetadata<at::native::(anonymous namespace)::OpaqueType<2u>, unsigned int, 128, 1>, at::native::(anonymous namespace)::TensorSizeStride<unsigned int, 4u>, int, unsigned int)",
+        "calls": 19,
+        "ms": 238.404,
+        "pct": 5.33,
+        "expected": false
+      },
+      {
+        "name": "_fp4_linear_kernel",
+        "calls": 84,
+        "ms": 228.171,
+        "pct": 5.1,
+        "expected": true
+      },
+      {
+        "name": "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, long, long, bool)",
+        "calls": 249,
+        "ms": 155.269,
+        "pct": 3.47,
+        "expected": false
+      },
+      {
+        "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> > const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> > const&)::{lambda(int)#1})",
+        "calls": 636,
+        "ms": 137.726,
+        "pct": 3.08,
+        "expected": false
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda(float)#1}, std::array<char*, 2ul>)",
+        "calls": 342,
+        "ms": 129.151,
+        "pct": 2.89,
+        "expected": false
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<float>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<float>, std::array<char*, 3ul>)",
+        "calls": 737,
+        "ms": 108.231,
+        "pct": 2.42,
+        "expected": false
+      },
+      {
+        "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<float, float>(at::TensorIteratorBase&, float)::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<float, float>(at::TensorIteratorBase&, float)::{lambda(float)#1}, std::array<char*, 2ul>)",
+        "calls": 138,
+        "ms": 83.248,
+        "pct": 1.86,
+        "expected": false
+      },
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_simt_sgemm_32x128_8x5_tn_align1>(cutlass_80_simt_sgemm_32x128_8x5_tn_align1::Params)",
+        "calls": 42,
+        "ms": 78.412,
+        "pct": 1.75,
+        "expected": true
+      },
+      {
+        "name": "void magma_sgemmEx_kernel<float, float, float, false, true, 6, 4, 6, 3, 4>(int, int, int, BatchedTensor, int, BatchedTensor, int, BatchedTensor, int, BatchedTensor, int, int, int, float const*, float const*, float, float, int, cublasLtEpilogue_t, int, void const*, long)",
+        "calls": 42,
+        "ms": 73.236,
+        "pct": 1.64,
+        "expected": true
+      },
+      {
+        "name": "_fp4_grouped_kernel",
+        "calls": 21,
+        "ms": 73.206,
+        "pct": 1.64,
+        "expected": true
+      },
+      {
+        "name": "void at::native::reduce_kernel<128, 4, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::native::sum_functor<float, float, float>::operator()(at::TensorIterator&)::{lambda(float, float)#1}>, unsigned int, float, 4, 4> >(at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::native::sum_functor<float, float, float>::operator()(at::TensorIterator&)::{lambda(float, float)#1}>, unsigned int, float, 4, 4>)",
+        "calls": 386,
+        "ms": 64.984,
+        "pct": 1.45,
+        "expected": false
+      },
+      {
+        "name": "void at::native::(anonymous namespace)::CatArrayBatchedCopy<at::native::(anonymous namespace)::OpaqueType<2u>, unsigned int, 3, 64, 64>(at::native::(anonymous namespace)::OpaqueType<2u>*, at::native::(anonymous namespace)::CatArrInputTensorMetadata<at::native::(anonymous namespace)::OpaqueType<2u>, unsigned int, 64, 64>, at::native::(anonymous namespace)::TensorSizeStride<unsigned int, 4u>, int, unsigned int)",
+        "calls": 46,
+        "ms": 58.685,
+        "pct": 1.31,
+        "expected": false
+      },
+      {
+        "name": "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized<at::native::(anonymous namespace)::OpaqueType<4u>, unsigned int, 1, 128, 1, 16, 4>(char*, at::native::(anonymous namespace)::CatArrInputTensorMetadata<at::native::(anonymous namespace)::OpaqueType<4u>, unsigned int, 128, 1>, at::native::(anonymous namespace)::TensorSizeStride<unsigned int, 4u>, int, unsigned int)",
+        "calls": 21,
+        "ms": 48.765,
+        "pct": 1.09,
+        "expected": false
+      },
+      {
+        "name": "Memcpy DtoD (Device -> Device)",
+        "calls": 910,
+        "ms": 45.624,
+        "pct": 1.02,
+        "expected": false
+      }
+    ],
+    "unexpected": [
+      {
+        "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>, 4, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)",
+        "calls": 2130,
+        "ms": 535.323
+      },
+      {
+        "name": "_cb3_unpack_kernel",
+        "calls": 198,
+        "ms": 294.98
+      },
+      {
+        "name": "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized<at::native::(anonymous namespace)::OpaqueType<2u>, unsigned int, 2, 128, 1, 16, 8>(char*, at::native::(anonymous namespace)::CatArrInputTensorMetadata<at::native::(anonymous namespace)::OpaqueType<2u>, unsigned int, 128, 1>, at::native::(anonymous namespace)::TensorSizeStride<unsigned int, 4u>, int, unsigned int)",
+        "calls": 19,
+        "ms": 238.404
+      }
+    ],
+    "encoder_only": true
+  }
+}

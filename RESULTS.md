@@ -1114,3 +1114,26 @@ with both on came back 5 of 10 strict, 6 of 10 finished, with a think-exit and a
 7 and 9. The Sinkhorn path is the only one of the two whose arithmetic differs from the shipped
 kernels; it stays off. The fused dequant is bit-identical by construction and gets its own gate
 before it is recommended. Records under `results/prefill/`.
+
+### 2026-09-15 06:40 — the night's prefill runs: fp8 gather, chunk 4,096, attention GEMM precision
+
+Same Frontend keep-set at 0.36, one ~6,700-token prompt per configuration (`results/prefill/`):
+
+| change | prefill | TTFT | Frontend gate (strict · finished · hard misses) |
+|---|---|---|---|
+| shipped | 257 tok/s | 25.9 s | 7 · 9 · 0 (2026-09-14 01:22) |
+| `DSV41_PREFILL_FP8_DEQUANT=fused` | +3.3 % (other prompt: 409 → 422) | | 4 · 9 · 0 |
+| `DSV41_PREFILL_KV_FP8=1` | 314 tok/s | 21.3 s | 6 · 8 · one think-exit (gated at chunk 4,096) |
+| `DSV41_PREFILL_KV_FP8=1`, chunk 4,096 | 170 tok/s | 39.3 s | refuted on speed |
+| `DSV41_PREFILL_ATTN_GEMM=tf32` | 266 tok/s | 25.1 s | 4 · 9 · 0 |
+| `DSV41_PREFILL_ATTN_GEMM=bf16` | 358 tok/s | 18.7 s | not yet gated |
+
+Eight Frontend gates at this keep in one night put the strict count between 4 and 7 and the
+finished count between 8 and 10 on the same code; the strict rule is sampling noise at n = 10,
+and only one configuration produced hard misses (the fused Sinkhorn, above). A prefill change is
+therefore judged here by finished answers and the kinds of miss, not by the strict count. On
+that reading the fused dequant and the tf32 attention path show no harm; the fp8 gather's single
+think-exit needs a second gate at the shipped chunk; bf16 attention, the largest gain, is gated
+next. The memory model predicted the fp8 gather's low-water mark to within 0.1 GB (12.25 against
+12.35 GB) and over-estimated the 4,096 chunk by 12 GB, which the allocator's high-water behaviour
+explains and `docs/memory-budget.md` now describes.
