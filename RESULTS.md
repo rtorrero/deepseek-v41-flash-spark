@@ -1193,3 +1193,37 @@ until a second full gate at n = 20 says the guard miss was the loop lottery and 
 a corrupted run. Three-character operators welded between operands (`===`, `!==`, `>>>`) are
 ordinary JavaScript, and the check now skips them. Every gate card before this date that reads
 "corrupted run" on an operator is that false positive; none of the shipped records did.
+
+### 2026-09-15 12:15 — the drafter's first fine-tune: built, run, and nothing gained
+
+The whole path ran end to end on the box for the first time: the recorder wrote 2,066 shards
+(150,298 settled tokens, 8.2 GB) while the server decoded 1,031 continuations; `tools/train_mtp.py`
+trained all 636 M drafter parameters for 3,000 steps of 16 at LR 2e-5 (0.51 s a step, 42 GB, 26
+minutes, engine down); `tools/verify_mtp.sh` served both heads on the Frontend keep-set at 0.36
+and took the two rows that decide anything, then the two gates (`results/mtp/`):
+
+| head | prose acceptance · tok/s | markup acceptance · tok/s | Frontend gate | Writing prompts on this keep-set |
+|---|---|---|---|---|
+| shipped | 2.69 · 14.3 | 5.31 · 29.4 | 9 of 10 finished, 0 hard | 5 of 8, guard 2 |
+| fine-tuned | 2.77 · 14.5 | 5.35 · 29.6 | 8 of 10 finished, guard 1 | 6 of 8, think-exit 2 |
+
+The rows are noise around the shipped head, and the trainer had said so before the verify ran: its
+held-out acceptance proxy was 3.84 before training and 3.76 after, flat at every checkpoint. Two
+causes, both in the data, both fixed before the next pass. The generator planned 75 % of its
+requests as prose, and the shards came out 55 % code by tokens (prose 48,274, code 82,498,
+reasoning 14,824, markup 4,863): a prose continuation stops on its own after about 80 tokens
+while a code one runs to the cap, so a request share is not a token share. `draft_data_gen.py`
+now picks the next request by the group behind its settled-token share (test added). And 3,000
+steps of 16 is a third of an epoch at a learning rate ten times below the recipe this follows,
+which is a warm-up, not a fine-tune. The second pass, queued overnight: a prose-heavy 120k-token
+pass with the fixed generator, then LR 1e-4 for 8,000 steps over both sets.
+
+The gate differences between the two heads are the sampling lottery at n = 8 and n = 10. Verification
+by the target keeps the output distribution, so a drafter cannot make the model write differently;
+it can only be slower or faster. The two think-exits on the Writing prompts are noted, and if the
+second head shows the same kind twice again, the acceptance path gets checked before its rows are
+believed.
+
+The Writing prompts on the **Frontend** keep-set are a new column here and not comparable with the
+Writing record (its own keep-set at 0.40, 5 of 8 strict with one guard miss on 2026-09-13 20:45); a
+Writing gate on its own keep-set under the new prefill defaults is queued tonight.
