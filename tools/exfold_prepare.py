@@ -208,6 +208,13 @@ def observe(eng, texts, max_len: int, want_obs: int, log=print):
 
 
 # --------------------------------------------------------------------------- stage 2
+# Inference mode is scoped to the two compute functions and NOT to the engine's construction.
+# The engine's own entry points (engine/model.py forward, decode) run under inference mode, so the
+# scratch they allocate lazily is an inference tensor and a kernel that writes it from outside
+# fails ("Inplace update to inference tensor outside InferenceMode"; the third calibration run).
+# The arena, in turn, must be a normal tensor, because the slot loader writes it from worker
+# threads that are outside any mode (the fourth run, with main() wrapped, failed there).
+@torch.inference_mode()
 def expert_outputs(eng, L: int, rows: torch.Tensor, idx: torch.Tensor):
     """`[n, k, D]` -- each observed token's routed expert outputs, unweighted.
 
@@ -229,6 +236,7 @@ def expert_outputs(eng, L: int, rows: torch.Tensor, idx: torch.Tensor):
     return out
 
 
+@torch.inference_mode()
 def accumulate(out: torch.Tensor, idx: torch.Tensor, n_experts: int, batch: int = 256):
     """The three pairwise sums plus the per-expert norm statistics, for one layer.
 
@@ -414,8 +422,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # The engine's expert kernels update arena tensors in place; outside inference mode torch refuses
-    # that on tensors the engine created under it ("Inplace update to inference tensor outside
-    # InferenceMode"), which is how the first calibration runs on the box ended.
-    with torch.inference_mode():
-        main()
+    main()
