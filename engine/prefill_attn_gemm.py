@@ -20,12 +20,13 @@ The modes.
   fp32            -- what the engine did until 0.6.0: `q` and the gathered KV are widened to fp32
                      per tile and both products run in fp32. Byte-for-byte the shipped engine;
                      this module writes nothing and touches no torch flag.
-  tf32            -- gated 4 strict / 9 finished / no hard miss, +5 %; the same fp32 tensors, but `torch.backends.cuda.matmul.allow_tf32` is turned
+  tf32  (default since 2026-09-15: gated 4·9·0 and 8·10·0 with the fused dequant, +5 %) -- the same fp32 tensors, but `torch.backends.cuda.matmul.allow_tf32` is turned
                      on around the tile loop and off again after it. TF32 rounds the GEMM *inputs*
                      to an 11-bit significand and still accumulates in fp32 on the tensor cores,
                      so it is the "keep fp32 accumulate" path, at ~2^-11 = 4.9e-4 relative on the
                      operands and of the order of 1e-3 on the product.
-  bf16  (default since 2026-09-15: two full gates, 6·9·1 and 8·10·0, plus 13 more runs with no hard miss; +21 %) -- the operands are never widened at all (`q` and the KV are bf16 in the cache),
+  bf16            -- +21 % prefill and two clean gates, but prose DECODE acceptance after a bf16
+                     prefill measured 1.99 against 2.69 (RESULTS.md 2026-09-15 17:20): opt-in -- the operands are never widened at all (`q` and the KV are bf16 in the cache),
                      the products run bf16-in/fp32-accumulate on the tensor cores, and the score
                      product is widened back to fp32 before the softmax, which therefore stays
                      exactly as accurate as it was. 8-bit significand, ~2^-8 = 3.9e-3 relative.
@@ -65,7 +66,7 @@ import os
 
 ENV_VAR = "DSV41_PREFILL_ATTN_GEMM"
 ALIAS = "DSV41_PREFILL_HC_GEMM"
-DEFAULT = "bf16"
+DEFAULT = "tf32"
 DECODE = "fp32"   # decode never leaves fp32, whatever the prefill default becomes
 MODES = ("fp32", "tf32", "bf16")
 

@@ -1270,3 +1270,27 @@ thinking off, and the head already matches it about as well as its position-2 to
 a head that accepts more on prose needs either a different objective (the paper this follows
 trains against the target's full distribution, not a top-32 slice) or a target the head has not
 already seen. The shipped head stays, unchanged to the bit.
+
+### 2026-09-15 17:20 — bf16 back to opt-in: the decode after it accepts fewer draft tokens on prose
+
+The drafter verify's baseline rows, same prompts and the shipped head, under the two prefill modes:
+
+| prefill attention | prose acceptance · tok/s | markup acceptance · tok/s |
+|---|---|---|
+| tf32 (09:01 run) | 2.69 · 14.3 | 5.31 · 29.4 |
+| bf16 (16:44 run) | 1.99 · 10.4 | 5.37 · 29.9 |
+
+The morning's short-prompt probe had shown the same shape (2.43 to 1.98, 13.4 to 10.9 tok/s) and was
+set aside as one sample. Two prose prompts out of two, a quarter of the acceptance each, and markup
+untouched, is a pattern. The likely mechanism: the drafter reads the prefix the prefill wrote, and a
+prefix rounded at bf16 is far enough from what its blocks were trained against to cost draft hits
+on prose, where the head has the least margin to begin with. What is not settled is whether the
+loss is the mode or the greedy path: at temperature 0 a rounded prefill can pick a different
+continuation, and a different story has a different acceptance. An A/B with sampled runs, five
+per mode on each prose prompt, is queued behind tonight's chain.
+
+Until it reports, the default is tf32 again (gated 4 · 9 · 0 alone and 8 · 10 · 0 with the fused
+dequant). Four hours of bf16 as the default changed no shipped record: every gate in that window
+is filed under `results/prefill/` by mode, and the drafter verify rows above are the only rows
+taken under it. A 3 s TTFT gain on a 6,678-token prompt is worth less than 4 tok/s on every prose
+answer past a few hundred tokens, and that arithmetic is the whole decision.
