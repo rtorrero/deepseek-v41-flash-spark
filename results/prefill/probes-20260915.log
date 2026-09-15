@@ -1,0 +1,12 @@
+PROBE {"prompt_tokens": 6678, "completion_tokens": 62, "ttft_s": 29.123, "wall_s": 33.95, "prefill_s": 29.104, "prefill_tok_s": 229.45, "decode_tok_s": 12.86, "accept_len_mean": 3.1, "run": 1, "tag": "shipped"}
+PROBE {"prompt_tokens": 6678, "completion_tokens": 64, "ttft_s": 17.699, "wall_s": 22.05, "prefill_s": 17.555, "prefill_tok_s": 380.4, "decode_tok_s": 14.47, "accept_len_mean": 2.62, "run": 2, "tag": "shipped"}
+PROBE {"prompt_tokens": 31, "completion_tokens": 200, "ttft_s": 1.212, "wall_s": 16.11, "prefill_s": 1.199, "prefill_tok_s": 25.85, "decode_tok_s": 13.36, "accept_len_mean": 2.43, "run": 1, "tag": "shipped-decode"}
+PROBE {"prompt_tokens": 6678, "completion_tokens": 60, "ttft_s": 22.14, "wall_s": 27.09, "prefill_s": 22.113, "prefill_tok_s": 301.99, "decode_tok_s": 12.14, "accept_len_mean": 2.86, "run": 1, "tag": "bf16"}
+PROBE {"prompt_tokens": 6678, "completion_tokens": 64, "ttft_s": 14.81, "wall_s": 19.16, "prefill_s": 14.562, "prefill_tok_s": 458.58, "decode_tok_s": 14.48, "accept_len_mean": 2.62, "run": 2, "tag": "bf16"}
+PROBE {"prompt_tokens": 31, "completion_tokens": 200, "ttft_s": 1.19, "wall_s": 19.6, "prefill_s": 1.166, "prefill_tok_s": 26.58, "decode_tok_s": 10.86, "accept_len_mean": 1.98, "run": 1, "tag": "bf16-decode"}
+PROBE {"prompt_tokens": 6678, "completion_tokens": 64, "ttft_s": 24.488, "wall_s": 30.26, "prefill_s": 24.467, "prefill_tok_s": 272.94, "decode_tok_s": 10.92, "accept_len_mean": 2.62, "run": 1, "tag": "fp8g"}
+PROBE {"prompt_tokens": 6678, "completion_tokens": 64, "ttft_s": 18.073, "wall_s": 22.35, "prefill_s": 17.831, "prefill_tok_s": 374.51, "decode_tok_s": 14.73, "accept_len_mean": 2.62, "run": 2, "tag": "fp8g"}
+PROBE {"prompt_tokens": 31, "completion_tokens": 200, "ttft_s": 1.241, "wall_s": 16.19, "prefill_s": 1.217, "prefill_tok_s": 25.47, "decode_tok_s": 13.32, "accept_len_mean": 2.43, "run": 1, "tag": "fp8g-decode"}
+PROBE {"prompt_tokens": 6678, "completion_tokens": 64, "ttft_s": 21.374, "wall_s": 26.77, "prefill_s": 21.357, "prefill_tok_s": 312.69, "decode_tok_s": 12.05, "accept_len_mean": 2.71, "run": 1, "tag": "combo"}
+PROBE {"prompt_tokens": 6678, "completion_tokens": 64, "ttft_s": 14.907, "wall_s": 19.25, "prefill_s": 14.812, "prefill_tok_s": 450.85, "decode_tok_s": 14.52, "accept_len_mean": 2.62, "run": 2, "tag": "combo"}
+PROBE {"prompt_tokens": 31, "completion_tokens": 200, "ttft_s": 0.97, "wall_s": 19.38, "prefill_s": 0.966, "prefill_tok_s": 32.09, "decode_tok_s": 10.86, "accept_len_mean": 1.98, "run": 1, "tag": "combo-decode"}

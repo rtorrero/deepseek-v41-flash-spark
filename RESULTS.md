@@ -1137,3 +1137,31 @@ think-exit needs a second gate at the shipped chunk; bf16 attention, the largest
 next. The memory model predicted the fp8 gather's low-water mark to within 0.1 GB (12.25 against
 12.35 GB) and over-estimated the 4,096 chunk by 12 GB, which the allocator's high-water behaviour
 explains and `docs/memory-budget.md` now describes.
+
+### 2026-09-15 08:00 — the same four prefill changes, warm, through one probe
+
+The night's table above misleads, and the reason is worth its own entry. Every number in it came
+from the first prompt an engine served after a start. `tools/prefill_probe.py` now sends the same
+prompt twice per configuration, and the second run is the one that counts: the shipped engine does
+229 tok/s on its first 6,678-token prompt and 380 on the second identical one. The 254-against-409
+gap between two earlier entries was cold against warm, not two harnesses. A decode probe on a 31-token
+prose prompt, 200 tokens, thinking off, follows each pair.
+
+Frontend keep-set at 0.36, 256k context, one prompt (`results/prefill/prompt.txt`), warm run,
+raw lines in `results/prefill/probes-20260915.log`:
+
+| configuration | prefill (warm) | TTFT | first prompt after start | decode, short prose |
+|---|---|---|---|---|
+| shipped | 380 tok/s | 17.7 s | 229 tok/s | 13.4 tok/s, acceptance 2.43 |
+| `DSV41_PREFILL_ATTN_GEMM=bf16` | 459 tok/s (+21 %) | 14.8 s | 302 tok/s | 10.9 tok/s, acceptance 1.98 |
+| `DSV41_PREFILL_KV_FP8=1` | 375 tok/s | 18.1 s | 273 tok/s | 13.3 tok/s, acceptance 2.43 |
+| all three with `DSV41_PREFILL_FP8_DEQUANT=fused` | 451 tok/s | 14.9 s | 313 tok/s | 10.9 tok/s, acceptance 1.98 |
+
+Three readings. The fp8 gather buys nothing at the shipped chunk once both runs are warm; its +22 %
+last night was a cold run against a cold run of a different length, and its gate had a think-exit.
+It is out. The bf16 attention products are the whole gain, +21 % and not the +41 % the cold run
+suggested; the fused dequant adds nothing visible at n = 1 on top of it. And the decode line after a
+bf16 prefill is lower on the short prompt with a different acceptance, the same figure twice, which
+says the bf16 rounding in prefill changes the prefix the decoder reads and the continuation with it.
+Whether that matters is what the gate is for. It runs next on bf16 alone and on bf16 with the fused
+dequant, and finished answers and miss kinds decide, against the shipped 7 · 9 · 0.
