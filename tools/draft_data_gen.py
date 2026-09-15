@@ -177,6 +177,21 @@ def register_pool(sources: list, registers) -> list:
     return [s for s in sources if s["register"] in registers]
 
 
+def prose_behind(by_register: dict, prose_share: float) -> bool:
+    """Which group the next request should come from, judged on SETTLED TOKENS, not requests.
+
+    The first 150k-token run planned 75 % of its requests as prose and ended at 32 % prose by
+    tokens: a prose continuation stops on its own after ~80 tokens while a code one runs to the
+    cap, so a request share is not a token share. The drafter is trained on tokens, and the
+    prose ones are the point, so the group that is behind its share gets the next request.
+    """
+    prose = sum(v for k, v in by_register.items() if k in PROSE)
+    total = sum(by_register.values())
+    if total == 0:
+        return prose_share > 0
+    return prose / total < prose_share
+
+
 def plan_mix(sources: list, n: int, prose_share: float, seed: int) -> list:
     """`n` (topic, register) draws, deterministic in `seed`.
 
@@ -364,13 +379,21 @@ def main() -> int:
                f"prose_share {a.prose_share}, seed {a.seed}\n")
     rng = random.Random(a.seed ^ 0x5EED)
     t_start = time.perf_counter()
-    i = 0
+    # Two queues in plan order; which one the next request comes from is decided on settled tokens.
+    queue = {"prose": [s for s in picks if s["register"] in PROSE],
+             "code": [s for s in picks if s["register"] in CODEY]}
+    extend_seed = a.seed + len(picks)
     try:
         while st["tokens"] < a.tokens:
-            if i >= len(picks):  # the plan ran out (short answers); extend it deterministically
-                picks += plan_mix(sources, est["requests"], a.prose_share, a.seed + len(picks))
-            src = picks[i]
-            i += 1
+            group = "prose" if prose_behind(st["by_register"], a.prose_share) else "code"
+            if not queue[group]:  # that queue ran out; extend the plan deterministically
+                more = plan_mix(sources, est["requests"], a.prose_share, extend_seed)
+                extend_seed += len(more)
+                queue["prose"] += [s for s in more if s["register"] in PROSE]
+                queue["code"] += [s for s in more if s["register"] in CODEY]
+                if not queue[group]:
+                    continue
+            src = queue[group].pop(0)
             text = passage(read_source(src), rng)
             if len(text) < 200:
                 continue

@@ -83,6 +83,10 @@ drawn = {s["path"] for s in G.plan_mix(sources, 2000, 0.75, 3) if s["register"] 
 check("every code/markup source is drawn at least once over a long plan",
       drawn == codey, f"{len(drawn)}/{len(codey)}")
 
+check("the next request comes from the group behind its TOKEN share, not its request share",
+      G.prose_behind({}, 0.75) and G.prose_behind({"prose": 100, "code": 300}, 0.75)
+      and not G.prose_behind({"prose": 400, "reasoning": 50, "code": 100}, 0.75)
+      and not G.prose_behind({"code": 10}, 0.0))
 check("prose_share 1.0 needs no code sources drawn",
       all(s["register"] in G.PROSE for s in G.plan_mix(sources, 100, 1.0, 5)))
 
