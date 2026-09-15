@@ -498,6 +498,10 @@ def corrupt_run(text: str):
         # a writer's ellipsis; five or more are a run.
         if ch == "." and j - i < 5:
             continue
+        # `a===b`, `a!==b`, `a>>>b`: three-character operators welded between operands are
+        # ordinary JavaScript, and a Tic-Tac-Toe page tripped this on `a===b && b===c`.
+        if ch in "=>" and j - i == 3:
+            continue
         if before.isalnum() and after.isalnum():
             return text[i - 1:j + 1], line.strip()[:60]
     return None

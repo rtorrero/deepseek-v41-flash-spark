@@ -55,8 +55,9 @@ The three modes, and why `fused` is the one to use.
     something slow and correct. The mode name is kept so the refusal is discoverable rather than
     silent.
 
-Off is the default and off is byte-identical: with the variable unset `MODE` is `"off"` and
-`v41_ref.dense` calls `w.dequant()` exactly as it always did. `tools/test_prefill_fp8.py` pins
+Fused is the default since 2026-09-15 (bit-identical to `w.dequant()` on the device,
+`tools/test_fp8_dequant.py`, +3.3 % prefill); `off` is the path the engine used until then, and
+off is byte-identical: `v41_ref.dense` calls `w.dequant()` exactly as it always did. `tools/test_prefill_fp8.py` pins
 both halves of that. Torch-free, like `engine/prefill_topk.py`, so the parser and the memory
 arithmetic are under test on a CPU runner.
 """
@@ -67,10 +68,12 @@ import os
 
 ENV_VAR = "DSV41_PREFILL_FP8_DEQUANT"
 
-#: Every spelling the variable accepts. "off" is the shipped behaviour.
+#: Every spelling the variable accepts. "fused" is the shipped behaviour; "off" is the pre-0.6 path.
 MODES = ("off", "fused", "cached", "scaled_mm")
+DEFAULT = "fused"
 
-_OFF = ("", "off", "0", "none", "default")
+_OFF = ("off", "0", "none")
+_DEFAULT = ("", "default")
 
 _SCALED_MM_REFUSAL = (
     "the checkpoint's scale table is one UE8M0 value per 32x32 block "
@@ -87,6 +90,8 @@ def parse(raw):
     Pure and torch-free so the unit test can exercise every branch on a CPU runner.
     """
     v = (raw or "").strip().lower()
+    if v in _DEFAULT:
+        return DEFAULT
     if v in _OFF:
         return "off"
     if v in ("fused", "cached"):

@@ -101,8 +101,9 @@ KEY_BLOCK = 512  # indexer score tile along the compressed-key axis (= index_top
 R.MM_TILE = MM_TILE
 
 # The two prefill switches of docs/gemm-dispatch.md, pushed into v41_ref the same way MM_TILE is.
-# Both default to off and off is byte-identical: PREFILL_FP8_MODE "off" is FP8Weight.dequant(), and
-# with HC_SINKHORN_FUSED never asked for, hc_mixes keeps the tiled torch Sinkhorn.
+# PREFILL_FP8_MODE defaults to "fused" since 2026-09-15 (bit-identical to FP8Weight.dequant() on the
+# device, tools/test_fp8_dequant.py); "off" is that dequant itself. With HC_SINKHORN_FUSED never asked
+# for, hc_mixes keeps the tiled torch Sinkhorn.
 R.PREFILL_FP8_MODE = PF.MODE
 try:  # the fused Sinkhorn decode has used all along; absent only where triton is not importable
     from engine.hc_sinkhorn import hc_split_sinkhorn as _hc_fused  # noqa: E402

@@ -17,7 +17,7 @@ Three halves:
    byte-identical" means at this level.
 
 3. Regex pins on `engine/model.py`. What matters about this switch is not that it works -- it is
-   a dtype and a context manager -- but that it stays fp32 by default, stays inside the attention
+   a dtype and a context manager -- but that it is tf32 by default, stays inside the attention
    softmax, and stays PREFILL-ONLY. A mode that leaked into the decode path would change the
    drafted tokens the verify step is asked to accept and nothing would crash; the acceptance rate
    would just quietly fall. And a TF32 scope that was armed and never restored would do the same
@@ -53,10 +53,10 @@ def raises(fn, *a):
 
 
 # ============================================================ the parser
-check("the default is fp32", DEFAULT == "fp32" and MODES == ("fp32", "tf32", "bf16"))
-check("unset means fp32", parse(None) == "fp32" and parse("") == "fp32")
-check("the off spellings mean fp32",
-      all(parse(v) == "fp32" for v in ("off", "default", "none", " OFF ", "Default")))
+check("the default is tf32", DEFAULT == "tf32" and MODES == ("fp32", "tf32", "bf16"))
+check("unset means tf32", parse(None) == "tf32" and parse("") == "tf32")
+check("the off spellings mean the default, tf32",
+      all(parse(v) == "tf32" for v in ("off", "default", "none", " OFF ", "Default")))
 check("each mode parses to itself", [parse(m) for m in MODES] == list(MODES))
 check("case and whitespace are tolerated", parse("  TF32 ") == "tf32" and parse("BF16") == "bf16")
 check("a mode that does not exist is refused",
@@ -76,7 +76,7 @@ check("the refusal names the variable and lists the modes",
       ENV_VAR in msg and all(m in msg for m in MODES), msg)
 
 # ============================================================ the environment and the alias
-check("neither variable set is fp32", from_env({}) == "fp32")
+check("neither variable set is tf32", from_env({}) == "tf32")
 check("the variable is read", from_env({ENV_VAR: "tf32"}) == "tf32")
 check("the alias is read when the variable is unset", from_env({ALIAS: "bf16"}) == "bf16")
 check("the variable wins over the alias",
@@ -88,16 +88,18 @@ check("the alias is the name the investigation started under",
       ALIAS == "DSV41_PREFILL_HC_GEMM" and ENV_VAR == "DSV41_PREFILL_ATTN_GEMM")
 
 # ============================================================ the prefill guard
-check("with neither variable set the module starts in fp32", AG.MODE == "fp32")
-check("off, every path is fp32", AG.mode_for(True) == "fp32" and AG.mode_for(False) == "fp32")
+check("with neither variable set the module starts in tf32", AG.MODE == "tf32")
+check("the default: prefill tf32, decode fp32", AG.mode_for(True) == "tf32" and AG.mode_for(False) == "fp32")
+AG.MODE = "fp32"
+check("fp32, every path is fp32", AG.mode_for(True) == "fp32" and AG.mode_for(False) == "fp32")
 for m in ("tf32", "bf16"):
     AG.MODE = m
     try:
         check(f"{m}: prefill gets the mode", AG.mode_for(True) == m)
         check(f"{m}: DECODE stays fp32", AG.mode_for(False) == "fp32")
     finally:
-        AG.MODE = "fp32"
-check("the sweep leaves the module back in its shipped state", AG.MODE == "fp32")
+        AG.MODE = "tf32"
+check("the sweep leaves the module back in its shipped state", AG.MODE == "tf32")
 
 # ============================================================ math_scope
 check("torch is not loaded yet, so 'does not import torch' below means something",

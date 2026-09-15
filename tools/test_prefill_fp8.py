@@ -57,9 +57,10 @@ def _msg(fn, *a):
 
 
 # ============================================================ the parser
-check("unset means the shipped path", parse(None) == "off" and parse("") == "off")
+check("unset means the shipped path, fused", parse(None) == "fused" and parse("") == "fused"
+      and parse("default") == "fused")
 check("the off spellings mean the shipped path",
-      all(parse(v) == "off" for v in ("off", "0", "none", "default", " OFF ", "Off")))
+      all(parse(v) == "off" for v in ("off", "0", "none", " OFF ", "Off")))
 check("the two implemented modes parse", parse("fused") == "fused" and parse("cached") == "cached")
 check("whitespace and case are tolerated", parse("  Fused ") == "fused" and parse("CACHED") == "cached")
 check("an unknown mode is refused", raises(parse, "dequant") and raises(parse, "yes"))
@@ -79,7 +80,8 @@ import engine.prefill_fp8 as PF  # noqa: E402
 
 check("the module reads the environment once, at import",
       "MODE = parse(os.environ.get(ENV_VAR))" in open(HOOK).read())
-check("with the variable unset the module starts off", PF.MODE == "off")
+check("with the variable unset the module starts fused", PF.MODE == "fused")
+PF.MODE = "off"
 check("off means neither branch is taken", not PF.enabled() and not PF.cached())
 
 PF.MODE = "fused"
@@ -88,8 +90,8 @@ try:
     PF.MODE = "cached"
     check("cached is enabled and cached", PF.enabled() and PF.cached())
 finally:
-    PF.MODE = "off"
-check("the sweep leaves the module back in its shipped state", PF.MODE == "off")
+    PF.MODE = "fused"
+check("the sweep leaves the module back in its shipped state", PF.MODE == "fused")
 
 # ============================================================ what `cached` costs
 # The five weights that are still FP8Weight under DSV41_DENSE_FP4=attn,wo_a, at the checkpoint's

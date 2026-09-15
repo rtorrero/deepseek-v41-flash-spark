@@ -590,6 +590,11 @@ check("the loop the model enters repairing a corrupted token is caught",
 check("`===` and `...` in real code are not corrupted runs",
       G.corrupt_run(GOOD_HTML) is None, str(G.corrupt_run(GOOD_HTML)))
 check("a markdown rule is not a corrupted run", G.corrupt_run("text\n\n---------\n\nmore") is None)
+check("`a===b` and `a>>>b` welded between operands are operators, not runs",
+      G.corrupt_run("return a!==null && a===b && b===c") is None
+      and G.corrupt_run("x = a>>>b") is None
+      and G.corrupt_run("Tic===Tac===Toe") is None
+      and G.corrupt_run("Tic====Tac") is not None)
 check("a box-drawing rule is not a corrupted run",
       G.corrupt_run("| a | b |\n──────────") is None)
 check("three blank lines are not a corrupted run", G.corrupt_run("a\n\n\n\nb") is None)

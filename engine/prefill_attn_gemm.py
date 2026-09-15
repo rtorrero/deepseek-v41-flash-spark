@@ -17,10 +17,10 @@ path has that count.
 
 The modes.
 
-  fp32  (default) -- what the engine has always done: `q` and the gathered KV are widened to fp32
+  fp32            -- what the engine did until 0.6.0: `q` and the gathered KV are widened to fp32
                      per tile and both products run in fp32. Byte-for-byte the shipped engine;
                      this module writes nothing and touches no torch flag.
-  tf32            -- the same fp32 tensors, but `torch.backends.cuda.matmul.allow_tf32` is turned
+  tf32  (default since 2026-09-15, gated 4 strict / 9 finished / no hard miss, +5 %) -- the same fp32 tensors, but `torch.backends.cuda.matmul.allow_tf32` is turned
                      on around the tile loop and off again after it. TF32 rounds the GEMM *inputs*
                      to an 11-bit significand and still accumulates in fp32 on the tensor cores,
                      so it is the "keep fp32 accumulate" path, at ~2^-11 = 4.9e-4 relative on the
@@ -65,7 +65,8 @@ import os
 
 ENV_VAR = "DSV41_PREFILL_ATTN_GEMM"
 ALIAS = "DSV41_PREFILL_HC_GEMM"
-DEFAULT = "fp32"
+DEFAULT = "tf32"
+DECODE = "fp32"   # decode never leaves fp32, whatever the prefill default becomes
 MODES = ("fp32", "tf32", "bf16")
 
 
@@ -97,7 +98,7 @@ MODE = from_env()
 
 def mode_for(prefill: bool) -> str:
     """The math type an attention call should use. Never anything but fp32 off the prefill path."""
-    return MODE if prefill else DEFAULT
+    return MODE if prefill else DECODE
 
 
 @contextlib.contextmanager

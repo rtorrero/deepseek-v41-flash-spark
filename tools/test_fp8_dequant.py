@@ -124,9 +124,9 @@ try:
     R.prefill_fp8_cache_clear()
     check("clearing gives them back", R.prefill_fp8_cache_bytes() == 0)
 finally:
-    R.PREFILL_FP8_MODE = "off"
+    R.PREFILL_FP8_MODE = "fused"
     R.prefill_fp8_cache_clear()
-check("the sweep leaves v41_ref back in its shipped state", R.PREFILL_FP8_MODE == "off")
+check("the sweep leaves v41_ref back in its shipped state", R.PREFILL_FP8_MODE == "fused")
 
 if not torch.cuda.is_available():
     print("\nskip: no CUDA here, so the Triton kernel itself was not run "
