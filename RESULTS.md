@@ -1338,3 +1338,36 @@ non-resident experts than the eight transient slots and every request died on th
 start log printed one warning nobody reads. From `engine/keep_guard.py` on, that start is refused
 with the counts and the remedies (`DSV41_ALLOW_STREAMING_TAIL=1` serves the tail anyway), and the
 rule is under test. The two void cards stay on disk as the record of the failure.
+
+### 2026-09-15 23:30 — the single-file page test: every configuration fails, 0.5.0 included
+
+One task, run through opencode against the Frontend keep-set, from the same folder with the same
+prompt each time: a realistic single-file HTML aquarium (a boids school, caustics, light shafts,
+kelp, bubbles, a control), roughly 360 words of specification inside opencode's own 18k-token
+context. Expected: one Write call with the page.
+
+| serving point | thinking | what came out |
+|---|---|---|
+| 0.36, 256k, current defaults | off, five runs | ~137 good lines, then `const A1 = p(A, 0)` … `A1016` until the repetition guard, about 13,500 tokens; the content parameter never closes, no path, no file |
+| 0.38, 128k, 86 GB arena | off | `<title>Aquarium</td>`, then a cascade of broken `</script>` tags after 1,056 tokens |
+| 0.36, 256k, fp32 attention and the old dequant (the 0.5.0 numerics) | off, two runs | nine tokens and stop with no tool call; then 32,000 tokens of plain-text deliberation with no tool call |
+| 0.36, 256k, current defaults, reasoning budget 2,000 | on | budget hit at 2,004, the answer degenerates into `fish fish fish`, guard stop at 3,685 |
+| 0.36, 256k, current defaults | on | 32,000 tokens of reasoning, length cap, nothing |
+| **v0.5.0 code**, 0.36, 256k | on | 32,000 tokens of reasoning, length cap, nothing |
+
+Three readings. The prefill numerics are not the cause: the 0.5.0 numerics fail too. The tagged
+0.5.0 engine is not better: run for run it fails the same way as the current code on the same
+prompt. And the failure is degeneration in whatever span the model is generating, reasoning or
+answer or tool-call value, within a few thousand tokens, on a keep-set that finishes 9 of 10 of its
+gate prompts. The gate prompts ask for pages of 5 to 7 thousand characters; this one asks for
+sixty kilobytes behind an 18k-token agent prompt, and that is past what 139 experts a layer hold.
+
+Two smaller findings from the same evening. opencode's `reasoning_effort: "none"` never reaches
+the server (the option is dropped), so every earlier "thinking off" opencode session on this
+recipe ran with thinking on; the server default decides. And the strict tool-call parser rejects
+a Write whose content value is a whole HTML page, the fallback parser used to empty such a value at
+its first `<`, and nothing kept the refused text; the fallback is fixed and the text is saved under
+`logs/tooltext/` when `DSV41_LOG_TOOL_TEXT=1`.
+
+Not a release. The candidate serves the gate prompts but not this task, and the tag waits until a
+page of this size either lands or is written down as out of reach for this box.

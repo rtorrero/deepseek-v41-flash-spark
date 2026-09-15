@@ -350,3 +350,14 @@ plan that ends in a decision loop, the agent that rewrites a clean file — rema
 Streaming one non-resident expert per layer-step when the router's margin asks for it fires 1.5 times a
 token on Frontend and costs 26 ms a fetch, halving decode, and the gate outcomes stay inside noise
 (`results/escape/`). Off by default; see RESULTS.md 2026-09-15 00:50.
+
+## 2026-09-15 — a large single-file page through an agent is out of reach at keep 0.36
+
+Asked through opencode for a realistic single-file HTML page of roughly sixty kilobytes (a boids
+school, caustics, light shafts, kelp, bubbles, a control) inside opencode's 18k-token context, the
+Frontend keep-set at 0.36 degenerates within a few thousand tokens in every mode tried, and so
+does the tagged v0.5.0 engine on the same prompt: numbered-variable loops inside the file, a wrong
+close tag at a `</` boundary followed by a tag cascade, plain-text deliberation that never calls
+the tool, reasoning that never ends. The gate's own page prompt is a tenth of that size and passes.
+Until a keep-set that holds more experts is measured on this task, split such work into a skeleton
+and separate edits, and read RESULTS.md 2026-09-15 23:30 before trying a bigger prompt.
