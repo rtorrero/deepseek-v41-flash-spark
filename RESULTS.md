@@ -1165,3 +1165,31 @@ bf16 prefill is lower on the short prompt with a different acceptance, the same 
 says the bf16 rounding in prefill changes the prefix the decoder reads and the continuation with it.
 Whether that matters is what the gate is for. It runs next on bf16 alone and on bf16 with the fused
 dequant, and finished answers and miss kinds decide, against the shipped 7 · 9 · 0.
+
+### 2026-09-15 09:30 — the bf16 and tf32 verdicts, and two defaults change
+
+Two gates and three reruns on the Frontend keep-set at 0.36, thinking on, against the shipped
+record of 7 strict · 9 finished · 0 hard misses (`results/prefill/`):
+
+| configuration | strict | finished | think-exit · guard · corrupt | note |
+|---|---|---|---|---|
+| `DSV41_PREFILL_ATTN_GEMM=bf16` | 6 | 9 | 0 · 1 · 0 | html-page looped 10× in its reasoning until the repeat guard cut it; no page |
+| bf16 + `DSV41_PREFILL_FP8_DEQUANT=fused` | 5 | 9 | 0 · 0 · 0 | html-page passed with 60 declarations and 16 functions |
+| html-page alone on bf16, three more runs | 2 of 3 | 3 of 3 | 0 · 0 · 0 | run 2 tripped the corruption check on `a===b`, a false positive, fixed below |
+
+So bf16 finished 9 of 10 twice and one run in 23 ran its reasoning loop into the guard. The shipped
+code loops in reasoning three to six times a gate at this keep, and none of those 80 runs reached
+the guard. One in 23 against none in 80 is not a verdict at n = 10, and the decode probe after a
+bf16 prefill (10.9 tok/s at acceptance 1.98 against 13.4 at 2.43, the same pair twice) points the
+same way: the rounding in prefill changes what the decoder reads. The dequant bit test on the
+device passed every shape, so the fused dequant is bit-identical and needs no gate of its own.
+
+**Defaults, from this commit:** `DSV41_PREFILL_ATTN_GEMM=tf32` (gated 4 · 9 · 0 on 2026-09-15
+04:25, +5 %) and `DSV41_PREFILL_FP8_DEQUANT=fused` (bit-identical, +3.3 %). A named constant pins
+decode to fp32, under test, whatever the prefill default says. bf16 stays opt-in with its +21 %
+until a second full gate at n = 20 says the guard miss was the loop lottery and not the mode.
+
+**Gate correction.** The corrupted-run check flagged `a===b && b===c` inside a Tic-Tac-Toe page as
+a corrupted run. Three-character operators welded between operands (`===`, `!==`, `>>>`) are
+ordinary JavaScript, and the check now skips them. Every gate card before this date that reads
+"corrupted run" on an operator is that false positive; none of the shipped records did.

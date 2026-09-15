@@ -443,6 +443,13 @@ lands here as folding rather than dropping.
 
 ### Changed
 
+- **Two prefill defaults move (2026-09-15).** `DSV41_PREFILL_ATTN_GEMM` defaults to `tf32`
+  (Frontend gate 4 strict · 9 finished · no hard miss, +5 % prefill) and
+  `DSV41_PREFILL_FP8_DEQUANT` to `fused` (bit-identical to the old dequant on the device,
+  `tools/test_fp8_dequant.py`, +3.3 %). Decode stays fp32 by a named constant, under test.
+  `bf16` is +21 % (459 against 380 tok/s warm on a 6,678-token prompt) and stays opt-in: it
+  finished 9 of 10 twice, but one run in 23 looped into the repeat guard and the decode after a
+  bf16 prefill accepted fewer draft tokens. RESULTS.md 2026-09-15 09:30 has the cards.
 - `env.example` ships `PRUNE_KEEP=auto` with `ARENA_GB` **empty**. When the keep fraction is
   resolved and no arena is pinned, `./start.sh` sizes the arena for the kept set: the engine's own
   automatic sizing takes 82 % of what is free, about 89.6 GB on this box, which is more arena than
@@ -458,6 +465,9 @@ lands here as folding rather than dropping.
   0.36 and does not fit keep 0.39 — the trade is explicit rather than discovered by the watchdog.
 
 ### Fixed
+
+- `tools/gate_profile.py` no longer reports `a===b` as a corrupted run: three-character operators
+  welded between operands are JavaScript, and the check skips them (test added).
 
 - `./start.sh` no longer exits silently, before printing anything, on a checkout with no
   `results/trace-*/stats/coverage.json`: the fallback lookup ends in a failed test, and under
