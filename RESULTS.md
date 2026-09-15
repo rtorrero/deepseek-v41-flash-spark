@@ -1239,3 +1239,34 @@ on the 6,678-token prompt) and TTFT 17.7 s to 14.8 s. tf32 stays as the fallback
 byte-for-byte 0.5.0 engine. The decode-acceptance signal from the morning's short-prompt probe
 gets a proper measurement tonight: the drafter verify runs its shipped-head baseline under bf16,
 and the prose row (2.69 accepted tokens a step under tf32 today) is the comparison.
+
+### 2026-09-15 16:50 — the drafter's second pass and three learning-rate probes: parked
+
+The second data pass ran with the token-balanced generator: 120,000 settled tokens over 750
+requests at 80 % prose and reasoning by tokens (prose 67,615, reasoning 28,419, code 22,069,
+markup 1,956), against 42 % in the first pass. Both sets together are 1,764 shards and 259,100
+training samples, 12,983 of them held out by shard. On that split the shipped head's acceptance
+proxy is 3.19.
+
+The planned run at LR 1e-4 for 8,000 steps came down to 2.55 by step 500 and sat at 2.6 through
+step 2,000 (position-1 top-1 0.74 to 0.66), so it was stopped at 2,400 and replaced by three
+1,000-step probes on the same split:
+
+| LR | proxy before | after | after the fp8 round trip |
+|---|---|---|---|
+| 5e-6 | 3.19 | 3.20 | 3.21 |
+| 2e-5 | 3.19 | 3.18 | 3.25 |
+| 5e-5 | 3.19 | 3.06 | 3.23 |
+
+Nothing lifts it. A small rate leaves the head where it was, a large one degrades it, and the fp8
+column sitting above the bf16 one says the proxy's own resolution is about 0.05, so any gain this
+trainer can make on this data is below what the eval can see. The one-request verify agrees: the
+first head moved prose acceptance 2.69 to 2.77 and markup 5.31 to 5.35.
+
+Parked, with everything left in place to pick up: the recorder, the generator, the trainer, the
+verify script, 8.2 + 6.5 GB of shards on the box under `data/`, and the probe weights. What a next
+attempt would change is not the learning rate. The recorded target is the pruned server with
+thinking off, and the head already matches it about as well as its position-2 top-1 of 0.71 allows;
+a head that accepts more on prose needs either a different objective (the paper this follows
+trains against the target's full distribution, not a top-32 slice) or a target the head has not
+already seen. The shipped head stays, unchanged to the bit.
