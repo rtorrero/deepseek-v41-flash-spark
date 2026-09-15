@@ -22,7 +22,6 @@ import importlib.util
 import json
 import logging
 import os
-from server.dsml_tolerant import parse_tolerant
 import re
 import sys
 import threading
@@ -40,6 +39,7 @@ for _p in (HERE, REPO_ROOT):
 from engine_api import Engine, MockEngine  # noqa: E402
 from think_controls import MAX_NGRAM, MIN_NGRAM, make_controls  # noqa: E402
 from tool_grammar import TOOL_CALLS_MARKER, make_factory  # noqa: E402
+from dsml_tolerant import parse_tolerant
 
 log = logging.getLogger("dsv41.server")
 
