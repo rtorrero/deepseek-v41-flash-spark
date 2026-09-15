@@ -106,6 +106,9 @@ done
     echo
     echo "head: ${WEIGHTS:-shipped (checkpoint mtp.*)}"
     echo "serving: EXPERT_PROFILE=$PROFILE PRUNE_KEEP=$KEEP, thinking off for the two prompts,"
+    echo "(each row is ONE greedy run: on prose five sampled runs of the same prompt spread 1.96 to 2.65,"
+    echo " RESULTS.md 2026-09-15 18:25, so a prose difference under about 0.4 here is not a finding;"
+    echo " tools/prefill_probe.py --decode --temperature 0.7 --repeat 5 is the A/B tool)"
     echo "thinking on for the gates."
     echo
     echo "| prompt | accept_len_mean | tok/s | tokens |"
