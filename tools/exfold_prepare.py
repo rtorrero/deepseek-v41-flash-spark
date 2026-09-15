@@ -414,4 +414,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # The engine's expert kernels update arena tensors in place; outside inference mode torch refuses
+    # that on tensors the engine created under it ("Inplace update to inference tensor outside
+    # InferenceMode"), which is how the first calibration runs on the box ended.
+    with torch.inference_mode():
+        main()
