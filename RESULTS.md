@@ -1318,3 +1318,23 @@ pays 3 % on every generated token. With thinking on, the recipe's default, an an
 thousands of tokens and the 3 % is 5 to 10 s, more than the prefill gave back. bf16 wins only
 when the prompt is long and the answer short. tf32 stays the default, bf16 stays opt-in with this
 table beside it, and the verify script's prose row is read as a greedy sample from now on.
+
+### 2026-09-15 18:50 — addendum to §5: Writing at the served keep, and two void cards explained
+
+Writing on its own keep-set at `PRUNE_KEEP=auto`, which resolves to 0.36 at 256k, under the tf32
+attention default and the fused dequant: 5 of 8 strict, 6 of 8 finished, two guard misses
+(`news-lede` and `xl-en-fr` looped in their reasoning until the server cut them), one repeat-only
+miss. The 2026-09-13 record at 0.40 was 5 of 8 strict with one guard miss on a different prompt.
+This run is now the Writing record in `results/keepsets/gates.json`, because 0.36 at 256k is what
+the recipe serves; the translation prompt has looped on every Writing card since the profile
+exists, and the keep-set, not the prefill mode, is where that lives.
+
+Two earlier Writing cards from today (`results/prefill/GATE-writing-defaults.md`,
+`GATE-writing-bf16.md`) show eight HTTP 500s each and measure nothing. Both servers had come up
+with more kept experts than arena slots: `EXPERT_PROFILE` is ignored while the shipped env pins
+`TRACE_STATS`, so the first served the Frontend keep at 0.40 on an 81 GB arena, and the second
+asked for 0.40 with an arena the launcher sized for less. A prefill chunk then needed more
+non-resident experts than the eight transient slots and every request died on the ring, while the
+start log printed one warning nobody reads. From `engine/keep_guard.py` on, that start is refused
+with the counts and the remedies (`DSV41_ALLOW_STREAMING_TAIL=1` serves the tail anyway), and the
+rule is under test. The two void cards stay on disk as the record of the failure.

@@ -394,8 +394,13 @@ check("  which the coverage target alone would not have chosen",
       sal.keep_for(tuple(sorted(by["Frontend"]["topics"])), 0.85, rank="maxmin") < 0.2, True)
 check("  and the screen says both counts", by["Frontend"]["status"],
       "7 of 10 strict · 9 finished")
+check("  and Writing's record, at the served keep, says both too",
+      by["Writing"]["status"], "5 of 8 strict · 6 finished")
+# A card written before the finished line existed yields the strict count alone; every shipped
+# record carries the line now (Writing was the last, 2026-09-15), so the case is a synthetic card.
 check("  with the strict count alone where nothing counted the rest",
-      by["Writing"]["status"], "5 of 8 strict")
+      T._counts(["**Verdict: FAIL** — 3 of 8 runs failed: `a` (on) x; `b` (on) y; `c` (on) z"]),
+      (8, 5, None))
 check("  a good finished count is not called a warning",
       (by["Backend"]["status"], by["Backend"]["tone"]),
       ("3 of 10 strict · 10 finished", "good"))
