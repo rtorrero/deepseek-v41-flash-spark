@@ -966,8 +966,8 @@ def put(w, y, x, s, attr=0, maxw=None):
 MIN_H, MIN_W = 20, 70
 
 # The bar in the top-left corner, on both screens. It names the repository rather than the
-# model because a box can hold several checkouts of several recipes, and the handle because
-# the owner asked for it to be there.
+# model because a box can hold several checkouts of several recipes, and the handle so a
+# screenshot of the tool says where it came from.
 TITLE = " deepseek-v41-flash-spark · 0xbakeer "
 
 
