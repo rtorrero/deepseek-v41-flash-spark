@@ -101,11 +101,15 @@ part of the port that most resembles a project rather than a sweep.
 
 | artifact | state | validation |
 |---|---|---|
-| `tools/fp4_decode.py` | the portable decode, bit-exact | `python3 tools/test_fp4_decode.py` -- 15 checks, **passing here** |
+| `tools/fp4_decode.py` | the portable decode, bit-exact (blocker B1) | `python3 tools/test_fp4_decode.py` -- 15 checks, **passing here** |
 | `tools/fp4_cpu.c` + `build_fp4_cpu.sh` | fused decode+GEMV, AVX2/FMA, OpenMP | `tools/test_fp4_gemv_cpu.py` -- 21 checks, **passing here** |
-| `tools/fp4_expert_cpu.py` | the RAM tier: arena, expert, routed MoE | same suite; matches `moe_forward_reference` |
+| `tools/fp4_expert_cpu.py` | the RAM tier: arena, expert, routed MoE | same suite; agrees with `moe_forward_reference` |
+| `engine/caps.py` | blocker B2's decision point: fp16 on sm_70, and the capability gates | `tools/test_caps.py` -- 28 checks, **passing here** |
+| `tools/tier_plan.py` | the three-tier planner (VRAM/DDR4/NVMe) | `tools/test_tier_plan.py` -- 43 checks, **passing here** |
 | `tools/bench_fp4_cpu.py` | the measured cost of the tier | numbers below |
 | `tools/fp4_decode_triton.py` | the decode in Triton + a GPU check | **needs the V100**: `--check` |
+
+107 checks across the four suites, all passing on a machine with no GPU.
 
 Two findings from writing it that are worth more than the code:
 
@@ -141,33 +145,48 @@ Breakdown at 24 threads: w1 gate 0.253 ms, w3 up 0.250 ms, clamped SwiGLU 0.013 
 the way past -- the fused form reads each stored byte once, where materialising to fp32 first
 would touch roughly six times the bytes.
 
-## The tier plan this implies
+## The tier plan, from the planner
 
-240 expert passes per generated token (40 layers x 6 routed experts), 18.8 MB each:
+`python3 tools/tier_plan.py` builds this out of the repo's own memory terms (`tools/budget.py`),
+the routing trace already in `results/`, and exactly one measured input: the CPU tier's rate. With
+the Ryzen's 29.1 GB/s and a deliberately conservative 400 GB/s for the GPU expert path:
 
-| RAM tier share | CPU ms/token | CPU-only tok/s | note |
-|---:|---:|---:|---|
-| 0% (all experts in VRAM) | 0 | - | needs 128 GB of VRAM for experts alone: not possible with the dense weights |
-| 35% (what fits in VRAM after dense/KV/drafter) | 55 | 18 | measured CPU rate extrapolated |
-| 60% | 93 | 10.7 | measured on the Ryzen |
-| 100% | 155 | 6.5 | the Spark-like shape, minus the SSD |
+| tier | routed mass | GB/token | ms/token | tok/s alone |
+|---|---:|---:|---:|---:|
+| VRAM, 133 slots/layer | 0.758 | 3.42 | 8.5 | 117 |
+| DDR4, 251 slots/layer | 0.242 | 1.09 | 37.5 | 26.6 |
+| NVMe | 0.000 | 0.00 | 0.0 | - |
+| **total** | 1.000 | 4.51 | 46.1 | **21.7** |
 
-The V100 host has 16 cores and, in a 4-GPU chassis, usually more memory channels than a desktop:
-if it reaches 60-80 GB/s the CPU tier lands between 20 and 27 tok/s for a 60% share. **Run
-`tools/bench_fp4_cpu.py` on that host and use its number** -- the planner's input is a
-measurement, not a table.
+All 15,360 slots are resident, nothing is streamed, and the weakest layer covers 1.000 of its
+routing. Serialised that is 21.7 tok/s; with the CPU expert work overlapped under the GPU's
+attention, 26.6. If the host's CPU side reaches 60 GB/s -- a 16-core server board has more memory
+channels than a desktop -- it becomes 37 serialised and 55 overlapped.
 
-Three ways to buy headroom if the split does not come out well, in order of how much they are
-already implemented:
+The planner's only calibration is the box this engine ships for. Run it with `--profile spark`
+against the same trace and it predicts **2.05 tok/s with 1.18 GB of NVMe per generated token**,
+where that box was measured at 2.64-2.71 tok/s and 0.92 GB; and **0.739 of the routed mass in the
+arena**, where the repo reports a static coverage of 0.748 at 4,000 resident slots. Same regime,
+same trace, nothing fitted. That is what makes the V100 numbers worth reading.
 
-1. **Put more of the hot set in VRAM.** 128 GB of HBM2 at ~900 GB/s is 30x the DDR4 tier, so the
-   ranking that decides which experts live where is worth more than any kernel tuning. The trace
-   machinery for this already exists (`engine/experts.py::rank_from_trace`, `tools/budget.py`).
-2. **Use the `cb3` codebook layout for the RAM tier.** 14,454,784 B per slot instead of
-   18,800,640 -- 23% less traffic through the tier *and* 23% more experts resident, at the quality
-   cost the repo already documents.
-3. **AVX-512 or AMX** if the host has it; the current kernel is AVX2 because that is what this
-   machine has, and it is compute-bound at one thread (2.9 GB/s) and bandwidth-bound at twelve.
+**Correction to an earlier estimate in this document.** A naive "35% of the routed work in VRAM,
+65% on the CPU" split gives 10.7 tok/s. The trace says the hot set is far hotter than that: 133
+slots per layer is 34.6% of the *experts* but **75.8% of the routing**. Ranking is what makes the
+CPU tier cheap, which is also why `tools/budget.py`'s ranking rules matter here and not just on
+the Spark.
+
+Three levers, in the order they are worth pulling:
+
+1. **The ranking that decides which experts sit in VRAM.** HBM2 at ~900 GB/s against DDR4 at
+   29-60 GB/s is a 15-30x difference, and the trace machinery for it already exists
+   (`engine/experts.py::rank_from_trace`, `tools/budget.py`). The 0.758 above is that lever
+   already pulled with the repo's own trace.
+2. **The `cb3` codebook layout for the RAM tier** (14.45 MB per slot instead of 18.80): measured
+   here, it moves 0.834 of the routed mass into VRAM and takes the plan to 36.9 serialised / 50.4
+   overlapped, at the quality cost the repo already documents.
+3. **AVX-512 or AMX** if the host has it. The current kernel is AVX2 because that is what the
+   machine that wrote it has; at one thread it is compute-bound (2.9 GB/s) and at twelve it is at
+   66% of the copy ceiling, so the headroom is real but on the compute side.
 
 ## What to run on the V100 host, in order
 
@@ -183,8 +202,14 @@ bash tools/build_fp4_cpu.sh
 python3 tools/test_fp4_gemv_cpu.py
 python3 tools/bench_fp4_cpu.py --reps 9        # <- the tier planner's input
 
-# 3. the same decode against the checkpoint's own bytes, not synthetic ones
-python3 tools/test_fp4_moe.py --help           # the upstream accuracy/bandwidth harness
+# 3. the plan, with this host's measured CPU rate and the GPU rate measured in step 4
+python3 tools/test_caps.py
+python3 tools/test_tier_plan.py
+python3 tools/tier_plan.py --cpu-gbs <from step 2>
+
+# 4. the GPU expert kernels once the portable decode is in: this prints the effective GB/s
+MODEL_DIR=/path/to/DeepSeek-V4.1-Flash python3 tools/test_fp4_moe.py
+python3 tools/tier_plan.py --cpu-gbs <step 2> --gpu-gbs <step 4>
 ```
 
 If step 1 fails, the failure is a specific code or a specific K position, not a vague numerical
@@ -193,12 +218,17 @@ activation's stride-2 indexing.
 
 ## Honest status
 
-* The CPU tier and the decode are **validated**: 36 checks across two suites, all passing, on a
-  machine with no GPU. The arithmetic is bit-exact against the reference and against fp64.
+* The decode, the CPU tier, the capability/dtype layer and the planner are **validated**: 107
+  checks across four suites, all passing on a machine with no GPU. The arithmetic is bit-exact
+  against the reference and against fp64, and the planner reproduces the measured single-box
+  regime without fitting anything.
 * The Triton decode is **written and unrun**. No driver, no `nvcc`, and no 510 GB of disk on the
   box this was written on.
-* The bf16 -> fp16 sweep (B2) and the attention path (B5) are **not started**: they are the two
-  pieces of real work left, and B2 is deliberately not a blind find-and-replace.
-* The tier plan above is arithmetic from a measured CPU rate plus the repo's own memory constants.
-  It is a plan, not a benchmark of the assembled system: the overlap between the CPU expert work
-  and the GPU attention work is a scheduling property the runtime still has to deliver.
+* The bf16 -> fp16 sweep (B2) and the attention path (B5) are **not started**. They are the two
+  pieces of real work left. `engine/caps.py` gives the sweep its single decision point
+  (`DSV41_DTYPE`, resolving to fp16 on sm_70) and `tools/test_caps.py` guards the rule, but the
+  239 call sites still have to follow it, and the ones carrying large magnitudes need review
+  rather than a find-and-replace.
+* The tier plan is arithmetic from a measured CPU rate plus the repo's own memory constants. It is
+  a plan, not a benchmark of the assembled system: the overlap between the CPU expert work and the
+  GPU attention work is a scheduling property the runtime still has to deliver.
