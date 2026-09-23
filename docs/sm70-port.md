@@ -239,23 +239,35 @@ sglang-v100 image, llama-swap's own instances left alone):
 | ported MoE kernels, speed | **22 GB/s** at best across a 16-config sweep |
 | Triton's own ceiling on that card | 784 GB/s read-only, 781 GB/s copy, 83 TFLOP/s fp16 matmul |
 
-The last row is the one that matters: **Triton is not the problem.** A trivial Triton read kernel
-reaches 87% of the V100's HBM2, so 22 GB/s is this kernel's structure, not the backend. Two
-symptoms point at where: every config in the sweep is slow, and *bigger tiles make it worse*
-(T=32 at BM=32 costs 10x what T=6 at BM=16 does), which is what per-iteration register-layout
-conversions look like -- not a bandwidth ceiling.
+The number that matters turned out not to mean what it first looked like, so a second round of
+experiments ran on the card. Same shapes, same container, four measurements:
 
-`_quad_dot` loads a 128-K chunk and then cuts it into four 32-wide groups, doing **eight `tl.dot`s
-of K=16** per chunk, each surrounded by a layout conversion: the decoded even/odd tiles have to be
-rearranged into a dot operand, `tl.trans(we)` is another, and `_split4` is a third. On the GB10 the
-software pipeliner hides that; on Volta, with 64 KB per block and no async copy, it dominates.
+| experiment | GB/s |
+|---|---:|
+| a trivial Triton read-only kernel | 784 |
+| `torch.matmul` fp16, the same work through cuBLAS | **315** |
+| the ported inner loop **with the decode removed** (fp16 weights loaded directly) | **6.5** |
+| the ported inner loop with the decode | 9.9 (on packed bytes) |
 
-The fix is the standard Volta pattern, and it is bounded work: keep the 128-K chunk but do **two
-`tl.dot`s of K=64** (the even and the odd halves, which the K-permutation trick already gives for
-free) with the UE8M0 scale folded into the weights. Folding is safe exactly when the scale is <= 1
-(the largest weight becomes 6.0), which the checkpoint's own scale bytes decide, so it needs a guard
-and a fallback to the group-accumulator path -- and `tools/test_fp4_decode.py` already demonstrates
-what happens when the fold is not safe.
+Removing the decode does not help -- the version *with* the decode is faster -- and neither does
+occupancy: a 48-point sweep over BM, BN, num_warps and num_stages stays between 0.8 and 6.5 GB/s,
+and *more* programs per SM makes it worse. A dense fp16 GEMM of the same shape through cuBLAS is
+**48x faster than the best Triton configuration of the same loop**.
+
+So the conclusion is not "this kernel is mistuned". It is that **Triton's `tl.dot` is not usable on
+SM70 at these shapes**: Triton reaches 87% of the card's HBM2 on a pure read and the card's tensor
+cores do 83 TFLOP/s through cuBLAS, yet any kernel whose core is a `tl.dot` over these tiles lands
+at single-digit GB/s whatever the knobs are. That is the backend, not the structure.
+
+It is also what the rest of the V100 ecosystem does: the sglang-V100 fork this host actually runs
+builds a **CUDA** extension for its NVFP4 MoE (`SGLANG_V100_NVFP4_MOE_BUILD_DIR`) and uses
+**TileLang** for SM70 attention, and 1Cat-vLLM uses **TurboMind** CUDA kernels for its MXFP4 MoE.
+Nobody runs Triton MoE on Volta in production.
+
+What that means for the plan: the GPU tier needs ~40 GB/s to stop being the bottleneck and ~300 GB/s
+to disappear behind the CPU tier, and cuBLAS demonstrates the second is reachable on this hardware.
+The vehicle has to change -- TileLang (already a dependency of the fork, `tilelang==0.1.8`) or the
+ecosystem's CUDA kernels. Tuning this Triton kernel further is not the path.
 
 ## Honest status
 
