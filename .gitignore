@@ -41,3 +41,6 @@ results/*/state/
 tools/atlas/models/
 # the upstream clone the vendored build is reproduced from, when someone rebuilds it
 tools/atlas/upstream/atlas/
+
+# CPU expert tier: build artifact (bash tools/build_fp4_cpu.sh)
+tools/_fp4_cpu.so
