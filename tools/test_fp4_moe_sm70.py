@@ -79,9 +79,20 @@ def build_arena(n_slots: int, dev, gen, scale_lo: int = 120, scale_hi: int = 126
     return arena
 
 
-def routing(T: int, K: int, n_slots: int, gen, dev):
-    slots = torch.stack([torch.randperm(n_slots, generator=gen)[:K] for _ in range(T)]).to(torch.int32).to(dev)
-    w = torch.rand((T, K), generator=gen).to(dev)
+def routing(T: int, K: int, n_slots: int, gen, dev, cpu_gen=None):
+    """Distinct experts per token, and routing weights that sum to one.
+
+    Two generators on purpose, and this is the second time this trap cost a GPU round trip: a
+    device generator is required when the tensor is created on the device (`torch.randint(...,
+    device=dev)`, `torch.randn(..., device=dev)`), and a *CPU* generator is required by
+    `torch.randperm`, which builds its tensor on the CPU whatever the generator is. Passing the
+    device generator to randperm raises "Expected a 'cpu' device type for generator but found
+    'cuda'"; passing a CPU generator to a device tensor raises the mirror image.
+    """
+    cpu_gen = cpu_gen or torch.Generator().manual_seed(11)
+    slots = torch.stack([torch.randperm(n_slots, generator=cpu_gen)[:K] for _ in range(T)])
+    slots = slots.to(torch.int32).to(dev)
+    w = torch.rand((T, K), generator=gen, device=dev)
     return slots, w / w.sum(dim=1, keepdim=True)
 
 
