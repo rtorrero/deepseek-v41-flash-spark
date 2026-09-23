@@ -190,26 +190,37 @@ Three levers, in the order they are worth pulling:
 
 ## What to run on the V100 host, in order
 
-```bash
-# 0. the checkpoint is 510 GB; the Engram tables alone are the two 101 GB shards
-MODEL_DIR=/path/to/DeepSeek-V4.1-Flash
+Phases 1 to 3 need **no checkpoint and no build of the engine**, and each needs less than the last:
+phase 1 wants torch with CUDA and triton (it JITs a kernel), phase 2 wants torch and a C compiler,
+and phase 3 wants neither torch nor a GPU -- the planner is plain Python. The 510 GB checkpoint
+appears only in phase 4, which is the port work that is not written yet. So these three phases are
+how to find out whether the port is worth continuing *before* spending the disk and the GPU time.
 
-# 1. does the portable decode survive the GPU? (this is the blocker B1 answer)
+```bash
+# ---- 0. get the code onto the V100 host. Nothing to compile: the one C file is built in phase 2.
+git clone -b sm70-v100-port https://github.com/rtorrero/deepseek-v41-flash-spark.git dsv41-sm70
+cd dsv41-sm70
+python3 -c "import torch, triton; print(torch.__version__, triton.__version__, torch.cuda.get_device_name())"
+
+# ---- 1. does the portable decode survive the GPU?  <- the make-or-break question (blocker B1)
+#      It prints the device, compares the decode against the reference code by code, then runs one
+#      GEMV over the same bytes against an fp64 oracle. A failure names a code or a K position.
 python3 tools/fp4_decode_triton.py --check
 
-# 2. the CPU tier, no GPU needed, but run it here for this host's real number
+# ---- 2. the CPU tier, measured on this host (needs gcc; the .so builds in a second)
 bash tools/build_fp4_cpu.sh
 python3 tools/test_fp4_gemv_cpu.py
-python3 tools/bench_fp4_cpu.py --reps 9        # <- the tier planner's input
+python3 tools/bench_fp4_cpu.py --reps 9        # <- the tier planner's input: this host's GB/s
 
-# 3. the plan, with this host's measured CPU rate and the GPU rate measured in step 4
+# ---- 3. the plan, with this host's real CPU rate and its real memory
 python3 tools/test_caps.py
 python3 tools/test_tier_plan.py
-python3 tools/tier_plan.py --cpu-gbs <from step 2>
+python3 tools/tier_plan.py --cpu-gbs <from phase 2>
 
-# 4. the GPU expert kernels once the portable decode is in: this prints the effective GB/s
-MODEL_DIR=/path/to/DeepSeek-V4.1-Flash python3 tools/test_fp4_moe.py
-python3 tools/tier_plan.py --cpu-gbs <step 2> --gpu-gbs <step 4>
+# ---- 4. only now the checkpoint, and only once the MoE kernel has been ported:
+#      MODEL_DIR=/path/to/DeepSeek-V4.1-Flash python3 tools/test_fp4_moe.py
+#      that prints the effective GPU GB/s, which goes back into the planner:
+#      python3 tools/tier_plan.py --cpu-gbs <phase 2> --gpu-gbs <phase 4>
 ```
 
 If step 1 fails, the failure is a specific code or a specific K position, not a vague numerical
