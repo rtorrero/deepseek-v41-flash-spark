@@ -148,7 +148,11 @@ def main() -> int:
         err = rel_err(got, ref)
     except Exception as e:  # noqa: BLE001 - the point of the test is to see the failure
         ok, err, got = False, float("nan"), None
-        print(f"  FAIL  the kernel raised: {type(e).__name__}: {str(e)[:400]}")
+        # Triton prints the source snippet first and the *reason* after it, so a head-only slice
+        # hides exactly the line worth reading. Print both ends.
+        msg = str(e)
+        print(f"  FAIL  the kernel raised: {type(e).__name__}: {msg[:200]}"
+              f"{'  ...  ' + msg[-600:] if len(msg) > 800 else msg[200:]}")
         FAILS.append("kernel did not compile or run")
     if ok:
         check("fp16 tl.dot works on this SM and the kernel runs", True)
@@ -191,7 +195,8 @@ def main() -> int:
         # point of comparing against fp64 is to catch a systematic error, which would be orders
         # of magnitude larger.
         check("kept expert vs fp64 oracle", e < 1e-2, f"rel {e:.3e}")
-    print(f"       (the fp16 reference itself sits {rel_err(ref[0:1], oracle):.3e} from the oracle)")
+    ref1 = S.moe_forward_reference_dtype(x1, slots1, w1_, arena, dtype=torch.float16)
+    print(f"       (the fp16 reference for the same input sits {rel_err(ref1, oracle):.3e} from the oracle)")
 
     # ---------------------------------------------------------------- 4. the sweep
     print("\n[3] launch config sweep (the GB10 numbers do not transfer)\n")
