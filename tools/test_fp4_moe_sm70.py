@@ -156,6 +156,28 @@ def main() -> int:
         check("output is fp16 and correctly shaped",
               got.dtype == torch.float16 and tuple(got.shape) == (6, M.DIM), f"{got.dtype} {tuple(got.shape)}")
 
+    # ---------------------------------------------------------------- 1b. both inner loops
+    print("\n[1b] both inner loops, and the guard that picks between them\n")
+    if ok:
+        got_g = S.moe_forward_sm70(x, slots, w, arena, fold_scale=False)
+        e = rel_err(got_g, ref)
+        check("the grouped path (scale on the accumulator) also matches", e < args.tol, f"rel {e:.3e}")
+        check("this arena may fold (all scales <= 140)", S.arena_fold_ok(arena),
+              f"max scale byte {int(max(int(arena.s1.max()), int(arena.s3.max()), int(arena.s2.max())))}")
+        # An arena whose scales are past the fold's bound. The input is scaled down so the check is
+        # about the code path, not about fp16's range: at 2**14 the output of the grouped path is
+        # fine in fp32 and would overflow fp16, which is the engine's contract rather than the
+        # guard's business.
+        big = build_arena(2, dev, gen, scale_lo=141, scale_hi=145)
+        check("an arena with scales above 140 refuses to fold", not S.arena_fold_ok(big))
+        bs = torch.zeros((1, TOPK), dtype=torch.int32, device=dev)
+        bw = torch.full((1, TOPK), 1.0 / TOPK, device=dev)
+        xb = (x[:1] * 0.01).contiguous()
+        bref = S.moe_forward_reference_dtype(xb, bs, bw, big, dtype=torch.float16)
+        bgot = S.moe_forward_sm70(xb, bs, bw, big)
+        e = rel_err(bgot, bref)
+        check("the guard's fallback is correct on an unfoldable arena", e < args.tol, f"rel {e:.3e}")
+
     # ---------------------------------------------------------------- 3. the fp64 oracle
     print("\n[2] one expert against an fp64 oracle (the strongest check available here)\n")
     x1 = (torch.randn(1, M.DIM, generator=gen, device=dev) * 0.5).to(torch.float16).contiguous()

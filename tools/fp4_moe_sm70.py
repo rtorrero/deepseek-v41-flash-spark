@@ -91,6 +91,37 @@ def _chunk_dot(x_base, xk, mask_m, packed, scale_u8):
 
 
 @triton.jit
+def _chunk128(x_base, w_tile_ptr, s_ptr, mask_m):
+    """One 128-K chunk as two dots of K=64, with the UE8M0 scale folded into the weights.
+
+    `x_base` points at the chunk's first K element of the token row, `w_tile_ptr` at the chunk's 64
+    packed bytes for this BN row block, `s_ptr` at the chunk's four scale bytes.
+
+    Folding is exact here because the scale is a power of two: an fp16 weight times 2**k is exact
+    until it overflows, and the largest E2M1 value is 6.0, so it is safe while the scale is <= 1.
+    `arena_fold_ok` checks that on the checkpoint's own bytes before this path is chosen.
+
+    What folding buys is the dot width. Scaling the *accumulated group partial* instead -- which is
+    what upstream does and what the non-folded path here still does -- forces one dot per 32-K
+    group, i.e. eight dots of K=16 per 128-K chunk, each wrapped in a register-layout conversion to
+    a dot operand. That structure measured 22 GB/s on a V100 whose trivial Triton read kernel
+    reaches 784 GB/s (see docs/sm70-port.md). Two dots of K=64 replace it, and the K-permutation
+    trick means the even and the odd halves need no shuffle at all.
+    """
+    packed = tl.load(w_tile_ptr)                       # [BN, 64] uint8 = 128 K elements
+    ev, od = _decode_even_odd(packed)                  # [BN, 64] fp16 each
+    idx = tl.arange(0, 64) // 16                       # K element 2j and 2j+1 share group j//16
+    se = _ue8m0(tl.load(s_ptr + idx[None, :])).to(tl.float16)
+    we = ev * se
+    wo = od * se
+    kk = tl.arange(0, 64)
+    xe = tl.load(x_base + 2 * kk[None, :], mask=mask_m, other=0.0).to(tl.float16)
+    xo = tl.load(x_base + 2 * kk[None, :] + 1, mask=mask_m, other=0.0).to(tl.float16)
+    p = tl.dot(xe, tl.trans(we))
+    return tl.dot(xo, tl.trans(wo), acc=p)
+
+
+@triton.jit
 def _quad_dot(x_base, xk, mask_m, w_tile_ptr, s_ptr, BN: tl.constexpr):
     """Four consecutive K groups (128 logical K) from one 64-byte-wide packed tile. Same as
     upstream: the 64-byte row tile is what reaches the practical copy bandwidth on the original
@@ -115,7 +146,7 @@ def _moe_up_kernel_sm70(
     wgt_ptr, block_slot_ptr, block_pair_ptr,
     stride_x, stride_h, limit,
     TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, FOLD_SCALE: tl.constexpr,
 ):
     KB: tl.constexpr = K // 2
     SG: tl.constexpr = K // 32
@@ -144,8 +175,12 @@ def _moe_up_kernel_sm70(
     acc_g = tl.zeros([BM, BN], dtype=tl.float32)
     acc_u = tl.zeros([BM, BN], dtype=tl.float32)
     for q in range(0, SG // 4):
-        acc_g += _quad_dot(x_base + q * 128, xk, mask_m[:, None], w1_tile + q * 64, s1_tile + q * 4, BN)
-        acc_u += _quad_dot(x_base + q * 128, xk, mask_m[:, None], w3_tile + q * 64, s3_tile + q * 4, BN)
+        if FOLD_SCALE:
+            acc_g += _chunk128(x_base + q * 128, w1_tile + q * 64, s1_tile + q * 4, mask_m[:, None])
+            acc_u += _chunk128(x_base + q * 128, w3_tile + q * 64, s3_tile + q * 4, mask_m[:, None])
+        else:
+            acc_g += _quad_dot(x_base + q * 128, xk, mask_m[:, None], w1_tile + q * 64, s1_tile + q * 4, BN)
+            acc_u += _quad_dot(x_base + q * 128, xk, mask_m[:, None], w3_tile + q * 64, s3_tile + q * 4, BN)
 
     gate = tl.minimum(acc_g, limit)
     up = tl.minimum(tl.maximum(acc_u, -limit), limit)
@@ -162,7 +197,7 @@ def _moe_down_kernel_sm70(
     block_slot_ptr, block_pair_ptr,
     stride_h, stride_y,
     TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, NTOK: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, NTOK: tl.constexpr, FOLD_SCALE: tl.constexpr,
 ):
     KB: tl.constexpr = K // 2
     SG: tl.constexpr = K // 32
@@ -187,7 +222,10 @@ def _moe_down_kernel_sm70(
 
     acc = tl.zeros([BM, BN], dtype=tl.float32)
     for q in range(0, SG // 4):
-        acc += _quad_dot(h_base + q * 128, xk, mask_m[:, None], w2_tile + q * 64, s2_tile + q * 4, BN)
+        if FOLD_SCALE:
+            acc += _chunk128(h_base + q * 128, w2_tile + q * 64, s2_tile + q * 4, mask_m[:, None])
+        else:
+            acc += _quad_dot(h_base + q * 128, xk, mask_m[:, None], w2_tile + q * 64, s2_tile + q * 4, BN)
 
     row = ((offs_m % TOPK) * NTOK + offs_m // TOPK).to(tl.int64)
     tl.store(y_ptr + row[:, None] * stride_y + offs_n[None, :], acc, mask=mask_m[:, None])
@@ -207,6 +245,29 @@ _UP_CFG_SM70 = {16: (64, 4, 1), 32: (64, 4, 1), 64: (64, 4, 1)}
 _DOWN_CFG_SM70 = {16: (64, 4, 1), 32: (64, 4, 1), 64: (64, 4, 1)}
 
 
+def arena_fold_ok(arena) -> bool:
+    """True when folding the UE8M0 scale into the fp16 weights cannot overflow.
+
+    Folding multiplies a weight by 2**(b-127) where the largest weight on the E2M1 grid is 6.0, so
+    the product leaves fp16's 65504 when 6.0 * 2**(b-127) > 65504, i.e. b > 140. The bound is
+    therefore 140, not 127: an earlier version of this guard used 127 and would have sent a
+    checkpoint with scales of 2**1..2**13 down the slow path for no reason.
+
+    What the guard does *not* cover is whether the engine's fp16 output can hold the result, which
+    is a property of the checkpoint and of `--dtype`, not of the fold -- both paths scale the
+    products by the same bytes, so if the output overflows fp16 it overflows either way.
+
+    Scanning the arena costs one reduction over its scale tensors. That is not nothing (a full
+    arena holds 190 MB of scales), so the answer is cached on the arena object, which is safe
+    because the scales never change after load.
+    """
+    cached = getattr(arena, "_dsv41_fold_ok", None)
+    if cached is None:
+        cached = all(int(t.max()) <= 140 for t in (arena.s1, arena.s3, arena.s2) if t.numel())
+        arena._dsv41_fold_ok = cached
+    return cached
+
+
 def moe_forward_sm70(
     x: torch.Tensor,
     slots: torch.Tensor,
@@ -216,11 +277,16 @@ def moe_forward_sm70(
     block_m: int | None = None,
     up_cfg: tuple[int, int, int] | None = None,
     down_cfg: tuple[int, int, int] | None = None,
+    fold_scale: bool | None = None,
 ) -> torch.Tensor:
     """x fp16 [T, 5120], slots int32 [T, K], weights fp32 [T, K] -> fp16 [T, 5120].
 
     Same contract and same summation order as `fp4_moe.moe_forward`; the differences are the
-    decode and the dtype.
+    decode, the dtype, and the inner loop's shape (`fold_scale`).
+
+    `fold_scale=None` asks `arena_fold_ok`, which is the right default: it picks the fast path
+    whenever the checkpoint's own scale bytes make it safe and the correct-but-slow grouped path
+    otherwise, so a caller cannot get a wrong answer by forgetting about it.
     """
     assert x.dtype == torch.float16 and x.shape[1] == DIM and x.is_contiguous(), (
         f"expected contiguous fp16 x [T, {DIM}], got {x.dtype} {tuple(x.shape)}")
@@ -228,6 +294,8 @@ def moe_forward_sm70(
     assert weights.shape == (T, K)
     P = T * K
     dev = x.device
+    if fold_scale is None:
+        fold_scale = arena_fold_ok(arena)
     BM = block_m or _pick_bm(P)
     bn1, nw1, ns1 = up_cfg or _UP_CFG_SM70[BM]
     bn2, nw2, ns2 = down_cfg or _DOWN_CFG_SM70[BM]
@@ -245,13 +313,13 @@ def moe_forward_sm70(
         x, arena.w1, arena.s1, arena.w3, arena.s3, h,
         wgt, block_slot, block_pair,
         x.stride(0), h.stride(0), float(swiglu_limit),
-        TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, num_warps=nw1, num_stages=ns1,
+        TOPK=K, N=INTER, K=DIM, BM=BM, BN=bn1, FOLD_SCALE=fold_scale, num_warps=nw1, num_stages=ns1,
     )
     _moe_down_kernel_sm70[(NB, DIM // bn2)](
         h, arena.w2, arena.s2, parts,
         block_slot, block_pair,
         h.stride(0), parts.stride(0),
-        TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, num_warps=nw2, num_stages=ns2,
+        TOPK=K, N=DIM, K=INTER, BM=BM, BN=bn2, NTOK=T, FOLD_SCALE=fold_scale, num_warps=nw2, num_stages=ns2,
     )
     return parts.view(K, T, DIM).sum(dim=0).to(torch.float16)
 
