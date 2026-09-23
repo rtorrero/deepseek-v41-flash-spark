@@ -172,11 +172,14 @@ def main() -> int:
         # about the code path, not about fp16's range: at 2**14 the output of the grouped path is
         # fine in fp32 and would overflow fp16, which is the engine's contract rather than the
         # guard's business.
-        big = build_arena(2, dev, gen, scale_lo=141, scale_hi=145)
+        # 2**14..2**16: past the fold's bound of 140, and with the input scaled down so the fp16
+        # output stays representable. Both paths multiply by the same bytes, so this is about the
+        # code path, not about fp16's range.
+        big = build_arena(2, dev, gen, scale_lo=141, scale_hi=143)
         check("an arena with scales above 140 refuses to fold", not S.arena_fold_ok(big))
         bs = torch.zeros((1, TOPK), dtype=torch.int32, device=dev)
         bw = torch.full((1, TOPK), 1.0 / TOPK, device=dev)
-        xb = (x[:1] * 0.01).contiguous()
+        xb = (x[:1] * 1e-5).contiguous()
         bref = S.moe_forward_reference_dtype(xb, bs, bw, big, dtype=torch.float16)
         bgot = S.moe_forward_sm70(xb, bs, bw, big)
         e = rel_err(bgot, bref)
