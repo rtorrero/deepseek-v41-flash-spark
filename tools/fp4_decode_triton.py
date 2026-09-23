@@ -181,11 +181,14 @@ def check(rows: int = 512, k: int = 1024, seed: int = 4, device: str = "cuda") -
             return 1
         print(f"        codes -> {got.tolist()}")
 
-    # 2. the GEMV.
-    g = torch.Generator().manual_seed(seed)
+    # 2. the GEMV: does the portable decode survive being driven by a real kernel on this SM?
+    #    The generator has to live on the same device as the tensors it fills; a CPU generator
+    #    with a CUDA tensor raises "Expected a 'cuda' device type for generator but found 'cpu'".
+    g = torch.Generator(device=dev)
+    g.manual_seed(seed)
     w = torch.randint(0, 256, (rows, k // 2), generator=g, dtype=torch.uint8, device=dev)
     s = torch.randint(110, 145, (rows, k // 32), generator=g, dtype=torch.uint8, device=dev)
-    x = torch.randn(k, generator=g).to(dev)
+    x = torch.randn(k, generator=g, device=dev)
     y_tri = fp4_gemv_triton(w, s, x)
     wf = D.dequant_fp4(w.cpu(), s.cpu(), dtype=torch.float64).to(dev)
     y_ref = (wf @ x.double()).float()
