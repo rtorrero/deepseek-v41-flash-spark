@@ -227,6 +227,36 @@ If step 1 fails, the failure is a specific code or a specific K position, not a 
 complaint, and it tells us whether the correction to make is in `_decode_codes` or in the
 activation's stride-2 indexing.
 
+## Where the port stands after the first GPU runs (2026-09-23)
+
+Measured on the real host (4x V100-PCIE-32GB, one card at a time, ephemeral containers over the
+sglang-v100 image, llama-swap's own instances left alone):
+
+| step | result |
+|---|---|
+| decode on SM70, `tools/fp4_decode_triton.py --check` | **passes** -- all 16 codes bit-exact, GEMV against fp64 at rel 1.8e-07 |
+| ported MoE kernels, `tools/test_fp4_moe_sm70.py` | **correct** -- rel 6.5e-04 against the fp16 reference, inside 1e-2 of an fp64 oracle, and fp16 `tl.dot` does work on Volta |
+| ported MoE kernels, speed | **22 GB/s** at best across a 16-config sweep |
+| Triton's own ceiling on that card | 784 GB/s read-only, 781 GB/s copy, 83 TFLOP/s fp16 matmul |
+
+The last row is the one that matters: **Triton is not the problem.** A trivial Triton read kernel
+reaches 87% of the V100's HBM2, so 22 GB/s is this kernel's structure, not the backend. Two
+symptoms point at where: every config in the sweep is slow, and *bigger tiles make it worse*
+(T=32 at BM=32 costs 10x what T=6 at BM=16 does), which is what per-iteration register-layout
+conversions look like -- not a bandwidth ceiling.
+
+`_quad_dot` loads a 128-K chunk and then cuts it into four 32-wide groups, doing **eight `tl.dot`s
+of K=16** per chunk, each surrounded by a layout conversion: the decoded even/odd tiles have to be
+rearranged into a dot operand, `tl.trans(we)` is another, and `_split4` is a third. On the GB10 the
+software pipeliner hides that; on Volta, with 64 KB per block and no async copy, it dominates.
+
+The fix is the standard Volta pattern, and it is bounded work: keep the 128-K chunk but do **two
+`tl.dot`s of K=64** (the even and the odd halves, which the K-permutation trick already gives for
+free) with the UE8M0 scale folded into the weights. Folding is safe exactly when the scale is <= 1
+(the largest weight becomes 6.0), which the checkpoint's own scale bytes decide, so it needs a guard
+and a fallback to the group-accumulator path -- and `tools/test_fp4_decode.py` already demonstrates
+what happens when the fold is not safe.
+
 ## Honest status
 
 * The decode, the CPU tier, the capability/dtype layer and the planner are **validated**: 107
@@ -235,11 +265,12 @@ activation's stride-2 indexing.
   regime without fitting anything.
 * The Triton decode is **written and unrun**. No driver, no `nvcc`, and no 510 GB of disk on the
   box this was written on.
-* The bf16 -> fp16 sweep (B2) and the attention path (B5) are **not started**. They are the two
-  pieces of real work left. `engine/caps.py` gives the sweep its single decision point
-  (`DSV41_DTYPE`, resolving to fp16 on sm_70) and `tools/test_caps.py` guards the rule, but the
-  239 call sites still have to follow it, and the ones carrying large magnitudes need review
-  rather than a find-and-replace.
+* The MoE kernels (`tools/fp4_moe_sm70.py`) are **ported and correct on the real card**, and
+  **36x slower than they need to be**; the section above says why and what the fix is.
+* The bf16 -> fp16 sweep (B2) and the attention path (B5) are **not started**. `engine/caps.py`
+  gives the sweep its single decision point (`DSV41_DTYPE`, resolving to fp16 on sm_70) and
+  `tools/test_caps.py` guards the rule, but the 239 call sites still have to follow it, and the
+  ones carrying large magnitudes need review rather than a find-and-replace.
 * The tier plan is arithmetic from a measured CPU rate plus the repo's own memory constants. It is
   a plan, not a benchmark of the assembled system: the overlap between the CPU expert work and the
   GPU attention work is a scheduling property the runtime still has to deliver.

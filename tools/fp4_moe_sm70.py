@@ -18,6 +18,14 @@ Three changes, and only three:
     64 KB per block. The defaults here are conservative guesses and
     `tools/test_fp4_moe_sm70.py` sweeps them.
 
+**Measured, first run on a V100 (2026-09-23): correct and slow.** Correct: rel 6.5e-04 against the
+fp16 reference, inside 1e-2 of an fp64 oracle on a single expert, and fp16 `tl.dot` does work on
+Volta. Slow: 22 GB/s at best over a 16-config sweep, against 784 GB/s that a trivial Triton read
+kernel reaches on the same card -- so the ceiling is not Triton's, it is this kernel's structure
+(see docs/sm70-port.md, "Where the port stands"). The next change is to keep the 128-K chunk but
+do two `tl.dot`s of K=64 with the scale folded into the weights, instead of eight of K=16 each
+wrapped in a layout conversion.
+
 Everything else is deliberately line-by-line parallel to the original -- the routing, the arena
 layout, the K-permutation trick (`_split4`, `_quad_dot`), the clamps, the SwiGLU, the per-pair
 output buffer that removes the atomics, the summation order -- so the two files can be diffed and
