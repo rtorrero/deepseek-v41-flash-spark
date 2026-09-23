@@ -91,11 +91,13 @@ def _chunk_dot(x_base, xk, mask_m, packed, scale_u8):
 
 
 @triton.jit
-def _chunk128(x_base, w_tile_ptr, s_ptr, mask_m):
+def _chunk128(x_base, w_tile_ptr, s_base, s_idx, mask_m):
     """One 128-K chunk as two dots of K=64, with the UE8M0 scale folded into the weights.
 
     `x_base` points at the chunk's first K element of the token row, `w_tile_ptr` at the chunk's 64
-    packed bytes for this BN row block, `s_ptr` at the chunk's four scale bytes.
+    packed bytes for this BN row block, and the scale arrives as a base pointer plus a [BN, 64]
+    index tile: a first version added a [1, 64] index to the [BN, 4] scale *tile* and Triton
+    refused the broadcast. The index tile is built once per program and reused by every chunk.
 
     Folding is exact here because the scale is a power of two: an fp16 weight times 2**k is exact
     until it overflows, and the largest E2M1 value is 6.0, so it is safe while the scale is <= 1.
@@ -110,8 +112,7 @@ def _chunk128(x_base, w_tile_ptr, s_ptr, mask_m):
     """
     packed = tl.load(w_tile_ptr)                       # [BN, 64] uint8 = 128 K elements
     ev, od = _decode_even_odd(packed)                  # [BN, 64] fp16 each
-    idx = tl.arange(0, 64) // 16                       # K element 2j and 2j+1 share group j//16
-    se = _ue8m0(tl.load(s_ptr + idx[None, :])).to(tl.float16)
+    se = _ue8m0(tl.load(s_base + s_idx)).to(tl.float16)  # K element 2j and 2j+1 share group j//16
     we = ev * se
     wo = od * se
     kk = tl.arange(0, 64)
@@ -171,13 +172,16 @@ def _moe_up_kernel_sm70(
     w3_tile = w3_ptr + slot * (N * KB) + offs_n[:, None] * KB + offs_j[None, :]
     s1_tile = s1_ptr + slot * (N * SG) + offs_n[:, None] * SG + offs_q[None, :]
     s3_tile = s3_ptr + slot * (N * SG) + offs_n[:, None] * SG + offs_q[None, :]
+    s1_base = s1_ptr + slot * (N * SG)
+    s3_base = s3_ptr + slot * (N * SG)
+    s128 = offs_n[:, None] * SG + (tl.arange(0, 64) // 16)[None, :]  # [BN, 64], reused per chunk
 
     acc_g = tl.zeros([BM, BN], dtype=tl.float32)
     acc_u = tl.zeros([BM, BN], dtype=tl.float32)
     for q in range(0, SG // 4):
         if FOLD_SCALE:
-            acc_g += _chunk128(x_base + q * 128, w1_tile + q * 64, s1_tile + q * 4, mask_m[:, None])
-            acc_u += _chunk128(x_base + q * 128, w3_tile + q * 64, s3_tile + q * 4, mask_m[:, None])
+            acc_g += _chunk128(x_base + q * 128, w1_tile + q * 64, s1_base + q * 4, s128, mask_m[:, None])
+            acc_u += _chunk128(x_base + q * 128, w3_tile + q * 64, s3_base + q * 4, s128, mask_m[:, None])
         else:
             acc_g += _quad_dot(x_base + q * 128, xk, mask_m[:, None], w1_tile + q * 64, s1_tile + q * 4, BN)
             acc_u += _quad_dot(x_base + q * 128, xk, mask_m[:, None], w3_tile + q * 64, s3_tile + q * 4, BN)
@@ -219,11 +223,13 @@ def _moe_down_kernel_sm70(
     xk = 2 * tl.arange(0, 16)[None, :]
     w2_tile = w2_ptr + slot * (N * KB) + offs_n[:, None] * KB + offs_j[None, :]
     s2_tile = s2_ptr + slot * (N * SG) + offs_n[:, None] * SG + offs_q[None, :]
+    s2_base = s2_ptr + slot * (N * SG)
+    s128 = offs_n[:, None] * SG + (tl.arange(0, 64) // 16)[None, :]
 
     acc = tl.zeros([BM, BN], dtype=tl.float32)
     for q in range(0, SG // 4):
         if FOLD_SCALE:
-            acc += _chunk128(h_base + q * 128, w2_tile + q * 64, s2_tile + q * 4, mask_m[:, None])
+            acc += _chunk128(h_base + q * 128, w2_tile + q * 64, s2_base + q * 4, s128, mask_m[:, None])
         else:
             acc += _quad_dot(h_base + q * 128, xk, mask_m[:, None], w2_tile + q * 64, s2_tile + q * 4, BN)
 
