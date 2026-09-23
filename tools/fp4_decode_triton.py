@@ -89,6 +89,22 @@ if HAVE_TRITON:
         return _decode_codes(p & 0x0F), _decode_codes((p >> 4) & 0x0F)
 
     @triton.jit
+    def _decode_probe_kernel(packed_ptr, out_ptr, N: tl.constexpr):
+        """Loads N packed bytes, decodes them, and writes the 2N values back in K order.
+
+        This exists because `_decode_even_odd` is an inline helper, not a kernel: in Triton a
+        kernel's tensor parameter arrives as a *pointer*, so calling the helper directly as a
+        kernel fails with "cannot cast pointer<uint8>[] to int32" (learned on the first real run
+        on a V100). The helper is right as written -- a kernel loads the tile and then calls it --
+        so the harness needed a kernel around it, which is what this is.
+        """
+        offs = tl.arange(0, N)
+        packed = tl.load(packed_ptr + offs)
+        ev, od = _decode_even_odd(packed)
+        tl.store(out_ptr + 2 * offs, ev)
+        tl.store(out_ptr + 2 * offs + 1, od)
+
+    @triton.jit
     def _gemv_sm70_kernel(w_ptr, s_ptr, x_ptr, y_ptr, N, NG, BN: tl.constexpr):
         """y[n] = sum over K groups of scale[n,g] * sum_k x[k] * value(code(w[n,k])).
 
@@ -148,19 +164,22 @@ def check(rows: int = 512, k: int = 1024, seed: int = 4, device: str = "cuda") -
     dev = torch.device(device)
 
     # 1. the decode, every code, through the same path the kernel uses.
-    codes = torch.arange(16, dtype=torch.int32, device=dev)
+    #    Eight packed bytes carry sixteen codes: byte i is code i in the low nibble and code i+8 in
+    #    the high one, so all sixteen values are covered by one tile.
+    packed = torch.tensor([i | ((i + 8) << 4) for i in range(8)], dtype=torch.uint8, device=dev)
+    codes = D.codes_from_packed(packed.cpu())  # [16], in K order
+    want = D.values_bits(codes, dtype=torch.float16)
     if HAVE_TRITON:
-        # pack as bytes so we exercise _decode_even_odd end to end: low nibble = code i, high = 0
-        packed = (codes[:8] | (codes[8:] << 4)).to(torch.uint8).reshape(1, 8)
-        ev, od = _decode_even_odd[(1,)](packed)
-        got = torch.cat([ev.reshape(-1)[:8], od.reshape(-1)[:8]])
-        want = D.values_bits(codes.to(torch.uint8).cpu(), dtype=torch.float16)
-        ok = torch.equal(got.cpu(), want)
+        out = torch.empty(16, dtype=torch.float16, device=dev)
+        _decode_probe_kernel[(1,)](packed, out, N=8)
+        got = out.cpu()
+        ok = torch.equal(got, want)
         print(f"  {'PASS' if ok else 'FAIL'}  decode matches the reference on all 16 codes")
         if not ok:
-            print(f"        got  {got.cpu().tolist()}")
+            print(f"        got  {got.tolist()}")
             print(f"        want {want.tolist()}")
             return 1
+        print(f"        codes -> {got.tolist()}")
 
     # 2. the GEMV.
     g = torch.Generator().manual_seed(seed)
